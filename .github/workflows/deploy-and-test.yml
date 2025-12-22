@@ -117,11 +117,13 @@ jobs:
           mkdir -p "$DEPLOY_PATH"
           cd "$DEPLOY_PATH"
 
-          # Pull latest changes or clone
+          # Pull latest changes or clone (uses SSH for private repo)
           if [ -d ".git" ]; then
             git fetch origin
             git reset --hard origin/main
           else
+            # Try SSH first (for private repos with deploy key), fallback to HTTPS
+            git clone git@github.com:${{ github.repository }}.git . || \
             git clone https://github.com/${{ github.repository }}.git .
           fi
 
