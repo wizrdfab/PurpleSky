@@ -1,0 +1,98 @@
+# Sofia LightGBM - Data Sync Workflow
+#
+# Sync data files to Azure VM (for large files not in git)
+# This is a manual workflow for when you need to update training data
+
+name: Sync Data to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Data source (azure-blob or skip)'
+        required: true
+        default: 'skip'
+        type: choice
+        options:
+          - skip
+          - azure-blob
+      verify_only:
+        description: 'Only verify data exists (do not sync)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync:
+    name: Sync Data Files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AZURE_VM_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.AZURE_VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Check Data Status
+        run: |
+          echo "## Data Status on Azure VM" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          ssh ${{ secrets.AZURE_VM_USER }}@${{ secrets.AZURE_VM_HOST }} << 'CHECK_SCRIPT'
+          DEPLOY_PATH="${AZURE_VM_PATH:-~/sofia}"
+          cd "$DEPLOY_PATH"
+
+          echo "=== Data Directory Status ==="
+          echo ""
+
+          if [ -d "data" ]; then
+            DATA_SIZE=$(du -sh data 2>/dev/null | cut -f1)
+            DATA_FILES=$(find data -type f | wc -l)
+            echo "data/: $DATA_SIZE ($DATA_FILES files)"
+          else
+            echo "data/: NOT FOUND"
+          fi
+
+          if [ -d "data_collector" ]; then
+            DC_SIZE=$(du -sh data_collector 2>/dev/null | cut -f1)
+            DC_FILES=$(find data_collector -type f | wc -l)
+            echo "data_collector/: $DC_SIZE ($DC_FILES files)"
+          else
+            echo "data_collector/: NOT FOUND"
+          fi
+
+          echo ""
+          echo "=== Models Status ==="
+          for dir in models models_*; do
+            if [ -d "$dir" ]; then
+              SIZE=$(du -sh "$dir" 2>/dev/null | cut -f1)
+              echo "$dir: $SIZE"
+            fi
+          done
+          CHECK_SCRIPT
+
+      - name: Sync from Azure Blob
+        if: github.event.inputs.source == 'azure-blob' && github.event.inputs.verify_only == 'false'
+        run: |
+          ssh ${{ secrets.AZURE_VM_USER }}@${{ secrets.AZURE_VM_HOST }} << 'SYNC_SCRIPT'
+          DEPLOY_PATH="${AZURE_VM_PATH:-~/sofia}"
+          cd "$DEPLOY_PATH"
+
+          echo "Syncing data from Azure Blob Storage..."
+
+          # This requires Azure CLI to be installed on the VM
+          # and appropriate credentials configured
+          if command -v az &> /dev/null; then
+            az storage blob download-batch \
+              --account-name "${AZURE_STORAGE_ACCOUNT}" \
+              --source sofia-data \
+              --destination ./data \
+              --pattern "*" || echo "Blob sync failed or not configured"
+          else
+            echo "Azure CLI not installed on VM. Please install or use manual sync."
+          fi
+          SYNC_SCRIPT
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}

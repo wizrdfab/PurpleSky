@@ -1,0 +1,17 @@
+# TrendFollower ML System Requirements
+# Install with: pip install -r requirements.txt
+
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine learning
+lightgbm>=4.0.0
+scikit-learn>=1.3.0
+
+# Optional: for visualization (uncomment if needed)
+# matplotlib>=3.7.0
+# plotly>=5.15.0
+
+# Optional: for faster data loading (uncomment if needed)
+# pyarrow>=12.0.0

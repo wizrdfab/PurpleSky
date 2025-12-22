@@ -1,0 +1,76 @@
+# Sofia LightGBM - Manual Command Runner
+#
+# Run any command on the Azure VM from GitHub Actions
+# Results displayed in GitHub Actions console - no SSH required!
+#
+# Usage: Go to Actions > Manual Command > Run workflow
+# Enter your command and see results in the workflow output
+
+name: Manual Command
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Command to run on Azure VM (in sofia directory)'
+        required: true
+        default: 'python -c "print(\"Hello from Sofia!\")"'
+        type: string
+      timeout:
+        description: 'Timeout in minutes'
+        required: false
+        default: '30'
+        type: string
+
+jobs:
+  run-command:
+    name: Execute Command
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AZURE_VM_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.AZURE_VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Run Command
+        timeout-minutes: ${{ fromJson(github.event.inputs.timeout) }}
+        run: |
+          echo "## Command Execution" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Command:** \`${{ github.event.inputs.command }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "::group::Command Output"
+
+          ssh ${{ secrets.AZURE_VM_USER }}@${{ secrets.AZURE_VM_HOST }} << 'REMOTE_SCRIPT'
+          cd "${{ secrets.AZURE_VM_PATH }}" || cd ~/sofia
+
+          echo "=== Command Output ==="
+          echo "Working directory: $(pwd)"
+          echo "Time: $(date)"
+          echo "======================"
+          echo ""
+
+          # Run the user's command
+          ${{ github.event.inputs.command }}
+
+          echo ""
+          echo "=== Command Complete ==="
+          REMOTE_SCRIPT
+
+          echo "::endgroup::"
+
+      - name: Output Summary
+        if: always()
+        run: |
+          echo "### Execution Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Host | ${{ secrets.AZURE_VM_HOST }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY

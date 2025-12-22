@@ -1,0 +1,14 @@
+1)"""if diag:
+            diag.log_model_training("EntryQualityModel", entry_metrics)
+            if hasattr(models.entry_model.success_model, 'feature_importances_'):
+                importances = dict(zip(feature_cols, models.entry_model.success_model.feature_importances_))
+                diag.log_feature_importance("EntryQualityModel", importances)*"""
+
+En trainer.py fue puesto en comentarios ya que ocurria un error (AttributeError: 'EntryQualityModel' object has no attribute 'success_model'), tendre que preguntarle a la IA que ocurre con esto
+
+2)"""with open(self.json_file, 'w') as f:
+            json.dump(json_data, f, indent=2, default=str)"""
+
+En diagnostic_logger.py fue puesto en comentarios ya que provocaba un error: TypeError: keys must be str, int, float, bool or None, not Float64DType
+
+3)Se agrego encoding='utf-8' en diagnostic_logger

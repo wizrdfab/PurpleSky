@@ -1,0 +1,1146 @@
+AI LOG / CHANGELOG (agent-maintained)
+Repo: trend_follower 1.1
+Workspace: D:\Fab\omei-eye\trend_follower 1.1
+Last updated: 2025-12-13
+
+This file is a human+AI readable summary of the changes made during the AI-assisted
+strategy iteration and live-trading buildout. It is intentionally high-level and
+points to the exact files/dirs where the implementation lives.
+
+Important operator notes (environment / conventions)
+- Windows PowerShell environment.
+- Avoid PowerShell Get-Content for viewing files (use rg/Select-String or [IO.File]::ReadAllLines).
+- Console encoding is cp1252 on this machine; avoid emojis/unicode in console logs.
+- Several snapshot folders exist; treat snapshot folders as READ-ONLY unless explicitly requested.
+
+Snapshot folders (do not modify; used as program state “freezes”)
+- profitable MONUSDT model 11-12-2024-0207PM/
+- profitable MONUSDT model 11-12-2024-1907PM/
+- profitable trader 11-12-2025/
+- Profitable trader 11-12-2025-2318/
+- Profitable trader -12-12-2025-1351/
+- Profitable trader 12-12-2025-1728/
+- Profitable trader 13-12-2025-0124/
+- Profitable Trader_2025-12-13_1556/
+
+----------------------------------------------------------------------
+VERSIONED CHANGELOG (approx chronological; based on file timestamps and work sequence)
+----------------------------------------------------------------------
+
+v0.1 (Baseline understanding + strategy direction)
+- Goal settled on EMA9-based, long-only strategy using bounce probability as the key gate.
+- Risk model standardized around ATR-based stops/targets (default ~1.0 ATR SL, 1.5R TP).
+- “Trend classifier has no say to open trades” principle adopted (trend model can be logged, but not gating).
+
+v0.2 (EMA9 pullback/touch labeling + slope proxy)
+Files: labels.py
+- Pullback detection updated to use intrabar “touch” logic:
+  - Uses min distance of OHLC to EMA instead of candle-close-only distance.
+  - Distance normalized by ATR: dist_from_ema = min(|OHLC-EMA|) / ATR.
+- Direction proxy switched from multi-EMA “alignment stacking” to EMA slope:
+  - Uses {base_tf}_ema_{pullback_ema}_slope_norm as the directional signal (positive => long bias).
+- Pullback zone label now combines:
+  - is_close_to_ema (<= pullback_threshold) AND
+  - has_trend (abs(slope_norm) > small floor).
+
+v0.3 (Backtest engine stabilized: long-only, bounce gating, logging, stop padding)
+Files: backtest.py, backtests-logs-at-close/
+- Backtest logic standardized to match the profitable "at-close" behavior:
+  - Direction from EMA slope_norm sign (long/short); trade_side controls allowed side (default: long).
+  - Entry gate uses bounce probability threshold (min_bounce_prob).
+  - "Quality grade" is informational only; does not block entries.
+- Stop padding added:
+  - stop_dist = (stop_loss_atr * ATR) + (stop_padding_pct * entry_price)
+  - Default stop_padding_pct = 0.0 (disabled by default).
+- Cooldown after stop-loss made configurable in backtest:
+  - cooldown_bars_after_stop controls the post-stop entry delay (0 = disabled; default 0).
+- Backtest logging implemented to disk:
+  - Writes per-trade JSONL logs and summary JSON into ./backtests-logs-at-close/
+  - Filenames include symbol/timeframe/timestamp (e.g., backtest_MONUSDT_5m_YYYYMMDD_HHMMSS_*).
+
+v0.4 (Training pipeline: configurable splits, backtest-only/train-only, two-pass)
+Files: config.py, trainer.py, run_training.py, train.py
+- Train/val/test split ratios made configurable:
+  - config.py: ModelConfig includes train_ratio/val_ratio/test_ratio defaults.
+  - trainer.py: time_series_split uses these ratios for chronological splits.
+- train.py (renamed from _tmp_train_touch.py) updated:
+  - Flags: --train-ratio, --val-ratio, --test-ratio
+  - Flags: --train-only (train models only; no backtest)
+  - Flags: --backtest-only (skip training; backtest using existing model_dir)
+  - Flag: --two-pass (requires val_ratio > 0): trains pass1 on train, then final on train+val using best_iteration.
+  - Flag: --cooldown-bars-after-stop forwarded into SimpleBacktester (0 = disabled).
+  - Flag: --trade-side forwarded into SimpleBacktester (long|short|both; default long).
+- Guardrails added:
+  - If backtest-only and test split is empty => error explaining to set test_ratio.
+  - If train_ratio=1.0 explicitly => val/test forced to 0.0 (train-only workflow).
+
+v0.5 (Feature engineering leakage fixes + “partial HTF” in-progress context)
+Files: feature_engine.py
+1) Multi-timeframe leakage fix
+- The classic HTF merge_asof lookahead issue was addressed:
+  - Higher-timeframe feature rows are shifted forward by tf_seconds before merge_asof.
+  - This makes an HTF bar available to lower TFs only after the HTF bar closes.
+
+2) Partial (in-progress) higher timeframe context added (leak-free)
+- Added partial_{tf}_open/high/low/close/volume columns computed from rolling base timeframe bars:
+  - window = tf_seconds / base_seconds
+  - open = first open in rolling window
+  - high/low = rolling max/min
+  - close = current base close
+  - volume = rolling sum
+- Intent: provide “currently forming HTF candle” context without future HTF-close data.
+
+3) Swing feature lookahead removed (causal swings)
+- detect_swing_highs/lows uses symmetric windows (future bars).
+- Added causal helpers:
+  - get_recent_swing_high / get_recent_swing_low with confirmation_bars
+  - swing distances now use only confirmed swings (no future peeking).
+
+4) Feature column hygiene tightened
+- get_feature_columns excludes label columns and leaky patterns (e.g., *_label, *_mfe, *_mae, *_rr, symbol, trdMatchID).
+
+v0.6 (Paper live trading: match backtest logic + better bootstrap + stop padding + safer logs)
+Files: live_trading.py, live_trading_logs/, logs-paper-trading/
+- live_trading.py aligned toward the "at-close, market entry" backtest behavior:
+  - Direction from EMA slope_norm (base tf); optional trade_side filter (long|short|both).
+  - Primary gate is bounce probability threshold (min_bounce_prob).
+  - Stop/TP are ATR-based; stop padding supported (stop_padding_pct, default 0).
+  - Optional cooldown after stop-loss via cooldown_bars_after_stop (default 0 = disabled).
+- Console/logging improvements:
+  - Avoid unicode/emojis in log strings (cp1252 safe).
+  - Added richer per-tick stats (e.g., usable feature count, buffer size, bounce_prob, slope/pullback diagnostics).
+
+Bootstrap loading (critical for restarts / warm start)
+- live_trading.py bootstrap loader updated to accept:
+  - A single CSV file OR a directory of CSV files.
+  - Reads and concatenates ALL rows (sorted by timestamp).
+  - Supports flexible column name variants and headerless files.
+  - Seeds the Predictor directly (predictor.add_trades) instead of inflating the TradeBuffer.
+  - NOTE: when a directory is used, only files matching *.csv are loaded; extensionless files are ignored.
+- Resulting nuance:
+  - “Trades in buffer: X” refers to the live WS TradeBuffer only; bootstrap trades are held in the predictor history.
+
+v0.7 (Limit-order simulation variant)
+Files: live_trading_with_limits.py
+- live_trading_with_limits.py maintained as a separate module for:
+  - "Limit semantics" experimentation (resting order in a pullback/EMA band instead of immediate market entry).
+  - Higher-frequency update loop (e.g., every N seconds).
+- Receives the same bootstrap loader improvements and stop padding support as live_trading.py.
+- Cooldown after stop-loss is configurable (default 3 bars; 0 disables).
+- Optional trade_side filter (long|short|both; default long).
+
+v0.8 (Funds/live execution variant using Bybit/pybit)
+Files: live_trading_funds.py, pybit-master/, live_results_funds/
+- Introduced/maintained a dedicated funds trader:
+  - Connects to Bybit via pybit.
+  - Places market entries and attaches SL/TP on the exchange side (per Bybit API semantics).
+  - Retains the same model/predictor/feature calculation pathway as the paper trader where possible.
+- Added safety controls around price drift/staleness:
+  - Entry deviation guard: skip if |live_price - signal_price| is too large in ATR units (configurable).
+- Added stop padding flag (stop_padding_pct) consistent with paper/backtest.
+- Added cooldown-bars-after-stop option (inherited from LivePaperTrader; default 0 = disabled).
+- Added trade-side option (inherited from LivePaperTrader; long|short|both).
+
+v0.9 (Trade collector for continuous on-disk history)
+Files: trade_collector.py, data_collector/
+- Trade collector built/updated to continuously fetch trades and save to disk so live trading can restart without huge gaps.
+- Output schema standardized (header written if file new/empty):
+  - timestamp,symbol,side,size,price,tickDirection,trdMatchID,grossValue,homeNotional,foreignNotional,RPI
+- Periodic flushing and shutdown safety:
+  - Background flusher thread writes buffered rows every --flush-interval seconds.
+  - On Ctrl+C / shutdown, a final flush is forced before exiting.
+  - Collector prints running totals: total_collected and total_flushed.
+
+----------------------------------------------------------------------
+NOTES FOR THE NEXT AI (practical “where to look”)
+----------------------------------------------------------------------
+
+Core pipeline (train -> backtest -> paper/live)
+- Data ingestion: data_loader.py (trade CSV -> OHLCV bars, multi-timeframe bars from ticks)
+- Features: feature_engine.py (per-TF indicators + leak-safe HTF merge + partial HTF)
+- Labels: labels.py (EMA9 intrabar touch + bounce outcome labels)
+- Training: trainer.py / run_training.py / train.py
+- Backtest: backtest.py (writes into backtests-logs-at-close/)
+- Paper live: live_trading.py (market-entry at base bar close)
+- Limit variant: live_trading_with_limits.py (limit-style experiments)
+- Funds live: live_trading_funds.py (real orders via pybit)
+- Collector: trade_collector.py (writes restartable trade history)
+
+Where results/logs live
+- Backtests: backtests-logs-at-close/
+  - *_trades.jsonl: per-trade timeline (entry/exit/diagnostics)
+  - *_summary.json: aggregated metrics + parameters snapshot
+- Paper logs: logs-paper-trading/
+- Funds stats/logs: live_results_funds/, logs/
+
+Known "gotchas" discovered during iteration
+- Multi-timeframe data leakage is real if HTF rows are merged by open_time; the implemented fix shifts HTF bar_time to close time.
+- Swing-high/low features can leak if computed with symmetric windows; current implementation uses confirmed swings only.
+- If bootstrap data is loaded into predictor but not TradeBuffer, "Trades in buffer" will not match the bootstrap file row count (this is by design).
+- Avoid percent signs (%) in argparse help strings unless escaped (%%); help text was rewritten to use "fraction of entry" phrasing.
+
+----------------------------------------------------------------------
+v1.0 (Major labeling and model improvements - Dec 2025)
+----------------------------------------------------------------------
+Files: labels.py, models.py, trainer.py, feature_engine.py
+
+1) Sequential TP/SL Labeling (path-dependent success definition)
+- BEFORE: Success = (MFE >= target) AND (MAE < stop) - checked independently
+- AFTER:  Success = TP hit BEFORE SL - bar-by-bar sequential walk
+- This matches actual trade execution logic; avoids labeling "lucky recoveries" as wins
+- New columns: pullback_hit_tp_first, pullback_bars_to_exit, pullback_exit_type ('tp'/'sl'/'timeout')
+
+2) Multi-Tier Quality Labels
+- Added pullback_tier column (0-3) for more granular success classification:
+  - Tier 0: Stopped out (hit SL first or MFE < 0.5R)
+  - Tier 1: Breakeven to 1R
+  - Tier 2: 1R to 2R
+  - Tier 3: 2R+ (runners)
+- EntryQualityModel now trains a multi-class tier classifier alongside binary bounce classifier
+
+3) Time-to-Target Features
+- pullback_bars_to_exit: How many bars until trade resolved
+- pullback_early_momentum: Direction-adjusted price move in first 3 bars
+- pullback_immediate_range: Range expansion in first 3 bars after entry
+
+4) Bounce Reaction Features (at the pullback bar itself)
+- bounce_bar_body_ratio: Body size / bar range (small = rejection candle)
+- bounce_bar_wick_ratio: Favorable wick / bar range (long wick = demand/supply)
+- bounce_bar_direction: 1 if bullish, -1 if bearish
+- bounce_volume_ratio: Volume vs moving average at the bounce
+- These are VALID training features (not leaky) - calculated from current bar only
+
+5) Probability Calibration
+- Added Isotonic Regression calibrator for bounce_prob
+- Calibrator trained on validation set to map raw LightGBM probabilities to true frequencies
+- New metrics: Expected Calibration Error (ECE) pre/post calibration
+- compute_expected_calibration_error() function added for diagnostics
+- Model now outputs both bounce_prob (calibrated) and bounce_prob_raw
+
+6) Trainer Integration
+- trainer.py updated to pass tier labels to EntryQualityModel
+- Logs exit type distribution, tier distribution, and calibration bin details
+- Diagnostic logs show pre/post ECE and per-bin calibration quality
+
+7) Feature Column Updates
+- feature_engine.py updated to:
+  - Exclude all new label columns from features (avoid leakage)
+  - Explicitly include bounce reaction features as valid training features
+
+Rationale:
+- The old MFE/MAE labeling didn't match execution reality
+- Sequential labeling trains the model on setups that produce clean, direct moves to TP
+- Multi-tier labels give more gradient signal for learning entry quality
+- Bounce reaction features capture microstructure at the moment of potential reversal
+- Probability calibration ensures "60% confidence" actually means 60% win rate
+
+----------------------------------------------------------------------
+v1.1 (Multi-Timeframe EMA Touch Detection - Dec 2025)
+----------------------------------------------------------------------
+Files: labels.py, feature_engine.py
+
+Problem: Only 236 pullback samples found with tight threshold (0.02 ATR); severe overfitting
+
+Solution: Scan ALL timeframes (1m, 5m, 15m, 1h, 4h) for EMA touches to maximize samples
+
+1) New detect_multi_tf_ema_touches() Function
+- Scans each timeframe's EMA9 for touch events
+- Uses INTRABAR HIGH/LOW for touch detection (not just close)
+- Implements directional setup logic:
+  - LONG: EMA slope positive + price above EMA + LOW dips to touch EMA
+  - SHORT: EMA slope negative + price below EMA + HIGH rises to touch EMA
+- Configurable parameters:
+  - touch_threshold_atr: 0.3 (how close is "touching")
+  - min_slope_norm: 0.03 (minimum slope strength)
+  - above_ema_atr: 2.0 (max distance to be "near" EMA)
+
+2) Touch Quality Scoring
+- Combines wick rejection ratio and distance quality
+- Wick rejection: favorable wick / total range (long wick = demand/supply)
+- Distance quality: inverse of ATR distance (closer = better)
+- Overall quality = 0.6 * wick_quality + 0.4 * dist_quality
+
+3) Output Columns (labeling metadata, not features)
+- ema_touch_detected: Boolean, any valid touch found
+- ema_touch_tf: Which timeframe's EMA was touched ('1m', '5m', etc.)
+- ema_touch_direction: 1 for long setup, -1 for short setup
+- ema_touch_quality: Touch quality score (0-1)
+- ema_touch_dist: Distance from EMA in ATR units
+- ema_touch_slope: EMA slope at touch point
+
+4) Integration with Labeling Pipeline
+- label_pullback_outcomes() now uses ema_touch_direction for trend_dir
+- create_training_dataset() uses multi-TF detection by default
+- Prints diagnostic counts per timeframe (long/short splits)
+
+5) Feature Engine Updates
+- All ema_touch_* columns excluded from training features
+- Added 'ema_touch_' to exclude_patterns list
+- These columns are labeling metadata, not predictive features
+
+Expected Benefits:
+- 10-50x more training samples by scanning multiple timeframes
+- Better alignment with trading intuition: "price kisses EMA and bounces"
+- Directional logic ensures proper setup quality (not random touches)
+- Intrabar touch detection captures wicks that briefly tap EMA
+
+----------------------------------------------------------------------
+v1.2 (Hyperparameters and min-bounce-prob tunning - Dec 2025)
+----------------------------------------------------------------------
+
+Summary of Changes
+
+  1. Calibration Fix (models.py:484-498)
+
+  Fixed the issue where IsotonicRegression(out_of_bounds='clip') caused all high-confidence probabilities to map to
+  1.0:
+  - Now detects when raw probabilities fall outside the calibrator's training range
+  - Falls back to raw probability instead of clipped value
+  - Prevents all predictions above X_max from becoming 1.0
+
+  2. Hyperparameter Optimization (hyperopt.py)
+
+  Created a new module with:
+  - LightGBMTuner class using Optuna for Bayesian optimization
+  - Tunes: n_estimators, max_depth, num_leaves, learning_rate, lambda_l1, lambda_l2, min_gain_to_split,
+  feature_fraction, bagging_fraction, bagging_freq
+  - Uses log-loss on validation set as the objective
+
+  3. Threshold Analysis (hyperopt.py)
+
+  - analyze_threshold_performance(): Shows win rate, P&L, profit factor at different min_bounce_prob thresholds
+  - find_optimal_threshold(): Finds optimal threshold maximizing total P&L
+  - analyze_probability_buckets(): Calibration check showing actual vs predicted win rate by bucket
+
+  4. Training Integration (trainer.py)
+
+  - Added tune_hyperparams and n_tuning_trials parameters
+  - Added show_threshold_analysis parameter
+  - Hyperparameter tuning runs BEFORE entry model training
+  - Threshold analysis runs AFTER entry model training
+
+  5. New CLI Flags (train.py)
+
+  - --tune-hyperparams: Enable Optuna hyperparameter tuning
+  - --n-tuning-trials N: Number of Optuna trials (default: 50)
+  - --no-threshold-analysis: Disable threshold analysis output
+
+  Usage Examples
+
+  Standard training with threshold analysis:
+  python train.py --data-dir data/MONUSDT --model-dir models_out --two-pass --trade-side both --min-bounce-prob 0.53
+
+  Training with hyperparameter tuning (50 trials):
+  python train.py --data-dir data/MONUSDT --model-dir models_tuned --two-pass --tune-hyperparams --n-tuning-trials
+  50
+
+  Quick tuning (10 trials) for testing:
+  python train.py --data-dir data/MONUSDT --model-dir models_test --tune-hyperparams --n-tuning-trials 10
+  --train-only
+
+  The output now shows:
+  1. Probability Threshold Analysis table - trades, win rate, total P&L, profit factor at each threshold
+  2. Probability Bucket Analysis - calibration check showing predicted vs actual win rates
+  3. Recommended min_bounce_prob - the threshold that maximizes cumulative P&L
+
+ Summary of Fixes
+
+  1. Threshold Analysis Now Uses RAW Probabilities (trainer.py:404-447)
+
+  - Changed from bounce_prob (calibrated) to bounce_prob_raw
+  - Calibrated probabilities are discrete (due to Isotonic Regression) and unsuitable for threshold optimization
+  - Now shows continuous distribution with meaningful threshold differences
+
+  2. Hyperparameter Tuning Order Fixed (trainer.py:403-500)
+
+  - Before: Tune hyperparams → Train model (wrong order)
+  - After: Train baseline → Show results → Optionally tune → Compare → Keep better model
+  - Baseline metrics are preserved and compared against tuned results
+  - System automatically keeps baseline if tuned model has worse accuracy
+
+  3. Tuning Objective Changed to AUC-ROC (hyperopt.py:335-349)
+
+  - Changed from log-loss (calibration-focused) to AUC-ROC (ranking-focused)
+  - Better for threshold-based trading decisions
+  - Score now shown as positive AUC (0.64) instead of negative loss
+
+  4. Model Comparison and Selection (trainer.py:453-476)
+
+  - Shows side-by-side comparison:
+  Comparison (Baseline vs Tuned):
+    Val Accuracy:  0.593 -> 0.516
+    Val Precision: 0.473 -> 0.401
+    Best Iter:     52 -> 4
+    -> Keeping BASELINE model (better accuracy)
+  - Automatically retrains with baseline params if tuned is worse
+
+----------------------------------------------------------------------
+v1.3 (Model Improvement Techniques - Dec 2025)
+----------------------------------------------------------------------
+Files: models.py, trainer.py, train.py
+
+Added three optional techniques to improve EntryQualityModel precision/accuracy:
+
+1) Noise Injection Feature Selection (--use-noise-filtering)
+   - Adds a random_noise_baseline column to training data
+   - Trains a quick model to get feature importance
+   - Removes any feature that ranks below random noise
+   - Reduces overfitting from weak/useless features
+   - Reports: features removed, features kept, list of removed features
+
+2) Seed Ensembling / Bagging (--use-seed-ensemble, --n-ensemble-seeds N)
+   - Trains N LightGBM models with different random seeds (default: 5)
+   - Averages predictions from all models for final probability
+   - Reduces variance and produces more stable predictions
+   - Reports: number of models, seeds used, best iterations per model
+
+3) CLI Flags Added to train.py:
+   --use-noise-filtering     Enable noise injection feature selection
+   --use-seed-ensemble       Enable seed ensembling
+   --n-ensemble-seeds N      Number of seeds for ensemble (default: 5)
+
+Implementation Details:
+- models.py: Added add_noise_feature(), identify_features_below_noise(),
+  filter_features_by_noise() functions
+- EntryQualityModel.train() now accepts use_noise_filtering, use_seed_ensemble,
+  n_ensemble_seeds parameters
+- EntryQualityModel stores filtered_feature_names and ensemble_classifiers
+- predict() automatically handles filtered features and ensemble averaging
+- save()/load() preserve all ensemble and filtering state
+
+Usage Examples:
+
+  # Standard training (no improvements)
+  python train.py --data-dir data/MONUSDT --model-dir models_out --two-pass
+
+  # With noise filtering only
+  python train.py --data-dir data/MONUSDT --model-dir models_out --two-pass --use-noise-filtering
+
+  # With seed ensembling only (5 models)
+  python train.py --data-dir data/MONUSDT --model-dir models_out --two-pass --use-seed-ensemble
+
+  # With seed ensembling (10 models)
+  python train.py --data-dir data/MONUSDT --model-dir models_out --two-pass --use-seed-ensemble --n-ensemble-seeds 10
+
+  # With both improvements
+  python train.py --data-dir data/MONUSDT --model-dir models_out --two-pass --use-noise-filtering --use-seed-ensemble
+
+Pros and Cons:
+
+Noise Injection Feature Selection:
+  PROS:
+  - Identifies and removes genuinely useless features
+  - Reduces model complexity and potential overfitting
+  - Simple and interpretable (compare to random noise)
+  - Fast (only one quick training pass for feature selection)
+  CONS:
+  - Conservative (may keep marginal features)
+  - Adds small training overhead
+  - Feature importance can vary slightly between runs
+
+Seed Ensembling:
+  PROS:
+  - More stable/robust predictions
+  - Reduces variance in probability estimates
+  - Generally improves out-of-sample performance
+  - Simple to implement and understand
+  CONS:
+  - Multiplies training time by N (number of seeds)
+  - Multiplies model storage size by N
+  - Slightly slower inference (N predictions to average)
+
+----------------------------------------------------------------------
+v1.4 (Probability Calibration Option - Dec 2025)
+----------------------------------------------------------------------
+Agent: Claude
+Date: 2025-12-20
+
+Files Modified:
+- train.py:168-188 - Added --use-calibration and --use-raw-probabilities CLI flags
+- train.py:397 - Pass use_calibration parameter to SimpleBacktester
+- train.py:436 - Added use_calibration to log_params for backtest logging
+- backtest.py:87 - Added use_calibration parameter to SimpleBacktester.__init__
+- backtest.py:106 - Store use_calibration as instance variable
+- backtest.py:244-246 - Log use_calibration flag in diagnostic output
+- backtest.py:303 - Pass use_calibration to entry_model.predict()
+- AGENTS.md - Created new file with instructions for AI agents
+
+Original Intent: User requested to reintroduce the probability calibrator
+(IsotonicRegression) with an option to enable it during backtest. The calibrator
+was already implemented in models.py but was not being used (default use_calibration=False).
+
+Analysis of v1.2 Patch Status:
+The ai-log.txt v1.2 entry mentioned a fix at models.py:484-498 that would detect when
+raw probabilities fall outside the calibrator's training range and fall back to raw
+probability. This patch is NOT present in the current codebase. The current code uses
+standard IsotonicRegression behavior with out_of_bounds='clip'. User requested to
+revert this patch if present, but since it was never applied, no reversion needed.
+
+Changes Made:
+1. Added --use-calibration flag to train.py
+   - Enables Isotonic Regression calibrated probabilities in backtest
+   - Calibrator is trained on validation set during model training
+
+2. Added --use-raw-probabilities flag to train.py
+   - Explicitly uses raw (uncalibrated) probabilities
+   - This is the default behavior
+   - Mutually exclusive with --use-calibration
+
+3. Updated SimpleBacktester to support calibration
+   - Added use_calibration parameter to constructor
+   - Passes flag to entry_model.predict(X, use_calibration=self.use_calibration)
+   - Logs calibration setting in diagnostic output
+
+4. Created AGENTS.md with instructions for AI agents
+   - Mandates updating ai-log.txt after every change
+   - Specifies required format: date/time, agent name, files/lines, intent
+   - Provides codebase overview and testing guidelines
+
+Usage Examples:
+  # Use calibrated probabilities (Isotonic Regression)
+  python train.py --data-dir data/MONUSDT --model-dir models --use-calibration
+
+  # Explicitly use raw probabilities (default behavior)
+  python train.py --data-dir data/MONUSDT --model-dir models --use-raw-probabilities
+
+  # Backtest only with calibration
+  python train.py --data-dir data/MONUSDT --model-dir models --backtest-only --use-calibration
+
+Testing: Not tested (no test data available in current session)
+
+----------------------------------------------------------------------
+v1.5 (Live Calibration Toggle - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 03:28
+Files Modified:
+- predictor.py:95-99,441,520-533 - Added use_calibration option and passed it to entry_model.predict/create_live_predictor
+- live_trading.py:59,240-310,391,1361-1433 - Added calibration default, logging, CLI flags, and wiring to predictor
+- live_trading_funds.py:654-735 - Added calibration CLI flags and wiring to LiveFundsTrader
+- ai-log.txt:511-528 - Added v1.5 entry
+
+Original Intent: Check whether live_trading and live_trading_funds need changes to use calibrated probabilities.
+
+Changes Made:
+1. Added a use_calibration flag to the predictor and passed it to EntryQualityModel.predict().
+2. Added CLI flags in live_trading.py and live_trading_funds.py to enable calibrated probabilities and wired them into the live traders.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.6 (Optuna Config Tuner - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 03:56
+Files Modified:
+- models.py:255-270,456-470,589-646,836-851 - Applied full ModelConfig params across classifiers
+- config_tuner.py:1-450 - Added Optuna-based config tuner for model/feature/label parameters
+- train.py:1-219,343-499 - Added tuning CLI flags, validation, and Optuna tuning flow
+- ai-log.txt:530-548 - Added v1.6 entry
+
+Original Intent: User requested a comprehensive hyperparameter tuner based on config.py to improve validation accuracy and precision.
+
+Changes Made:
+1. Wired missing ModelConfig parameters into Trend/Entry/Regime LightGBM training so tuning affects all models.
+2. Added an Optuna config tuner that searches model/feature/label parameters and scores trials by weighted validation accuracy/precision.
+3. Integrated the tuner into train.py with scope/trial/timeout flags and an optional train-after-tune path.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.7 (LGBM-Only Tuning Flag - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 04:16
+Files Modified:
+- train.py:163,266 - Added --tune-lgbm-only flag and mapped it to tune-scope model
+- ai-log.txt:550-565 - Added v1.7 entry
+
+Original Intent: User requested an option to tune only LightGBM parameters.
+
+Changes Made:
+1. Added a --tune-lgbm-only CLI flag as an alias for model-only Optuna tuning.
+2. Wired the flag to override --tune-scope.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.8 (Persist Training Config - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 04:33
+Files Modified:
+- train.py:1-159,299-319,366-516 - Added train_config.json save/load helpers and backtest-only config restore
+- ai-log.txt:567-583 - Added v1.8 entry
+
+Original Intent: Resolve feature-count mismatch after tune-then-train by reusing the exact training config for backtest-only.
+
+Changes Made:
+1. Save the full TrendFollowerConfig to train_config.json after training (including tune-then-train).
+2. Load train_config.json for backtest-only runs and reapply CLI overrides for data_dir/model_dir/ratios.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.9 (Backtest Feature Guard - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 04:56
+Files Modified:
+- backtest.py:143-178,257 - Added feature mismatch guard using entry model feature names
+- ai-log.txt:584-599 - Added v1.9 entry
+
+Original Intent: User requested a guard to prevent backtests from running with mismatched feature sets.
+
+Changes Made:
+1. Added feature name validation against the entry model to detect missing/extra columns.
+2. Ensured backtest uses the expected feature order when only order differs.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.10 (Backtest Guard Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 05:11
+Files Modified:
+- backtest.py:150-192 - Restored grade analysis/trade index init to __init__ (fixes AttributeError)
+- ai-log.txt:601-616 - Added v1.10 entry
+
+Original Intent: Fix AttributeError: SimpleBacktester has no _grade_analysis after adding feature guard.
+
+Changes Made:
+1. Moved _trades_by_bar initialization and _grade_analysis back into SimpleBacktester.__init__.
+2. Removed unreachable code block accidentally nested inside _validate_feature_columns.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.11 (Live Config Loader - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 05:18
+Files Modified:
+- live_trading.py:33-86,301-328 - Added train_config.json loader and auto-apply for live configs
+- ai-log.txt:618-633 - Added v1.11 entry
+
+Original Intent: User requested loading Optuna-tuned configs for live trading.
+
+Changes Made:
+1. Added helpers to read train_config.json and apply it to TrendFollowerConfig.
+2. LivePaperTrader now loads the training config when present, falling back to EMA9 defaults otherwise.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.12 (Train From Tuning Summary - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 05:27
+Files Modified:
+- train.py:205-250,426-477 - Added --train-from-tuning flag to train from best_config in tuning summary
+- ai-log.txt:635-650 - Added v1.12 entry
+
+Original Intent: User requested a flag to train from Optuna tuning results without re-running tuning.
+
+Changes Made:
+1. Added --train-from-tuning to load best_config from a tuning summary JSON.
+2. Wired training to use that config and persist train_config.json afterward.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.13 (Default Tune Summary Save - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 06:28
+Files Modified:
+- train.py:205-212,473-487 - Default Optuna tuning summary save to model-dir/tuning_summary.json
+- ai-log.txt:652-667 - Added v1.13 entry
+
+Original Intent: User requested Optuna tune results be saved by default in model-dir.
+
+Changes Made:
+1. Set default tuning summary path to model-dir/tuning_summary.json when --tune-save-results is not provided.
+2. Updated CLI help text to reflect the default save behavior.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.14 (Default Train-From-Tuning Path - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 06:32
+Files Modified:
+- train.py:205-214,428-436 - Allow --train-from-tuning with no path to use model-dir/tuning_summary.json
+- ai-log.txt:669-684 - Added v1.14 entry
+
+Original Intent: User requested default behavior for --train-from-tuning to use model-dir.
+
+Changes Made:
+1. Made --train-from-tuning accept an optional path argument with a model-dir default.
+2. Updated the training flow to resolve the default path when no value is provided.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.15 (Ensure Tune Summary Dir - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 06:38
+Files Modified:
+- train.py:484-486 - Ensure tuning summary directory exists before writing
+- ai-log.txt:686-700 - Added v1.15 entry
+
+Original Intent: Fix FileNotFoundError when saving tuning_summary.json to a missing model-dir.
+
+Changes Made:
+1. Create the parent directory for the tuning summary file before writing.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.16 (Trade Collector Header Mode - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 06:51
+Files Modified:
+- trade_collector.py:23-226 - Added header-mode auto-detection and CLI flag to match existing CSV format
+
+Original Intent: User requested trade_collector be compatible with the existing collected data.
+
+Changes Made:
+1. Added header-mode handling (auto/with-header/no-header) with detection of existing files or sibling CSVs.
+2. Added a --header-mode CLI flag and preserved current behavior unless compatibility requires headerless output.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.17 (Live Config Fallback Log - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 07:33
+Files Modified:
+- live_trading.py:350-359 - Log when train_config.json is missing and defaults are used
+
+Original Intent: User asked to log when live trading falls back to defaults.
+
+Changes Made:
+1. Added a warning log when train_config.json is not found so fallback is visible in console.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.18 (Live Lookback Window - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 08:27
+Files Modified:
+- live_trading.py:198-645,1552-1561 - Added lookback-days support, trade buffer trimming, and bootstrap filtering
+- live_trading_funds.py:682-748 - Added --lookback-days flag and passed to LiveFundsTrader
+
+Original Intent: User requested a live-trading lookback option to cap memory use and only use recent trades.
+
+Changes Made:
+1. Added TradeBuffer max-age trimming and LivePaperTrader lookback-days plumbing.
+2. Applied lookback filtering to bootstrap trade loads and exposed the CLI flag in live_trading and live_trading_funds.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.19 (Funds Incremental Bar Gate - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 19:14
+Files Modified:
+- live_trading_funds.py:332-353 - Use incremental last_bar_time when validating completed bars in funds mode
+- ai-log.txt:749-764 - Added v1.19 entry
+
+Original Intent: User reported live_trading_funds not opening positions with incremental features and min bounce prob set.
+
+Changes Made:
+1. Adjusted funds-mode stale bar gate to use incremental last_bar_time when incremental mode is enabled.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.20 (Funds Unknown Grade Guard - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-20 19:42
+Files Modified:
+- live_trading_funds.py:593-605 - Guard stats grade buckets when signal_quality is non-standard (e.g., N/A)
+- ai-log.txt:765-779 - Added v1.20 entry
+
+Original Intent: User reported KeyError 'N/A' after closing an exchange position manually.
+
+Changes Made:
+1. Added grade fallback and dict initialization for non-standard signal_quality values before updating stats.
+
+Testing: Not tested (not requested)
+
+----------------------------------------------------------------------
+v1.21 (Incremental Feature Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 13:19
+Files Modified:
+- incremental_features.py:912-962,1112-1147 - Guard out-of-order bars and normalize base bar_time publishing for HTF alignment
+- predictor.py:106-545 - Base TF wiring for incremental engine, ordered warmup/batch updates, and on-the-fly EMA-touch/bounce features in full mode
+- live_trading.py:972-977 - Use configured base_tf for incremental last_bar_time
+- ai-log.txt:782-801 - Added v1.21 entry
+
+Original Intent: User requested incremental features match full/backtest features,
+mitigate HTF alignment drift, and quantify numeric drift.
+
+Changes Made:
+1. Normalized base timeframe handling and update order to keep HTF/partial HTF alignment consistent.
+2. Added single-bar EMA-touch/bounce feature computation for legacy predictions to match training/backtest inputs.
+3. Added out-of-order bar guards and normalized bar_time handling in the incremental engine.
+
+Testing: Drift comparison script on data/MONUSDT (last 10 days) using full vs incremental features.
+
+----------------------------------------------------------------------
+v1.22 (Backtest Comparison Script - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 13:42
+Files Modified:
+- compare_backtests.py:1-288 - Added script to compare full vs incremental backtests, including trade overlap and bounce-probability drift stats.
+- ai-log.txt:803-818 - Added v1.22 entry
+
+Original Intent: User requested a script to compare incremental-feature backtests to the normal backtest with configurable stop/TP, min bounce prob, and calibration.
+
+Changes Made:
+1. Added compare_backtests.py to run both backtests, summarize metrics, list trade differences, and report bounce-probability drift per bar.
+2. Exposed CLI arguments for stop-loss-atr, take-profit-rr, min-bounce-prob, and use-calibration.
+
+Testing: Not tested (script added; user to run).
+
+----------------------------------------------------------------------
+v1.23 (Backtest Script Defaults - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 13:48
+Files Modified:
+- compare_backtests.py:59-280 - Added backtest CLI flags to mirror train.py, default trade_side to both, and report metric deltas
+- ai-log.txt:820-835 - Added v1.23 entry
+
+Original Intent: User requested the comparison script mimic train.py backtest settings, keep touch_threshold_atr/max_bounce_prob unmodified, and default trade_side=both.
+
+Changes Made:
+1. Added flags for max_bounce_prob, touch_threshold_atr, stop_padding_pct, cooldown, trade_side, and use_dynamic_rr.
+2. Aligned backtest kwargs with train.py (min_quality default B, raw_trades=trades) and added metric deltas.
+
+Testing: Not tested (script updated; user to run).
+
+----------------------------------------------------------------------
+v1.24 (Live Predictor Backtest Replay - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 14:12
+Files Modified:
+- live_trading_backtest_compare.py:1-320 - Added live-style trade replay using predictor.py and comparison to full backtest
+- ai-log.txt:837-851 - Added v1.24 entry
+
+Original Intent: User requested a replay-style backtest that feeds incoming trades through predictor.py and compares results to the normal backtest, with the same CLI arguments as compare_backtests.py.
+
+Changes Made:
+1. Implemented live_trading_backtest_compare.py to stream trades into IncrementalBarAggregator, update TrendFollowerPredictor, and capture features per base bar.
+2. Added comparison outputs (metrics, trade overlap, bounce-prob drift) aligned to the standard backtest split.
+
+Testing: Not tested (script added; user to run).
+
+----------------------------------------------------------------------
+v1.25 (Live EMA Touch Gate - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 15:32
+Files Modified:
+- live_trading.py:1075-1140 - Use bar-close price for entry decisions and gate entries on EMA touch detection
+- ai-log.txt:853-869 - Added v1.25 entry
+
+Original Intent: User asked to make live_trading_funds use ema_touch_detected and use bar close price to reduce price source mismatch.
+
+Changes Made:
+1. Switched entry decision price to the latest completed bar close when available.
+2. Added EMA-touch gating using incremental ema_touch_detected (with base-bar fallback for legacy mode).
+
+Testing: Not tested (not requested).
+
+----------------------------------------------------------------------
+v1.26 (Funds SL/TP Anchored to Bar Close - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 15:57
+Files Modified:
+- live_trading_funds.py:372-419 - Keep SL/TP and sizing anchored to bar close while using live price only for freshness checks
+- ai-log.txt:871-886 - Added v1.26 entry
+
+Original Intent: User asked to anchor SL/TP to the bar close to match backtest behavior.
+
+Changes Made:
+1. Kept stop/target calculations tied to the signal (bar-close) price.
+2. Retained live price checks for staleness/deviation without shifting SL/TP.
+
+Testing: Not tested (not requested).
+
+----------------------------------------------------------------------
+v1.27 (Entry Guard Note - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 16:17
+Files Modified:
+- dev-notes.txt:5-9 - Documented the live entry deviation guard with location and last-checked date
+- ai-log.txt:888-903 - Added v1.27 entry
+
+Original Intent: User requested a human-readable note describing the entry guard, its file/lines, and last-checked date.
+
+Changes Made:
+1. Added a dev-notes entry summarizing the max_entry_deviation_atr guard and where it lives.
+
+Testing: Not tested (documentation only).
+
+----------------------------------------------------------------------
+v1.28 (Funds Simulation Compare - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 16:56
+Files Modified:
+- live_trading_funds_simulation_compare.py:1-605 - Added offline trade replay using incremental live logic and comparison to full-feature backtest
+- ai-log.txt:905-920 - Added v1.28 entry
+
+Original Intent: User requested an offline live-trading simulator that replays historical trades with incremental features and compares results to a full-feature backtest.
+
+Changes Made:
+1. Implemented live_trading_funds_simulation_compare.py to replay trades, run a live-style incremental simulation, and compare metrics/trade overlap against a full-feature backtest.
+
+Testing: Not tested (script added; user to run).
+
+----------------------------------------------------------------------
+v1.29 (Simulated Funds Entry Fill Modes - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 17:38
+Files Modified:
+- live_trading_funds_simulated.py:67-636 - Added entry fill mode control, warmup-gated replay using _handle_trade_message, and dual-mode comparison summaries
+- ai-log.txt:921-936 - Added v1.29 entry
+
+Original Intent: User requested live_trading_funds_simulated.py compare bar-close vs last-trade entry fills while replaying live funds logic against a full-feature backtest.
+
+Changes Made:
+1. Added simulated exchange entry_price_override and entry_fill_mode wiring to compare bar-close vs last-trade fills.
+2. Switched trade replay to use _handle_trade_message with warmup gating, and ran both entry modes with overlap/P&L diff summaries.
+
+Testing: Not tested (script updated; user to run).
+
+----------------------------------------------------------------------
+v1.30 (EMA Touch Mode Flags - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 18:47
+Files Modified:
+- live_trading_funds_simulated.py:207-664 - Added EMA touch mode (base vs multi), base-TF touch override, and CLI flag; passed to sim/backtest
+- backtest.py:86-415 - Added ema_touch_mode option to use multi-TF EMA touch detection when available
+- train.py:127-742 - Added --ema-touch-mode flag, passed to backtest, and logged in backtest params
+- ai-log.txt:938-956 - Added v1.30 entry
+
+Original Intent: User requested flags to compare base-TF vs multi-TF EMA touch detection in backtests and live funds simulation.
+
+Changes Made:
+1. Added ema_touch_mode to SimpleBacktester and a base default with multi-TF option when ema_touch_detected is present.
+2. Added --ema-touch-mode to train.py and live_trading_funds_simulated.py, wiring it into backtest and live-sim entry gating.
+3. Implemented base-TF EMA touch computation override for simulated live trading while keeping incremental features.
+
+Testing: Not tested (user to run backtests).
+
+----------------------------------------------------------------------
+v1.31 (EMA Touch Diff Diagnostics - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 19:57
+Files Modified:
+- live_trading_funds_simulated.py:266-883 - Added EMA touch diff diagnostics, base-touch dist support, and CLI flags to dump mismatches
+- ai-log.txt:958-974 - Added v1.31 entry
+
+Original Intent: User requested diagnostics to explain EMA touch mismatches between full backtest and live funds simulation.
+
+Changes Made:
+1. Added --dump-touch-diffs/--dump-touch-limit to compare per-bar EMA touch detection between full and live replay.
+2. Captured live touch snapshots during replay and summarized mismatches with timestamps and distances.
+3. Added base-touch dist calculation to aid debugging when using base-TF touch mode.
+
+Testing: Not tested (diagnostic output only).
+
+----------------------------------------------------------------------
+v1.32 (Print Full/Live Trades - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 20:29
+Files Modified:
+- live_trading_funds_simulated.py:364-368,872-888 - Added --print-all-trades flag and optional full/live trade listing output
+- ai-log.txt:976-991 - Added v1.32 entry
+
+Original Intent: User requested printing all positions opened by the full backtest and live simulator to debug trade count differences.
+
+Changes Made:
+1. Added --print-all-trades flag to live_trading_funds_simulated.py.
+2. Printed full backtest and live simulation trades when the flag is enabled.
+
+Testing: Not tested (output change only).
+
+----------------------------------------------------------------------
+v1.33 (Comparison Report File - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 20:52
+Files Modified:
+- live_trading_funds_simulated.py:364-391,403-573,647-938 - Added --report-file and routed comparison output through report printer
+- ai-log.txt:993-1009 - Added v1.33 entry
+
+Original Intent: User requested writing all backtest comparison statistics to a file for easier diagnosis.
+
+Changes Made:
+1. Added --report-file to write all comparison output to disk while still printing to console.
+2. Routed summary, overlap, touch diff, trade list, and replay progress output through the report printer.
+
+Testing: Not tested (output change only).
+
+----------------------------------------------------------------------
+v1.34 (Detailed Comparison Report - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 21:17
+Files Modified:
+- live_trading_funds_simulated.py:379-1054,1279-1664 - Added detailed bar-level diagnostics, live snapshot capture, and CSV report sections (EMA touch/EMA values/bounce probs)
+- ai-log.txt:1010-1027 - Added v1.34 entry
+
+Original Intent: User requested a comprehensive report that includes EMA touch details, EMA values, and bounce probabilities for full vs live to diagnose differences.
+
+Changes Made:
+1. Added bar-level diagnostics collection for live simulation and full backtest, including EMA touch TF/EMA values and bounce probabilities.
+2. Wrote CSV sections for full/live trades and per-bar comparisons (all bars and diffs only) into the report file.
+3. Expanded report config section to capture key parameters used in the comparison.
+
+Testing: Not tested (report output only).
+
+----------------------------------------------------------------------
+v1.35 (Entry Guard Diagnostics - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 21:55
+Files Modified:
+- live_trading_funds_simulated.py:51-443,949-1068 - Added entry guard diagnostics, more explicit no-signal reason, and CSV fields for guard details
+- ai-log.txt:1029-1046 - Added v1.35 entry
+
+Original Intent: User requested entry guard reasons in the report and clearer live skip reasons.
+
+Changes Made:
+1. Added entry guard tracking in the simulated live trader (price deviation, stale bar, margin/qty, order failure).
+2. Updated live skip reason to report when signals are not calculated due to an open position.
+3. Wrote entry guard fields into the bar comparison CSV sections.
+
+Testing: Not tested (report output only).
+
+----------------------------------------------------------------------
+v1.36 (Predictor Entry Feature Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 22:18
+Files Modified:
+- predictor.py:142-176,506-510 - Align predictor entry feature list to the entry model, retaining trend list for trend predictions
+- ai-log.txt:1045-1061 - Added v1.36 entry
+
+Original Intent: User requested predictor to use the same feature list as backtest/training for live predictions.
+
+Changes Made:
+1. Loaded entry model feature names (filtered_feature_names or feature_names) in predictor.load_models with a trend list fallback.
+2. Used trend_feature_cols for trend predictions while keeping entry feature columns for entry predictions.
+
+Testing: Not tested (logic change only).
+
+----------------------------------------------------------------------
+v1.37 (Live Feature Diff Reporting - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5 (Codex)
+Date: 2025-12-21 22:59
+Files Modified:
+- live_trading_funds_simulated.py:880-2112 - Added entry-open detection override, per-bar feature capture, entry feature diffs, and 10-minute feature snapshots in the report
+- ai-log.txt:1062-1080 - Added v1.37 entry
+
+Original Intent: User requested the report capture live-only entries and dump per-feature diffs plus 10-minute feature snapshots.
+
+Changes Made:
+1. Captured entry-open events even when positions close and reopen in the same tick, and stored full feature vectors per bar.
+2. Added entry feature diff CSV and 10-minute feature snapshot CSV sections to the report, plus a feature column list.
+3. Captured live feature snapshots every 10 minutes during replay for comparison with full features.
+
+Testing: Not tested (report output changes only).
+
+----------------------------------------------------------------------
+v1.38 (EMA Touch Mode for Funds + Diagnostic Logging - Dec 2025)
+----------------------------------------------------------------------
+Agent: Claude (Opus 4.5)
+Date: 2025-12-22 00:00
+
+Files Modified:
+- live_trading_funds.py:146-273,795-850 - Added ema_touch_mode parameter, _compute_base_tf_touch(), overridden _get_feature_value(), and CLI --ema-touch-mode flag
+- incremental_features.py:912-1158 - Added last_touch_diagnostic attribute and detailed diagnostic logging in _compute_ema_touch_features()
+- live_trading_funds_simulated.py:1689-1717,1558-1616 - Updated record_touch() to capture diagnostic info and _summarize_touch_diffs() to print detailed diagnostics
+
+Original Intent: User requested:
+1. Add --ema-touch-mode argument to live_trading_funds.py (same as live_trading_funds_simulated.py)
+2. Log TF, slope value, and threshold comparison details when _compute_ema_touch_features() is called
+3. Investigate divergence between incremental features and batch mode features in backtest
+
+Changes Made:
+1. Added ema_touch_mode parameter to LiveFundsTrader
+   - Accepts "base" or "multi" (default: "base")
+   - "base" mode uses only base TF EMA touch detection (matches backtest)
+   - "multi" mode uses multi-TF detection from incremental features
+
+2. Added _compute_base_tf_touch() method to LiveFundsTrader
+   - Computes base-TF-only EMA touch detection
+   - Matches the backtest logic for consistent behavior
+
+3. Overrode _get_feature_value() in LiveFundsTrader
+   - Intercepts ema_touch_detected, ema_touch_direction, ema_touch_dist
+   - Returns base-TF touch values when ema_touch_mode="base"
+   - Falls back to parent implementation for other features or "multi" mode
+
+4. Added --ema-touch-mode CLI argument to live_trading_funds.py
+   - Choices: "base" (default), "multi"
+   - Help text explains the difference between modes
+
+5. Added last_touch_diagnostic to IncrementalFeatureEngine
+   - Captures bar_time, config (threshold, min_slope, pullback_ema), bar_info (OHLC)
+   - Captures ATR value and skip_reason if applicable
+   - Captures checked_tfs list with per-TF details:
+     - tf, ema_key, ema_val, slope_key, slope_val, min_slope, threshold
+     - setup (long/short), dist, dist_in_range, decision, reason
+     - quality (if touch detected)
+
+6. Updated _compute_ema_touch_features() to populate diagnostic info
+   - Logs every TF check with detailed slope/distance/threshold comparisons
+   - Captures why each TF was skipped or why touch was/wasn't detected
+   - Stores final result in diagnostic
+
+7. Updated record_touch() in live_trading_funds_simulated.py
+   - Captures incremental_engine.last_touch_diagnostic when available
+   - Stores in touch_snapshot for later analysis
+
+8. Updated _summarize_touch_diffs() to print diagnostic info
+   - On mismatch, prints threshold_atr, min_slope, ATR, bar OHLC
+   - Prints skip_reason if applicable
+   - Prints per-TF checks with slope, dist, decision, and reason
+
+Testing: Not tested (user to run live_trading_funds_simulated.py with --dump-touch-diffs to see diagnostics)
+
+Usage Example:
+  # Run simulation with touch diff diagnostics (multi mode)
+  python live_trading_funds_simulated.py --model-dir ./models/MONUSDT --data-dir ./data/MONUSDT \
+    --lookback-days 25 --entry-fill-mode bar_close --stop-loss-atr 1 --take-profit-rr 2 \
+    --min-bounce-prob 0.46 --ema-touch-mode multi --dump-touch-diffs --dump-touch-limit 1000 \
+    --print-all-trades --report-file ./logs/live_backtest_comparison/log.txt
+
+END

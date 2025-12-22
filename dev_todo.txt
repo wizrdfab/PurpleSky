@@ -1,0 +1,4 @@
+
+1) We need to check whether the new incremental features calculator calculates the features in the same way that in backtest.
+
+2)We need to make sure we handle weird situations from the API (I need to explain to the AI how we got a case in which the program reported the Price was around 0.023, but the actual Price was 0.02, and not only that, it closed a position in paper (real position was still open) despite the position didn't reach the TP nor SL -the position was closed as if TP was hit-

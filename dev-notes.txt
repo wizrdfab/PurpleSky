@@ -1,0 +1,9 @@
+18-12-2025 12:14
+
+I changed the purge logic for splits, and the limit is defined based solely on entry_forward (instead of also trend forward), since we are using only the entry quality model
+
+2025-12-21 16:17
+
+Entry guard (max_entry_deviation_atr): skips entries when abs(live_price - signal_price) / ATR exceeds the threshold (stale bar protection).
+Location: live_trading_funds.py:387-404
+Last checked: 2025-12-21 16:17

@@ -1,0 +1,135 @@
+# ============================================================================
+# Sofia LightGBM - Git Ignore Configuration
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# LARGE DATA FILES (DO NOT UPLOAD - See DATA_SETUP.md for sync instructions)
+# ----------------------------------------------------------------------------
+data/
+data_collector/
+
+# ----------------------------------------------------------------------------
+# Python
+# ----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# ----------------------------------------------------------------------------
+# IDE and Editor
+# ----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ----------------------------------------------------------------------------
+# Local Configuration and Secrets
+# ----------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+*.local.py
+secrets.py
+credentials.py
+config.local.py
+
+# ----------------------------------------------------------------------------
+# Logs and Runtime Files (keep structure, ignore contents)
+# ----------------------------------------------------------------------------
+logs/
+logs_live_trading_funds/
+logs-paper-trading/
+live_trading_logs/
+live_trading_funds_logs/
+live_results_logs/
+live_results_funds_logs/
+live_results_funds/
+live_results_simulated/
+backtests-logs-at-close/
+
+# ----------------------------------------------------------------------------
+# Models (trained model artifacts - regeneratable)
+# ----------------------------------------------------------------------------
+models/
+models_*/
+
+# ----------------------------------------------------------------------------
+# Database and Cache
+# ----------------------------------------------------------------------------
+*.sqlite3
+*.db
+*.cache
+.cache/
+
+# ----------------------------------------------------------------------------
+# Temporary and Error Files
+# ----------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+nul
+___All_Errors.txt
+__train.txt_Error.txt
+Errors to report.txt
+
+# ----------------------------------------------------------------------------
+# OS Generated
+# ----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ----------------------------------------------------------------------------
+# Claude Code / AI Tools
+# ----------------------------------------------------------------------------
+.claude/
+
+# ----------------------------------------------------------------------------
+# External Dependencies (vendored)
+# ----------------------------------------------------------------------------
+pybit-master/
+
+# ----------------------------------------------------------------------------
+# Keep these files tracked (use ! to negate ignore)
+# ----------------------------------------------------------------------------
+!.gitkeep
+!requirements.txt
+!AGENTS.md
+!Manual.md
+!README.txt
