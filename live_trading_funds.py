@@ -697,6 +697,9 @@ class LiveFundsTrader(LivePaperTrader):
     def _save_trade_dict(self, trade_dict: dict) -> None:
         """Write a pre-built trade dict (used to include exchange metadata)."""
         try:
+            # Ensure log directory exists
+            self.trades_file.parent.mkdir(parents=True, exist_ok=True)
+
             trades = []
             if self.trades_file.exists():
                 with open(self.trades_file, "r", encoding="utf-8") as f:
