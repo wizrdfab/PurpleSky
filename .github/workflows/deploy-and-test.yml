@@ -119,12 +119,12 @@ jobs:
 
           # Pull latest changes or clone (uses SSH for private repo)
           if [ -d ".git" ]; then
+            # Ensure remote uses SSH URL (for private repos)
+            git remote set-url origin git@github.com:${{ github.repository }}.git
             git fetch origin
             git reset --hard origin/main
           else
-            # Try SSH first (for private repos with deploy key), fallback to HTTPS
-            git clone git@github.com:${{ github.repository }}.git . || \
-            git clone https://github.com/${{ github.repository }}.git .
+            git clone git@github.com:${{ github.repository }}.git .
           fi
 
           # Create virtual environment if it doesn't exist
