@@ -49,6 +49,12 @@ jobs:
           ssh ${{ secrets.AZURE_VM_USER }}@${{ secrets.AZURE_VM_HOST }} << 'REMOTE_SCRIPT'
           cd "${{ secrets.AZURE_VM_PATH }}" || cd ~/sofia
 
+          # Activate virtual environment if it exists
+          if [ -f "venv/bin/activate" ]; then
+            source venv/bin/activate
+            echo "Virtual environment activated"
+          fi
+
           echo "=== Command Output ==="
           echo "Working directory: $(pwd)"
           echo "Time: $(date)"

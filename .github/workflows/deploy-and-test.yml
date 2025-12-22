@@ -124,10 +124,19 @@ jobs:
             git clone https://github.com/${{ github.repository }}.git .
           fi
 
-          # Install/update dependencies
+          # Create virtual environment if it doesn't exist
+          if [ ! -d "venv" ]; then
+            echo "Creating virtual environment..."
+            python3 -m venv venv
+          fi
+
+          # Activate virtual environment and install dependencies
+          source venv/bin/activate
+          pip install --upgrade pip --quiet
           pip install -r requirements.txt --quiet
 
           echo "Deployment completed at $(date)"
+          echo "Virtual environment: $DEPLOY_PATH/venv"
           DEPLOY_SCRIPT
 
           # Copy and execute
@@ -179,6 +188,9 @@ jobs:
 
           DEPLOY_PATH="${AZURE_VM_PATH:-/home/$USER/sofia}"
           cd "$DEPLOY_PATH"
+
+          # Activate virtual environment
+          source venv/bin/activate
 
           TEST_TYPE="$1"
           RESULTS_FILE="/tmp/sofia_test_results.txt"
