@@ -1,4 +1,0 @@
-# Requirements for scripts (download utilities, etc.)
-# Install with: pip install -r scripts/requirements.txt
-
-selenium>=4.15.0
