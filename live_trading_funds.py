@@ -165,6 +165,7 @@ class LiveFundsTrader(LivePaperTrader):
         self._qty_step: float = 0.0
         self._min_qty: float = 0.0
         self._tick_size: float = 0.0
+        self._min_notional: float = 5.0  # Default Bybit minimum order value in USDT
         self._last_entry_skip_log: Optional[datetime] = None
         self._max_entry_price_deviation_atr: float = max(0.0, float(max_entry_deviation_atr))  # safety: skip if signal price is too far from live
 
@@ -204,6 +205,10 @@ class LiveFundsTrader(LivePaperTrader):
         self._qty_step = _to_float(lot.get("qtyStep"), 0.0) or 0.0
         self._min_qty = _to_float(lot.get("minOrderQty"), 0.0) or 0.0
         self._tick_size = _to_float(price_filter.get("tickSize"), 0.0) or 0.0
+        # Bybit minNotionalValue (minimum order value in USDT, e.g., 5 USDT)
+        min_notional = _to_float(lot.get("minNotionalValue"), None)
+        if min_notional is not None and min_notional > 0:
+            self._min_notional = min_notional
 
     def _round_qty(self, qty: float) -> float:
         self._load_instrument_filters()
@@ -495,9 +500,37 @@ class LiveFundsTrader(LivePaperTrader):
 
         qty = risk_amount / risk_per_unit
         qty = self._round_qty(qty)
-        if qty <= 0:
-            self.logger.warning("Computed qty is below exchange minimum; skipping entry.")
+
+        # Negative qty indicates misconfiguration (e.g., negative position_size_pct) - do not trade
+        if qty < 0:
+            self.logger.error(f"Negative qty calculated ({qty:.6f}) - possible config bug. Skipping entry.")
             return
+
+        # Check if order value meets minimum notional requirement
+        self._load_instrument_filters()
+        notional = qty * price if qty > 0 else 0.0
+        used_min_qty_fallback = False
+
+        if qty == 0 or notional < self._min_notional:
+            # Fall back to minimum order quantity instead of skipping
+            if self._min_qty > 0:
+                min_notional_check = self._min_qty * price
+                if min_notional_check >= self._min_notional:
+                    self.logger.warning(
+                        f"Risk-based qty too small (notional ${notional:.2f} < ${self._min_notional:.2f} min). "
+                        f"Using minimum qty {self._min_qty:.6f} instead."
+                    )
+                    qty = self._min_qty
+                    used_min_qty_fallback = True
+                else:
+                    self.logger.warning(
+                        f"Even minimum qty ({self._min_qty:.6f}) results in notional ${min_notional_check:.2f} "
+                        f"which is below exchange minimum ${self._min_notional:.2f}. Skipping entry."
+                    )
+                    return
+            else:
+                self.logger.warning("Computed qty is below exchange minimum and no min_qty available; skipping entry.")
+                return
 
         # Ensure margin feasibility: margin ~= notional/leverage
         notional = qty * price
@@ -545,6 +578,7 @@ class LiveFundsTrader(LivePaperTrader):
                 "leverage": self.leverage,
                 "balance_asset": self.balance_asset,
                 "balance_available": balance,
+                "used_min_qty_fallback": used_min_qty_fallback,
             },
         )
 
@@ -559,7 +593,8 @@ class LiveFundsTrader(LivePaperTrader):
         pad_pct = getattr(self, "stop_padding_pct", 0.0) * 100
         self.logger.info(f"   Stop Loss:  {stop_loss:.6f} ({self.stop_loss_atr} ATR + {pad_pct:.3f}% pad)")
         self.logger.info(f"   Take Profit:{take_profit:.6f} ({self.take_profit_rr}:1 R:R)")
-        self.logger.info(f"   Qty:        {qty:.6f} units (risk ${risk_amount:.2f}, lev {self.leverage}x)")
+        qty_note = " [MIN QTY]" if used_min_qty_fallback else ""
+        self.logger.info(f"   Qty:        {qty:.6f} units{qty_note} (risk ${risk_amount:.2f}, lev {self.leverage}x)")
         self.logger.info("=" * 70)
 
     def _check_exit(self, current_atr: float):

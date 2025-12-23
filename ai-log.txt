@@ -1143,4 +1143,47 @@ Usage Example:
     --min-bounce-prob 0.46 --ema-touch-mode multi --dump-touch-diffs --dump-touch-limit 1000 \
     --print-all-trades --report-file ./logs/live_backtest_comparison/log.txt
 
+----------------------------------------------------------------------
+v1.39 (Minimum Order Value Fallback - Dec 2025)
+----------------------------------------------------------------------
+Agent: Claude (Opus 4.5)
+Date: 2025-12-23 00:00
+
+Files Modified:
+- live_trading_funds.py:163-168,195-211,501-528,561-593 - Added min notional tracking and fallback to minimum qty
+
+Original Intent: User reported Bybit error "Order does not meet minimum order value 5USDT"
+when the 2% risk-based position size resulted in an order value below the exchange minimum.
+User requested using minimum order quantity instead of skipping the trade entirely.
+
+Changes Made:
+1. Added _min_notional instance variable (default 5.0 USDT)
+   - Stores the exchange's minimum order value requirement
+   - Loaded from instrument info lotSizeFilter.minNotionalValue if available
+
+2. Updated _load_instrument_filters() to load minNotionalValue
+   - Fetches minNotionalValue from Bybit instrument info
+   - Falls back to 5.0 USDT if not available
+
+3. Modified _open_position() position sizing logic
+   - Added explicit check for qty < 0 (indicates config bug like negative position_size_pct)
+     - Logs error and skips entry - do NOT mask config bugs by using min_qty
+   - Separate check for qty == 0 or notional < min_notional (legitimate small-size case)
+     - Falls back to using min_qty (minimum order quantity)
+   - Logs warning when fallback is used:
+     "Risk-based qty too small (notional $X.XX < $5.00 min). Using minimum qty X.XXXXXX instead."
+   - If even min_qty doesn't meet the notional requirement, skips entry with warning
+   - Preserves the same SL/TP targets (anchored to bar close price)
+
+4. Updated position metadata and logging
+   - Added "used_min_qty_fallback" to position metadata for auditability
+   - Added "[MIN QTY]" indicator in order log when fallback is used
+
+Behavior:
+- Normal case: Uses 2% risk-based position sizing
+- Small account/high price case: Falls back to minimum qty to meet 5 USDT minimum
+- Edge case: If min_qty * price < 5 USDT, skips entry (extremely rare)
+
+Testing: Not tested (user to deploy and verify on live trading)
+
 END
