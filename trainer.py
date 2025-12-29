@@ -5,16 +5,69 @@ Orchestrates data loading, feature engineering, labeling, and model training.
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 import time
 
 from config import TrendFollowerConfig, DEFAULT_CONFIG
 from data_loader import load_trades, preprocess_trades, create_multi_timeframe_bars
 from feature_engine import calculate_multi_timeframe_features, get_feature_columns
 from labels import create_training_dataset, detect_pullback_zones
-from models import TrendFollowerModels
+from models import TrendFollowerModels, TrendClassifier, RegimeClassifier, append_context_features
 from diagnostic_logger import DiagnosticLogger
 
+
+def _slice_pred(pred, mask):
+    if pred is None:
+        return None
+    mask_arr = np.asarray(mask, dtype=bool)
+    sliced = {}
+    for key, values in pred.items():
+        arr = np.asarray(values)
+        if arr.shape[0] == mask_arr.shape[0]:
+            sliced[key] = arr[mask_arr]
+    return sliced
+
+
+def _oof_context_preds(model_cls, X, y, config: TrendFollowerConfig, n_folds: int = 3) -> Optional[Dict[str, np.ndarray]]:
+    if X is None or len(X) == 0 or n_folds < 2:
+        return None
+    n = len(X)
+    if n < max(30, n_folds * 10):
+        return None
+    y_series = pd.Series(y).reset_index(drop=True)
+    if y_series.nunique() < 2:
+        return None
+
+    indices = np.arange(n)
+    fold_indices = np.array_split(indices, n_folds)
+    preds: Optional[Dict[str, np.ndarray]] = None
+
+    for idx in fold_indices:
+        if idx.size == 0:
+            continue
+        train_end = int(idx[0])
+        if train_end <= 1:
+            continue
+        y_train = y_series.iloc[:train_end]
+        if y_train.nunique() < 2:
+            continue
+        model = model_cls(config.model)
+        model.train(
+            X.iloc[:train_end],
+            y_train,
+            None,
+            None,
+            verbose=False,
+        )
+        fold_pred = model.predict(X.iloc[idx])
+        if preds is None:
+            preds = {key: np.zeros(n, dtype=float) for key in fold_pred.keys()}
+        for key, values in fold_pred.items():
+            arr = np.asarray(values)
+            if key in preds and arr.shape[0] == idx.size:
+                preds[key][idx] = arr
+
+    return preds
 
 def time_series_split(
     df: pd.DataFrame,
@@ -52,6 +105,9 @@ def run_training_pipeline(
     use_noise_filtering: bool = False,
     use_seed_ensemble: bool = False,
     n_ensemble_seeds: int = 5,
+    use_rust_pipeline: bool = True,
+    rust_cache_dir: str = "rust_cache",
+    rust_write_intermediate: bool = False,
 ) -> Dict:
     """
     Run the complete training pipeline.
@@ -63,6 +119,9 @@ def run_training_pipeline(
         use_noise_filtering: If True, filter out features ranking below random noise
         use_seed_ensemble: If True, train N models with different seeds and average
         n_ensemble_seeds: Number of seeds to use for ensembling (default: 5)
+        use_rust_pipeline: If True, use the Rust pipeline for bars/features/labels
+        rust_cache_dir: Cache directory for Rust pipeline outputs
+        rust_write_intermediate: If True, write Rust intermediate files
 
     Returns:
         Dictionary with training results and metrics
@@ -81,101 +140,139 @@ def run_training_pipeline(
     if diag:
         diag.log_section("1. Data Loading")
     start_time = time.time()
-    
-    # Get sample rate from config (default to 1.0 if not set)
-    sample_rate = getattr(config, 'sample_rate', 1.0)
-    
-    trades = load_trades(config.data, sample_rate=sample_rate)
-    trades = preprocess_trades(trades, config.data)
-    
-    results['total_trades'] = len(trades)
-    print(f"      Loaded {len(trades):,} trades in {time.time() - start_time:.1f}s")
-    
-    if diag:
-        diag.log_metric("total_trades", len(trades))
-        diag.log_metric("sample_rate", sample_rate)
-        diag.log_dataframe_stats("trades", trades)
-    
-    # --- Step 2: Create Bars ---
-    print("\n[2/6] Creating multi-timeframe bars...")
-    if diag:
-        diag.log_section("2. Bar Creation")
-    start_time = time.time()
-    
-    bars_dict = create_multi_timeframe_bars(
-        trades,
-        config.features.timeframes,
-        config.features.timeframe_names,
-        config.data
-    )
+
+    trades = None
+    rust_available = False
+    rust_bridge = None
+    if use_rust_pipeline:
+        try:
+            import rust_pipeline_bridge as rust_bridge  # type: ignore
+            rust_available = bool(rust_bridge.is_available())
+        except Exception:
+            rust_available = False
+
+    if use_rust_pipeline and rust_available:
+        print("      Rust pipeline will load trades; skipping Python trade load.")
+        if diag:
+            diag.log_metric("total_trades", 0)
+            diag.log_metric("sample_rate", 1.0)
+    else:
+        # Get sample rate from config (default to 1.0 if not set)
+        sample_rate = getattr(config, 'sample_rate', 1.0)
+        trades = load_trades(config.data, sample_rate=sample_rate)
+        trades = preprocess_trades(trades, config.data)
+        results['total_trades'] = len(trades)
+        print(f"      Loaded {len(trades):,} trades in {time.time() - start_time:.1f}s")
+        if diag:
+            diag.log_metric("total_trades", len(trades))
+            diag.log_metric("sample_rate", sample_rate)
+            diag.log_dataframe_stats("trades", trades)
     
     base_tf = config.features.timeframe_names[config.base_timeframe_idx]
     results['base_timeframe'] = base_tf
-    results['bars_per_tf'] = {tf: len(bars) for tf, bars in bars_dict.items()}
-    
-    print(f"      Created bars in {time.time() - start_time:.1f}s")
-    
-    if diag:
-        diag.log_metric("base_timeframe", base_tf)
-        for tf, bars in bars_dict.items():
-            diag.log_metric(f"bars_{tf}", len(bars))
-            if tf == base_tf:
-                diag.log_dataframe_stats(f"bars_{tf}", bars)
-    
-    # --- Step 3: Calculate Features ---
-    print("\n[3/6] Calculating features...")
-    if diag:
-        diag.log_section("3. Feature Calculation")
-    start_time = time.time()
-    
-    featured_data = calculate_multi_timeframe_features(
-        bars_dict,
-        base_tf,
-        config.features
-    )
-    
-    feature_cols = get_feature_columns(featured_data)
-    results['num_features'] = len(feature_cols)
-    
-    print(f"      Calculated {len(feature_cols)} features in {time.time() - start_time:.1f}s")
-    
-    if diag:
-        diag.log_metric("num_features", len(feature_cols))
-        diag.log_feature_columns(feature_cols, featured_data)
-        diag.log_dataframe_stats("featured_data", featured_data, show_columns=False)
-    
-    # --- Step 4: Generate Labels ---
-    print("\n[4/6] Generating labels...")
-    if diag:
-        diag.log_section("4. Label Generation")
-    start_time = time.time()
-    
-    labeled_data, feature_cols = create_training_dataset(
-        featured_data,
-        config.labels,
-        config.features,
-        base_tf
-    )
-    
-    results['labeled_samples'] = len(labeled_data)
-    print(f"      Generated labels in {time.time() - start_time:.1f}s")
-    
-    if diag:
-        diag.log_metric("labeled_samples", len(labeled_data))
-        diag.log_metric("final_feature_count", len(feature_cols))
+
+    if use_rust_pipeline and rust_available and rust_bridge is not None:
+        print("\n[2/6] Running Rust pipeline (bars/features/labels)...")
+        if diag:
+            diag.log_section("2. Rust Pipeline")
+        start_time = time.time()
+        labeled_data, feature_cols, dataset_path = rust_bridge.build_dataset_from_config(
+            config,
+            cache_dir=rust_cache_dir,
+            write_intermediate=rust_write_intermediate,
+            force=False,
+        )
+        results['bars_per_tf'] = {}
+        results['num_features'] = len(feature_cols)
+        results['labeled_samples'] = len(labeled_data)
+        results['rust_dataset_path'] = str(dataset_path) if dataset_path is not None else "memory"
+        print(f"      Rust pipeline in {time.time() - start_time:.1f}s")
+        if diag:
+            diag.log_metric("base_timeframe", base_tf)
+            diag.log_metric("rust_dataset_path", results['rust_dataset_path'])
+            diag.log_metric("num_features", len(feature_cols))
+            diag.log_dataframe_stats("labeled_data", labeled_data, show_columns=False)
+    else:
+        if use_rust_pipeline and not rust_available:
+            print("\n[2/6] Rust pipeline unavailable; using Python pipeline...")
+        # --- Step 2: Create Bars ---
+        print("\n[2/6] Creating multi-timeframe bars...")
+        if diag:
+            diag.log_section("2. Bar Creation")
+        start_time = time.time()
         
-        # Log label distributions
-        if 'trend_label' in labeled_data.columns:
-            diag.log_label_distribution("trend_label", labeled_data['trend_label'])
-        if 'regime' in labeled_data.columns:
-            diag.log_label_distribution("regime", labeled_data['regime'])
-        if 'pullback_success' in labeled_data.columns:
-            pullback_labels = labeled_data['pullback_success'].dropna()
-            if len(pullback_labels) > 0:
-                diag.log_label_distribution("pullback_success", pullback_labels)
+        bars_dict = create_multi_timeframe_bars(
+            trades,
+            config.features.timeframes,
+            config.features.timeframe_names,
+            config.data
+        )
         
-        # Re-check feature columns for leakage after labeling
-        diag.log_feature_columns(feature_cols, labeled_data)
+        results['bars_per_tf'] = {tf: len(bars) for tf, bars in bars_dict.items()}
+        
+        print(f"      Created bars in {time.time() - start_time:.1f}s")
+        
+        if diag:
+            diag.log_metric("base_timeframe", base_tf)
+            for tf, bars in bars_dict.items():
+                diag.log_metric(f"bars_{tf}", len(bars))
+                if tf == base_tf:
+                    diag.log_dataframe_stats(f"bars_{tf}", bars)
+        
+        # --- Step 3: Calculate Features ---
+        print("\n[3/6] Calculating features...")
+        if diag:
+            diag.log_section("3. Feature Calculation")
+        start_time = time.time()
+        
+        featured_data = calculate_multi_timeframe_features(
+            bars_dict,
+            base_tf,
+            config.features
+        )
+        
+        feature_cols = get_feature_columns(featured_data)
+        results['num_features'] = len(feature_cols)
+        
+        print(f"      Calculated {len(feature_cols)} features in {time.time() - start_time:.1f}s")
+        
+        if diag:
+            diag.log_metric("num_features", len(feature_cols))
+            diag.log_feature_columns(feature_cols, featured_data)
+            diag.log_dataframe_stats("featured_data", featured_data, show_columns=False)
+        
+        # --- Step 4: Generate Labels ---
+        print("\n[4/6] Generating labels...")
+        if diag:
+            diag.log_section("4. Label Generation")
+        start_time = time.time()
+        
+        labeled_data, feature_cols = create_training_dataset(
+            featured_data,
+            config.labels,
+            config.features,
+            base_tf
+        )
+        
+        results['labeled_samples'] = len(labeled_data)
+        print(f"      Generated labels in {time.time() - start_time:.1f}s")
+        
+        if diag:
+            diag.log_metric("labeled_samples", len(labeled_data))
+            diag.log_metric("final_feature_count", len(feature_cols))
+            
+            # Log label distributions
+            if 'trend_label' in labeled_data.columns:
+                diag.log_label_distribution("trend_label", labeled_data['trend_label'])
+            if 'regime' in labeled_data.columns:
+                diag.log_label_distribution("regime", labeled_data['regime'])
+            if 'pullback_success' in labeled_data.columns:
+                pullback_labels = labeled_data['pullback_success'].dropna()
+                if len(pullback_labels) > 0:
+                    diag.log_label_distribution("pullback_success", pullback_labels)
+            
+            # Re-check feature columns for leakage after labeling
+            diag.log_feature_columns(feature_cols, labeled_data)
     
     # --- Step 5: Split Data ---
     print("\n[5/6] Splitting data...")
@@ -245,6 +342,68 @@ def run_training_pipeline(
         if hasattr(models.trend_classifier.model, 'feature_importances_'):
             importances = dict(zip(feature_cols, models.trend_classifier.model.feature_importances_))
             diag.log_feature_importance("TrendClassifier", importances)
+
+    trend_pred_train = _oof_context_preds(
+        TrendClassifier,
+        X_train,
+        y_trend_train,
+        config,
+        n_folds=3,
+    )
+    trend_pred_val = models.trend_classifier.predict(X_val) if X_val is not None else None
+
+    # Train Regime Classifier (before entry model so we can use its outputs as features)
+    print("\n  Training Regime Classifier...")
+    if diag:
+        diag.log_section("6c. Regime Classifier Training")
+    start_time = time.time()
+
+    y_regime_train = train_df['regime']
+    y_regime_val = val_df['regime'] if len(val_df) else None
+    regime_pred_train = None
+    regime_pred_val = None
+
+    if y_regime_train.nunique() < 2:
+        print("    Warning: Regime classifier skipped (insufficient class diversity).")
+        results['regime_classifier'] = {'skipped': True}
+    else:
+        if diag:
+            diag.log_label_distribution("regime_train", y_regime_train)
+            diag.log_feature_label_correlations(X_train, y_regime_train, 'regime')
+
+            # Special check: explain why regime classifier gets 100%
+            adx_col = f'{base_tf}_adx'
+            align_col = f'{base_tf}_ema_alignment'
+            if adx_col in X_train.columns and align_col in X_train.columns:
+                diag.log_raw(f"\n  NOTE: Regime is a deterministic function of {adx_col} and {align_col}\n")
+                diag.log_raw(f"  This is expected to achieve ~100% accuracy (not leakage, just trivial task)\n")
+
+        regime_metrics = models.regime_classifier.train(
+            X_train, y_regime_train,
+            X_val, y_regime_val,
+            verbose=True
+        )
+
+        results['regime_classifier'] = regime_metrics
+        print(f"    Train Accuracy: {regime_metrics['train_accuracy']:.3f}")
+        if 'val_accuracy' in regime_metrics:
+            print(f"    Val Accuracy:   {regime_metrics['val_accuracy']:.3f}")
+        print(f"    Trained in {time.time() - start_time:.1f}s")
+
+        if diag:
+            diag.log_model_training("RegimeClassifier", regime_metrics)
+            if hasattr(models.regime_classifier.model, 'feature_importances_'):
+                importances = dict(zip(feature_cols, models.regime_classifier.model.feature_importances_))
+                diag.log_feature_importance("RegimeClassifier", importances)
+
+        regime_pred_train = _oof_context_preds(
+            RegimeClassifier,
+            X_train,
+            y_regime_train,
+            config,
+            n_folds=3,
+        )
+        regime_pred_val = models.regime_classifier.predict(X_val) if X_val is not None else None
     
     # Train Entry Quality Model (only on pullback zones)
     # Now with: sequential TP/SL labeling, multi-tier quality, probability calibration
@@ -254,6 +413,7 @@ def run_training_pipeline(
     # Get pullback samples
     pullback_mask_train = ~train_df['pullback_success'].isna()
     pullback_mask_val = (~val_df['pullback_success'].isna()) if len(val_df) else None
+
 
     if diag:
         diag.log_metric("pullback_samples_train", int(pullback_mask_train.sum()))
@@ -274,9 +434,14 @@ def run_training_pipeline(
                 diag.log_raw(f"    Tier {int(tier)} ({tier_names.get(int(tier), '?')}): {count}\n")
 
     if pullback_mask_train.sum() > 100:
-        X_entry_train = X_train[pullback_mask_train]
+        X_entry_train = append_context_features(
+            X_train[pullback_mask_train],
+            _slice_pred(trend_pred_train, pullback_mask_train),
+            _slice_pred(regime_pred_train, pullback_mask_train),
+        )
         y_success_train = train_df.loc[pullback_mask_train, 'pullback_success'].astype(int)
-        y_rr_train = train_df.loc[pullback_mask_train, 'pullback_rr']
+        rr_col = 'pullback_win_r' if 'pullback_win_r' in train_df.columns else 'pullback_rr'
+        y_rr_train = train_df.loc[pullback_mask_train, rr_col]
 
         # Get tier labels for multi-tier quality classifier
         y_tier_train = None
@@ -284,40 +449,75 @@ def run_training_pipeline(
             y_tier_train = train_df.loc[pullback_mask_train, 'pullback_tier']
 
         has_val_pullbacks = pullback_mask_val is not None and int(pullback_mask_val.sum()) > 0 and X_val is not None
-        X_entry_val = X_val[pullback_mask_val] if has_val_pullbacks else None
+        X_entry_val = (
+            append_context_features(
+                X_val[pullback_mask_val],
+                _slice_pred(trend_pred_val, pullback_mask_val),
+                _slice_pred(regime_pred_val, pullback_mask_val),
+            )
+            if has_val_pullbacks
+            else None
+        )
         y_success_val = val_df.loc[pullback_mask_val, 'pullback_success'].astype(int) if has_val_pullbacks else None
-        y_rr_val = val_df.loc[pullback_mask_val, 'pullback_rr'] if has_val_pullbacks else None
+        rr_col_val = 'pullback_win_r' if 'pullback_win_r' in val_df.columns else 'pullback_rr'
+        y_rr_val = val_df.loc[pullback_mask_val, rr_col_val] if has_val_pullbacks else None
         y_tier_val = val_df.loc[pullback_mask_val, 'pullback_tier'] if (has_val_pullbacks and 'pullback_tier' in val_df.columns) else None
 
         if diag:
             diag.log_label_distribution("pullback_success_train", y_success_train)
             diag.log_feature_label_correlations(X_entry_train, y_success_train, 'pullback_success')
 
+        calibration_method = getattr(config.labels, "calibration_method", "temperature")
         entry_metrics = models.entry_model.train(
             X_entry_train, y_success_train, y_rr_train,
             X_entry_val, y_success_val, y_rr_val,
             y_tier_train=y_tier_train,
             y_tier_val=y_tier_val,
             verbose=True,
-            calibrate=True,  # Enable probability calibration
+            calibrate=bool(getattr(config.labels, "use_calibration", True)),
+            calibration_mode="oof",
+            calibration_oof_folds=3,
+            calibration_method=str(calibration_method),
             use_noise_filtering=use_noise_filtering,
             use_seed_ensemble=use_seed_ensemble,
             n_ensemble_seeds=n_ensemble_seeds,
         )
 
         results['entry_model'] = entry_metrics
-        print(f"    Train Accuracy:  {entry_metrics['train_accuracy']:.3f}")
-        print(f"    Train Precision: {entry_metrics['train_precision']:.3f}")
-        if 'val_accuracy' in entry_metrics:
+        if 'train_accuracy_raw' in entry_metrics:
+            print(f"    Train Base Rate:      {entry_metrics.get('train_base_rate', 0.0):.3f}")
+            print(f"    Train Accuracy (raw): {entry_metrics.get('train_accuracy_raw', 0.0):.3f}")
+            print(f"    Train Precision(raw): {entry_metrics.get('train_precision_raw', 0.0):.3f}")
+            print(f"    Train Recall   (raw): {entry_metrics.get('train_recall_raw', 0.0):.3f}")
+            print(f"    Train Accuracy (cal): {entry_metrics.get('train_accuracy_cal', 0.0):.3f}")
+            print(f"    Train Precision(cal): {entry_metrics.get('train_precision_cal', 0.0):.3f}")
+            print(f"    Train Recall   (cal): {entry_metrics.get('train_recall_cal', 0.0):.3f}")
+        else:
+            print(f"    Train Accuracy:  {entry_metrics['train_accuracy']:.3f}")
+            print(f"    Train Precision: {entry_metrics['train_precision']:.3f}")
+
+        if 'val_accuracy_raw' in entry_metrics:
+            print(f"    Val Base Rate:        {entry_metrics.get('val_base_rate', 0.0):.3f}")
+            print(f"    Val Accuracy   (raw): {entry_metrics.get('val_accuracy_raw', 0.0):.3f}")
+            print(f"    Val Precision  (raw): {entry_metrics.get('val_precision_raw', 0.0):.3f}")
+            print(f"    Val Recall     (raw): {entry_metrics.get('val_recall_raw', 0.0):.3f}")
+            print(f"    Val Accuracy   (cal): {entry_metrics.get('val_accuracy_cal', 0.0):.3f}")
+            print(f"    Val Precision  (cal): {entry_metrics.get('val_precision_cal', 0.0):.3f}")
+            print(f"    Val Recall     (cal): {entry_metrics.get('val_recall_cal', 0.0):.3f}")
+        elif 'val_accuracy' in entry_metrics:
             print(f"    Val Accuracy:    {entry_metrics['val_accuracy']:.3f}")
             print(f"    Val Precision:   {entry_metrics['val_precision']:.3f}")
 
         # Log calibration results
         if 'calibration' in entry_metrics:
             cal = entry_metrics['calibration']
-            print(f"    Pre-calibration ECE:  {cal['pre_calibration_ece']:.4f}")
-            print(f"    Post-calibration ECE: {cal['post_calibration_ece']:.4f}")
-            print(f"    ECE Improvement:      {cal['ece_improvement']:.4f}")
+            if 'pre_calibration_ece' in cal:
+                print(f"    Pre-calibration ECE:  {cal['pre_calibration_ece']:.4f}")
+                print(f"    Post-calibration ECE: {cal['post_calibration_ece']:.4f}")
+                print(f"    ECE Improvement:      {cal['ece_improvement']:.4f}")
+            else:
+                # CV case
+                print(f"    Calibration ECE:      {cal.get('ece', 0.0):.4f} ({cal.get('method', 'Unknown')})")
 
         if diag:
             diag.log_model_training("EntryQualityModel", entry_metrics)
@@ -329,21 +529,29 @@ def run_training_pipeline(
             if 'calibration' in entry_metrics:
                 diag.log_section("6b. Probability Calibration")
                 cal = entry_metrics['calibration']
-                diag.log_metric("pre_calibration_ece", cal['pre_calibration_ece'])
-                diag.log_metric("post_calibration_ece", cal['post_calibration_ece'])
-                diag.log_metric("ece_improvement", cal['ece_improvement'])
+                
+                if 'pre_calibration_ece' in cal:
+                    diag.log_metric("pre_calibration_ece", cal['pre_calibration_ece'])
+                    diag.log_metric("post_calibration_ece", cal['post_calibration_ece'])
+                    diag.log_metric("ece_improvement", cal['ece_improvement'])
+                    details_key = 'post_calibration_details'
+                else:
+                    diag.log_metric("calibration_ece", cal.get('ece', 0.0))
+                    diag.log_metric("calibration_method", cal.get('method', 'Unknown'))
+                    details_key = 'details'
 
-                diag.log_raw("\n  Calibration Bin Details (Post-Calibration):\n")
-                diag.log_raw(f"    {'Bin':<12} {'Count':<8} {'Confidence':<12} {'Actual':<12} {'Error':<10}\n")
-                diag.log_raw(f"    {'-'*54}\n")
-                for bin_info in cal['post_calibration_details']['bin_details']:
-                    diag.log_raw(
-                        f"    {bin_info['bin']:<12} "
-                        f"{bin_info['count']:<8} "
-                        f"{bin_info['avg_confidence']:<12.3f} "
-                        f"{bin_info['actual_accuracy']:<12.3f} "
-                        f"{bin_info['calibration_error']:<10.3f}\n"
-                    )
+                if details_key in cal and 'bin_details' in cal[details_key]:
+                    diag.log_raw("\n  Calibration Bin Details:\n")
+                    diag.log_raw(f"    {'Bin':<12} {'Count':<8} {'Confidence':<12} {'Actual':<12} {'Error':<10}\n")
+                    diag.log_raw(f"    {'-'*54}\n")
+                    for bin_info in cal[details_key]['bin_details']:
+                        diag.log_raw(
+                            f"    {bin_info['bin']:<12} "
+                            f"{bin_info['count']:<8} "
+                            f"{bin_info['avg_confidence']:<12.3f} "
+                            f"{bin_info['actual_accuracy']:<12.3f} "
+                            f"{bin_info['calibration_error']:<10.3f}\n"
+                        )
     else:
         print(f"    Warning: Only {pullback_mask_train.sum()} pullback samples, skipping entry model")
         results['entry_model'] = {'skipped': True}
@@ -351,44 +559,6 @@ def run_training_pipeline(
             diag.log_warning(f"Entry model skipped - only {pullback_mask_train.sum()} pullback samples")
 
     print(f"    Trained in {time.time() - start_time:.1f}s")
-    
-    # Train Regime Classifier
-    print("\n  Training Regime Classifier...")
-    if diag:
-        diag.log_section("6c. Regime Classifier Training")
-    start_time = time.time()
-    
-    y_regime_train = train_df['regime']
-    y_regime_val = val_df['regime'] if len(val_df) else None
-    
-    if diag:
-        diag.log_label_distribution("regime_train", y_regime_train)
-        diag.log_feature_label_correlations(X_train, y_regime_train, 'regime')
-        
-        # Special check: explain why regime classifier gets 100%
-        adx_col = f'{base_tf}_adx'
-        align_col = f'{base_tf}_ema_alignment'
-        if adx_col in X_train.columns and align_col in X_train.columns:
-            diag.log_raw(f"\n  NOTE: Regime is a deterministic function of {adx_col} and {align_col}\n")
-            diag.log_raw(f"  This is expected to achieve ~100% accuracy (not leakage, just trivial task)\n")
-    
-    regime_metrics = models.regime_classifier.train(
-        X_train, y_regime_train,
-        X_val, y_regime_val,
-        verbose=True
-    )
-    
-    results['regime_classifier'] = regime_metrics
-    print(f"    Train Accuracy: {regime_metrics['train_accuracy']:.3f}")
-    if 'val_accuracy' in regime_metrics:
-        print(f"    Val Accuracy:   {regime_metrics['val_accuracy']:.3f}")
-    print(f"    Trained in {time.time() - start_time:.1f}s")
-    
-    if diag:
-        diag.log_model_training("RegimeClassifier", regime_metrics)
-        if hasattr(models.regime_classifier.model, 'feature_importances_'):
-            importances = dict(zip(feature_cols, models.regime_classifier.model.feature_importances_))
-            diag.log_feature_importance("RegimeClassifier", importances)
     
     # --- Optional: Two-pass retrain on Train+Val ---
     # Pass 1 trains with a validation split (early stopping). Pass 2 retrains on Train+Val
@@ -441,14 +611,42 @@ def run_training_pipeline(
         print(f"    Train Accuracy: {trend_metrics['train_accuracy']:.3f}")
         print(f"    Trained in {time.time() - start_time:.1f}s")
 
+        trend_full_pred = models.trend_classifier.predict(X_full)
+
+        # Regime classifier (final)
+        print("\n  Retraining Regime Classifier on Train+Val...")
+        start_time = time.time()
+        regime_full_pred = None
+        if full_df['regime'].nunique() < 2:
+            print("    Warning: Regime classifier skipped (insufficient class diversity).")
+            results['regime_classifier'] = {'skipped': True}
+        else:
+            regime_metrics = models.regime_classifier.train(
+                X_full,
+                full_df['regime'],
+                None,
+                None,
+                verbose=True,
+                n_estimators=best_iters['regime_classifier'],
+            )
+            results['regime_classifier'] = regime_metrics
+            print(f"    Train Accuracy: {regime_metrics['train_accuracy']:.3f}")
+            regime_full_pred = models.regime_classifier.predict(X_full)
+        print(f"    Trained in {time.time() - start_time:.1f}s")
+
         # Entry quality model (final)
         print("\n  Retraining Entry Quality Model on Train+Val...")
         start_time = time.time()
         pullback_mask_full = ~full_df['pullback_success'].isna()
         if pullback_mask_full.sum() > 100:
-            X_entry_full = X_full[pullback_mask_full]
+            X_entry_full = append_context_features(
+                X_full[pullback_mask_full],
+                _slice_pred(trend_full_pred, pullback_mask_full),
+                _slice_pred(regime_full_pred, pullback_mask_full),
+            )
             y_success_full = full_df.loc[pullback_mask_full, 'pullback_success'].astype(int)
-            y_rr_full = full_df.loc[pullback_mask_full, 'pullback_rr']
+            rr_col_full = 'pullback_win_r' if 'pullback_win_r' in full_df.columns else 'pullback_rr'
+            y_rr_full = full_df.loc[pullback_mask_full, rr_col_full]
 
             entry_metrics = models.entry_model.train(
                 X_entry_full,
@@ -469,21 +667,6 @@ def run_training_pipeline(
         else:
             print(f"    Warning: Only {pullback_mask_full.sum()} pullback samples, skipping entry model")
             results['entry_model'] = {'skipped': True}
-        print(f"    Trained in {time.time() - start_time:.1f}s")
-
-        # Regime classifier (final)
-        print("\n  Retraining Regime Classifier on Train+Val...")
-        start_time = time.time()
-        regime_metrics = models.regime_classifier.train(
-            X_full,
-            full_df['regime'],
-            None,
-            None,
-            verbose=True,
-            n_estimators=best_iters['regime_classifier'],
-        )
-        results['regime_classifier'] = regime_metrics
-        print(f"    Train Accuracy: {regime_metrics['train_accuracy']:.3f}")
         print(f"    Trained in {time.time() - start_time:.1f}s")
 
     # --- Save Models ---

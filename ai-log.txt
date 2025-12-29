@@ -13,7 +13,7 @@ Important operator notes (environment / conventions)
 - Console encoding is cp1252 on this machine; avoid emojis/unicode in console logs.
 - Several snapshot folders exist; treat snapshot folders as READ-ONLY unless explicitly requested.
 
-Snapshot folders (do not modify; used as program state “freezes”)
+Snapshot folders (do not modify; used as program state ???freezes???)
 - profitable MONUSDT model 11-12-2024-0207PM/
 - profitable MONUSDT model 11-12-2024-1907PM/
 - profitable trader 11-12-2025/
@@ -30,14 +30,14 @@ VERSIONED CHANGELOG (approx chronological; based on file timestamps and work seq
 v0.1 (Baseline understanding + strategy direction)
 - Goal settled on EMA9-based, long-only strategy using bounce probability as the key gate.
 - Risk model standardized around ATR-based stops/targets (default ~1.0 ATR SL, 1.5R TP).
-- “Trend classifier has no say to open trades” principle adopted (trend model can be logged, but not gating).
+- ???Trend classifier has no say to open trades??? principle adopted (trend model can be logged, but not gating).
 
 v0.2 (EMA9 pullback/touch labeling + slope proxy)
 Files: labels.py
-- Pullback detection updated to use intrabar “touch” logic:
+- Pullback detection updated to use intrabar ???touch??? logic:
   - Uses min distance of OHLC to EMA instead of candle-close-only distance.
   - Distance normalized by ATR: dist_from_ema = min(|OHLC-EMA|) / ATR.
-- Direction proxy switched from multi-EMA “alignment stacking” to EMA slope:
+- Direction proxy switched from multi-EMA ???alignment stacking??? to EMA slope:
   - Uses {base_tf}_ema_{pullback_ema}_slope_norm as the directional signal (positive => long bias).
 - Pullback zone label now combines:
   - is_close_to_ema (<= pullback_threshold) AND
@@ -74,7 +74,7 @@ Files: config.py, trainer.py, run_training.py, train.py
   - If backtest-only and test split is empty => error explaining to set test_ratio.
   - If train_ratio=1.0 explicitly => val/test forced to 0.0 (train-only workflow).
 
-v0.5 (Feature engineering leakage fixes + “partial HTF” in-progress context)
+v0.5 (Feature engineering leakage fixes + ???partial HTF??? in-progress context)
 Files: feature_engine.py
 1) Multi-timeframe leakage fix
 - The classic HTF merge_asof lookahead issue was addressed:
@@ -88,7 +88,7 @@ Files: feature_engine.py
   - high/low = rolling max/min
   - close = current base close
   - volume = rolling sum
-- Intent: provide “currently forming HTF candle” context without future HTF-close data.
+- Intent: provide ???currently forming HTF candle??? context without future HTF-close data.
 
 3) Swing feature lookahead removed (causal swings)
 - detect_swing_highs/lows uses symmetric windows (future bars).
@@ -118,7 +118,7 @@ Bootstrap loading (critical for restarts / warm start)
   - Seeds the Predictor directly (predictor.add_trades) instead of inflating the TradeBuffer.
   - NOTE: when a directory is used, only files matching *.csv are loaded; extensionless files are ignored.
 - Resulting nuance:
-  - “Trades in buffer: X” refers to the live WS TradeBuffer only; bootstrap trades are held in the predictor history.
+  - ???Trades in buffer: X??? refers to the live WS TradeBuffer only; bootstrap trades are held in the predictor history.
 
 v0.7 (Limit-order simulation variant)
 Files: live_trading_with_limits.py
@@ -152,7 +152,7 @@ Files: trade_collector.py, data_collector/
   - Collector prints running totals: total_collected and total_flushed.
 
 ----------------------------------------------------------------------
-NOTES FOR THE NEXT AI (practical “where to look”)
+NOTES FOR THE NEXT AI (practical ???where to look???)
 ----------------------------------------------------------------------
 
 Core pipeline (train -> backtest -> paper/live)
@@ -353,8 +353,8 @@ Summary of Changes
 
   2. Hyperparameter Tuning Order Fixed (trainer.py:403-500)
 
-  - Before: Tune hyperparams → Train model (wrong order)
-  - After: Train baseline → Show results → Optionally tune → Compare → Keep better model
+  - Before: Tune hyperparams ??? Train model (wrong order)
+  - After: Train baseline ??? Show results ??? Optionally tune ??? Compare ??? Keep better model
   - Baseline metrics are preserved and compared against tuned results
   - System automatically keeps baseline if tuned model has worse accuracy
 
@@ -1186,4 +1186,2572 @@ Behavior:
 
 Testing: Not tested (user to deploy and verify on live trading)
 
+----------------------------------------------------------------------
+v1.40 (Robust Profit Tuning - Dec 2025)
+----------------------------------------------------------------------
+Agent: Gemini
+Date: 2025-12-25 10:00
+Files Modified:
+- config_tuner.py:53-62,217-290 - Implemented "Robust Profit Score" and objective selection
+- train.py:162-168,460 - Added --tune-objective CLI flag
+
+Original Intent: User requested to optimize the configuration for "robust profit" instead of accuracy/precision.
+
+Changes Made:
+1. Updated ConfigTuner to accept a `tuning_objective` parameter.
+2. Implemented a vectorized P&L calculator in `_evaluate_config` to compute `profit_score`.
+   - Uses `pullback_success` and `target_rr` to simulate trade outcomes on the validation set.
+   - Formula: `profit_score = total_pnl_r * min(1.0, profit_factor / 1.5)`.
+   - Penalizes strategies with Profit Factor < 1.5 to ensure robustness.
+3. Updated `train.py` to expose `--tune-objective` (default: 'profit').
+
+Testing: Not tested (user to run tuning)
+
+----------------------------------------------------------------------
+v1.41 (Config Tuner Production Upgrade - Dec 2025)
+----------------------------------------------------------------------
+Agent: Gemini
+Date: 2025-12-25 10:20
+Files Modified:
+- config_tuner.py: Fix missing numpy import, implement fee deduction and sample size weighting.
+
+Original Intent: Improve robustness of the profit score and fix runtime error.
+
+Changes Made:
+1. Added `import numpy as np` to fix NameError.
+2. Implemented Fee Simulation: Deduct `0.05R` from every trade result to simulate fees/slippage.
+3. Implemented Sample Size Weighting: Apply `tanh(n_trades/50)` penalty to discourage low-sample luck.
+4. Updated Profit Score formula: `profit_score = total_pnl_r * pf_penalty * confidence_weight`.
+
+Testing: Not tested.
+
+----------------------------------------------------------------------
+v1.42 (Drawdown Penalty Implementation - Dec 2025)
+----------------------------------------------------------------------
+Agent: Gemini
+Date: 2025-12-25 10:40
+Files Modified:
+- config_tuner.py: Implemented max drawdown penalty in profit score calculation.
+
+Original Intent: Penalize strategies with high volatility/drawdowns to find the "smoothest" equity curve.
+
+Changes Made:
+1. Calculated cumulative equity curve and max drawdown from fee-adjusted trade results (`net_r`).
+2. Implemented `stability_weight = 1.0 / (1.0 + (max_drawdown / total_pnl))`.
+3. Updated final score formula: `profit_score = total_pnl_r * pf_penalty * confidence_weight * stability_weight`.
+
+Testing: Not tested.
+
+----------------------------------------------------------------------
+v1.43 (Walk-Forward CV + Tail Risk Penalty - Dec 2025)
+----------------------------------------------------------------------
+Agent: Claude (Opus 4.5)
+Date: 2025-12-25 12:00
+
+Files Modified:
+- config_tuner.py:36-176,208-262,360-778 - Added walk-forward CV, tail risk metrics, refactored _evaluate_config
+- live_trading_funds.py:244-245 - Fixed pullback_threshold default to 0.5 (matching config.py)
+- live_trading.py:385-388,420-422 - Fixed pullback_threshold defaults to 0.5
+- live_trader.py:159-161 - Fixed pullback_threshold default to 0.5
+- live_trading_with_limits.py:291-293,299-301 - Fixed pullback_threshold defaults to 0.5
+
+Original Intent: User requested:
+1. Implement Walk-Forward Stability (Cross-Validation) for robust config tuning
+2. Implement Tail Risk / Skewness Penalty to favor strategies with positive skew
+3. Review pullback_threshold consistency across the codebase
+
+Changes Made:
+
+1. Walk-Forward Cross-Validation (_walk_forward_split function)
+   - Implements proper time-series CV with expanding training windows
+   - Splits data into n_folds (default: 3) temporal folds
+   - Handles edge cases: small data, insufficient samples, purge between train/val
+   - Each fold: train on [0:split_i], validate on [split_i:split_i+1]
+
+2. Walk-Forward Stability Penalty (in _evaluate_config)
+   - Computes mean and std of profit scores across all folds
+   - CV stability factor: 1.0 / (1.0 + coefficient_of_variation)
+   - Min score penalty: Penalizes if any fold has negative score
+   - Win rate consistency: Penalizes if win rates vary too much across folds
+   - Final formula: cv_adjusted_score = mean_score * stability_factor
+
+3. Tail Risk / Skewness Penalty (_calculate_tail_risk_metrics function)
+   - Calculates skewness: positive = more large wins, negative = more large losses
+   - Calculates kurtosis: high = fat tails (unpredictable extreme events)
+   - Tail ratio: avg(top 10% wins) / avg(bottom 10% losses)
+   - Skewness penalty: 1.0 + tanh(skewness/2) * 0.5 (range: 0.5 to 1.5)
+     - Skewness = -2: penalty = 0.52 (harsh penalty for left-tailed)
+     - Skewness = 0:  penalty = 1.0 (neutral)
+     - Skewness = +2: penalty = 1.48 (bonus for right-tailed)
+   - Kurtosis penalty: 1.0 / (1.0 + max(0, kurtosis-3) / 10)
+
+4. New ConfigTuner Parameters:
+   - use_walk_forward_cv: bool = True (enable/disable CV)
+   - n_cv_folds: int = 3 (number of validation folds)
+   - min_cv_train_samples: int = 100 (minimum training samples per fold)
+   - min_cv_val_samples: int = 30 (minimum validation samples per fold)
+   - cv_purge_bars: int = 0 (bars to purge between train/val)
+   - use_tail_risk_penalty: bool = True (enable/disable skewness penalty)
+
+5. Refactored _evaluate_config:
+   - Split into _evaluate_single_fold for cleaner code
+   - Single fold handles: model training, threshold optimization, metrics
+   - Main function handles: CV splitting, fold aggregation, stability penalty
+   - Falls back to single split if CV not enabled or not enough data
+
+6. Pullback Threshold Consistency Fix:
+   - INCONSISTENCY FOUND: config.py default = 0.5, live trading scripts used 0.02 fallback
+   - This caused different behavior between backtest and live trading
+   - Fixed all live trading scripts to use 0.5 as fallback (matching config.py default)
+   - Note: Trained models load their own tuned value from train_config.json
+
+New Metrics Logged:
+   - n_cv_folds: Number of CV folds used
+   - cv_mean_score: Mean profit score across folds
+   - cv_std_score: Std dev of profit scores across folds
+   - cv_min_score: Minimum fold score (worst period)
+   - cv_stability: CV stability factor
+   - cv_min_penalty: Min score penalty factor
+   - cv_wr_consistency: Win rate consistency factor
+   - cv_stability_factor: Combined stability factor
+   - val_skewness: Skewness of trade returns
+   - val_kurtosis: Kurtosis of trade returns
+   - val_tail_ratio: Ratio of avg top 10% wins to avg bottom 10% losses
+
+Testing: Not tested (user to run tuning)
+
+Usage Example:
+  # Run tuning with walk-forward CV and tail risk penalty (defaults: enabled)
+  python train.py --data-dir data/MONUSDT --model-dir models --tune-scope full \
+    --tune-n-trials 100 --tune-objective profit
+
+  # Disable CV for faster iteration (in code)
+  ConfigTuner(..., use_walk_forward_cv=False, use_tail_risk_penalty=False)
+
+----------------------------------------------------------------------
+v1.44 (Calibration Bug Fix + Prob Spread Penalty - Dec 2025)
+----------------------------------------------------------------------
+Agent: Claude (Opus 4.5)
+Date: 2025-12-25 14:00
+
+Files Modified:
+- config_tuner.py:420-429 - Switch to RAW probabilities for threshold optimization
+- config_tuner.py:729-747 - Strengthen prob_spread penalty (CV path)
+- config_tuner.py:787-799 - Strengthen prob_spread penalty (single-fold path)
+- config_tuner.py:823-829 - Add warnings for narrow probability spread
+
+Original Intent: User reported tuning produced very poor backtest results (5 trades, 0 wins).
+Investigation revealed calibration was compressing all probabilities to ~0.38 range.
+
+ROOT CAUSE ANALYSIS:
+1. Tuner was using calibrated probabilities (use_calibration=True) for threshold optimization
+2. The calibrator had coefficient=0.648, intercept=-0.88 which compressed all probs to 0.33-0.40 range
+3. Tuner found "optimal" threshold of 0.38 (where all probs cluster)
+4. prob_spread was only 1.88% (0.0188) - model couldn't differentiate samples
+5. The existing penalty `(0.05 - spread) * 100 = 3.2` was insignificant vs score of 1181
+
+FIXES:
+
+1. Use RAW Probabilities for Threshold Optimization (line 420-429)
+   - Changed from use_calibration=True to use_calibration=False
+   - Added calib_prob_spread metric to monitor calibrator health
+   - Raw probs have much better spread for threshold optimization
+
+2. Strengthen Prob Spread Penalty (CRITICAL)
+   - OLD: Subtract (0.05 - spread) * 100 from score (additive, weak)
+   - NEW: Multiply score by (spread / 0.10) when spread < 10%
+     - spread = 2%  -> score * 0.2 (80% reduction)
+     - spread = 5%  -> score * 0.5 (50% reduction)
+     - spread = 10% -> score * 1.0 (no penalty)
+   - If spread < 3%, force score = -100 (reject entirely)
+
+3. Add Warnings During Tuning
+   - Print warning when prob_spread < 5%
+   - Print warning when calibrator compresses spread < 3%
+
+New Metrics Added:
+   - calib_prob_spread: Spread of calibrated probabilities (for diagnostics)
+   - avg_prob_spread: Average raw probability spread across folds
+   - spread_penalty: The multiplicative penalty applied
+
+Impact:
+   - Configs with collapsed probability output will now score very low
+   - Models that can't discriminate samples will be rejected
+   - Threshold optimization uses raw probs for better differentiation
+
+Testing: Not tested (user to re-run tuning)
+
+Recommended Action for User:
+   # Re-run tuning with fixes
+   python train.py --data-dir ./data/1000PEPEUSDT/ --model-dir ./models/1000PEPEUSDT/ \
+     --optuna-tune --tune-trials 100
+
+   # For existing model, try backtest WITHOUT calibration:
+   python train.py --data-dir ./data/1000PEPEUSDT/ --model-dir ./models/1000PEPEUSDT/ \
+     --backtest-only --take-profit-rr 2.91 --stop-loss-atr 0.50 --trade-side both \
+     --ema-touch-mode multi --min-bounce-prob 0.50
+
+----------------------------------------------------------------------
+v1.45 (CRITICAL BUG FIX: Data Leakage in Walk-Forward CV - Dec 2025)
+----------------------------------------------------------------------
+Agent: Claude (Opus 4.5)
+Date: 2025-12-25 12:30
+
+Files Modified:
+- config_tuner.py:605-618 - Exclude test set from CV to prevent data leakage
+
+Original Intent: User reported tuning showed good validation metrics but terrible backtest results.
+Investigation revealed the CV was using ALL data including the test set.
+
+BUG IDENTIFIED:
+   The walk-forward CV was creating folds from the FULL pullback dataset, which included
+   samples that would be in the TEST SET during actual training.
+
+   Tuner CV was doing this:
+   [=== Fold 0 Train ===][= Fold 0 Val =][= Fold 1 Val =][= Fold 2 Val =]
+                                                          ???
+                                          INCLUDES TEST SET SAMPLES!
+
+   But actual training does:
+   [======= Train 70% =======][= Val 15% =][= TEST 15% =]
+                                            ???
+                               Model never trains on this!
+
+   Result: Tuner optimized thresholds on test data it shouldn't see,
+           causing inflated validation metrics that don't match test performance.
+
+FIX APPLIED:
+   Before creating CV folds, now exclude the test set:
+   ```python
+   test_ratio = cfg.model.test_ratio
+   n_total = len(labeled_data)
+   n_trainval = int(n_total * (1.0 - test_ratio))
+   trainval_data = labeled_data.iloc[:n_trainval].copy()
+   ```
+
+   New CV structure:
+   [=== Fold 0 Train ===][= Fold 0 Val =][= Fold 1 Val =][= Fold 2 Val =] | [TEST - EXCLUDED]
+                                                                          ???
+                                                          Never seen during tuning!
+
+New Metrics Added:
+   - cv_trainval_samples: Number of samples used for CV (excludes test)
+   - cv_trainval_pullbacks: Number of pullbacks used for CV (excludes test)
+
+Impact:
+   - Tuner metrics will now be more realistic (possibly lower but more accurate)
+   - Validation metrics should better predict test performance
+   - Eliminates data leakage between tuning and final evaluation
+
+Testing: User to re-run tuning with fix
+
 END
+----------------------------------------------------------------------
+v1.46 (Raw Prob Scoring + Min Val Samples - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-25 20:36
+Files Modified:
+- config_tuner.py:303 - Enforce configured min pullback validation sample count in folds
+- config_tuner.py:336 - Use raw (uncalibrated) probabilities for threshold scoring
+
+Original Intent: Use raw probabilities during tuning and enforce minimum validation pullback samples.
+
+Changes Made:
+1. Switched tuning fold scoring to raw probabilities to avoid calibration compression.
+2. Replaced hard-coded validation sample minimum with the configured value.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.63 (Ignore Local Artifacts - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 20:57
+Files Modified:
+- .gitignore:129-133 - Ignore local backup/tooling folders and sync script.
+- ai-log.txt:1468-1481 - Added log entry for ignore updates.
+
+Original Intent: User asked to exclude config_tuner_backup, sofia_scripts, and sync-data.sh from version control.
+
+Changes Made:
+1. Added ignore rules for local backup/tooling directories and sync script.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.62 (EV Gate Defaults + Multi-TF Touch Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 19:38
+Files Modified:
+- config.py:81-84 - Added EV gate defaults (ev_margin_r, fee_percent, use_expected_rr, use_ev_gate) to labels.
+- config_tuner.py:129-134 - Persisted EV gate settings into base_config labels for tuning outputs.
+- backtest.py:86-118 - Default EV gate on and ema_touch_mode to multi with multi fallback.
+- train.py:243-257,748-753,819-821,864-869,980-1071 - Default EV gate on, load ev margin/fees from train_config, and persist tuning EV settings.
+- predictor.py:53,619-636 - Added expected_rr_mean to EntrySignal and populated it from entry model output.
+- live_trading.py:98-101,306-339,418-437,1116-1234,1493-1496 - Added EV gate params, loaded tuned EV settings, and applied EV gating in live entry logic.
+- live_trading_funds.py:146-161,835-842 - Defaulted ema_touch_mode to multi for live funds.
+- live_trading_funds_simulated.py:212-241,304-312,1906-2102,2174-2182 - Defaulted ema_touch_mode to multi, used pullback_threshold for touch, loaded tuned EV settings, and passed them into backtest/live sim.
+
+Original Intent: User requested pipeline alignment: default multi-TF EMA touch, default EV gate, and persistence/loading of ev_margin_r across tuning, training, backtesting, live simulation, and live funds; plus pullback_threshold consistency.
+
+Changes Made:
+1. Added EV gate defaults to config labels and ensured tuning outputs persist ev_margin_r, fee_percent, use_expected_rr, and use_ev_gate.
+2. Defaulted EMA touch mode to multi in backtest/live funds/simulation and aligned pullback_threshold usage.
+3. Wired live trading and simulation to use EV gating with tuned ev_margin_r and fee_percent by default.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.62 (EV Gating Backtest Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 18:42
+Files Modified:
+- backtest.py:82-113,160-170,298-304,374-575,790-798,1038-1046 - Added EV gating parameters, cost-based EV filter, and diagnostics for rejections.
+- train.py:238-263,958-986,1026-1032 - Added backtest CLI flags for EV gating/costs and wired them into backtest params/logs.
+
+Original Intent: User requested backtest to match tuning by using EV gating with expected_rr and costs.
+
+Changes Made:
+1. Added EV gating (expected_rr + costs) to backtest entry logic with rejection tracking.
+2. Logged EV gate parameters and propagated CLI options to backtest run summaries.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.47 (Rolled back all updates to config_tuner.py (currently tunning for precision) - Dec 2025)
+----------------------------------------------------------------------
+Agent: Not agent, developer made the rollback
+Date: 2025-12-26
+Files modified:
+
+- config_tuner.py
+
+Original Intent: revert back changes for further testing
+
+ Changes Made:
+
+1)Switched back to tuning for precision
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.48 (Robust Profit Tuning + Live Threshold Sync - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 11:51
+Files Modified:
+- config_tuner.py:1-641,759-782 - Added robust profitability objective, walk-forward folds, risk metrics, AUC diagnostics, and tuning_objective support; surfaced key tuning fields.
+- train.py:218,640-643 - Updated Optuna help text and appended best_threshold/target_rr/stop_atr_multiple/pullback_threshold to tuning_summary.json.
+- live_trading.py:389-405 - Use tuned stop_atr_multiple/target_rr/best_threshold when defaults are used for live entries.
+
+Original Intent: User requested a deep review and to shift tuning from precision to robust profitability; ensure tuning_summary.json includes best_threshold, target_rr, stop_atr_multiple, pullback_threshold and keep pullback_threshold consistent across tuning->training->backtest->live.
+
+Changes Made:
+1. Reworked config_tuner scoring to use walk-forward validation and risk-adjusted profit metrics (PnL, drawdown, Sharpe/Sortino, threshold stability) plus AUC/coverage diagnostics.
+2. Added tuning_objective handling (profit/precision/mixed) and surfaced best_threshold/target_rr/stop_atr_multiple/pullback_threshold in metrics.
+3. Ensured tuning summary JSON and live trading defaults pull tuned thresholds/targets when CLI defaults are kept.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.49 (Per-Trial Tuning Metrics Report - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 12:14
+Files Modified:
+- config_tuner.py:83-790,924-939 - Added per-trial reporting with fold/aggregate metrics and wired report_trials flag through tuning entry points.
+- train.py:306,608 - Added --tune-no-trial-report flag and passed report_trials into Optuna tuning call.
+
+Original Intent: User requested per-trial reporting of fold metrics and aggregate metrics during tuning.
+
+Changes Made:
+1. Implemented per-trial console report with fold-level and aggregate tuning metrics.
+2. Added report_trials toggle to config_tuner and CLI flag to disable if needed.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.50 (Backtest Gate Diagnostics - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 12:18
+Files Modified:
+- backtest.py:61,142-451,683,925-1084 - Added EMA touch counters, propagated signal_stats to results, printed signal gate diagnostics, and saved signal_stats in backtest summary.
+
+Original Intent: User asked to add backtest diagnostics to identify why zero trades are taken.
+
+Changes Made:
+1. Track EMA touch raw/passed/mismatch counts in backtest signal stats.
+2. Print signal gate diagnostics (touch/bounce/trade_side rejections) in console output.
+3. Persist signal_stats into backtest summary JSON.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.51 (Bounce Prob Diagnostics - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 12:26
+Files Modified:
+- backtest.py:62,165-462,721-1024,1151 - Added bounce_prob distribution stats (all signals vs EMA-touch) to console output and summary JSON.
+
+Original Intent: User requested additional backtest diagnostics to explain zero-trade outcomes.
+
+Changes Made:
+1. Track bounce_prob values and compute percentiles and pct above min_bounce_prob.
+2. Print bounce_prob diagnostics in backtest console output.
+3. Persist bounce_prob_stats in backtest summary JSON.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.52 (EV Gating + LCB Scoring + Costs - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 12:55
+Files Modified:
+- config_tuner.py:74-792,881-947 - Removed threshold grid optimization; added EV-based trade gating, LCB scoring, trade-count pruning, cost/EV margin controls, and new metrics for fold robustness.
+- train.py:276-318,606-610,640 - Added tuning CLI flags (fee/EV margin/min trades/lcb z/raw probs/expected_rr) and updated messaging for breakeven threshold.
+
+Original Intent: User requested to stop optimizing thresholds on validation, add costs, use robust statistics (LCB/median), and prune low-quality trials; omit purge/embargo for now.
+
+Changes Made:
+1. Replaced threshold grid search with EV gating and breakeven threshold reporting, plus optional expected_rr gating and raw-probability evaluation.
+2. Scored folds via LCB of mean R with drawdown and trade-count penalties; aggregated via median/IQR.
+3. Added cost model parameters and Optuna pruning for early negative or too-few-trades folds.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.53 (Default Fee Percent + Auto R Cost - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 13:24
+Files Modified:
+- config_tuner.py:256-569,359-366,823-992 - Added auto fee conversion from percent to R, cost metrics in trial reports, and fee_percent support in tuner API.
+- train.py:282-292,649 - Added --tune-fee-percent and auto fee handling for Optuna tuning.
+
+Original Intent: User requested a default round-trip fee of 0.055% to be applied during tuning.
+
+Changes Made:
+1. Compute fee_per_trade_r automatically from fee_percent using median ATR percent and stop_atr_multiple when not explicitly provided.
+2. Expose fee_percent in tuning CLI and surface fee/cost metrics in trial reports and metrics output.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.54 (Round-Trip Fee Default 0.11% - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 13:26
+Files Modified:
+- config_tuner.py:78-88,966-975 - Updated default fee_percent to 0.0011 (0.11% round-trip).
+- train.py:288-292 - Updated --tune-fee-percent default to 0.0011 (0.11% round-trip).
+
+Original Intent: User clarified fees are 0.055% to open and 0.055% to close.
+
+Changes Made:
+1. Adjusted default round-trip fee to 0.11% to reflect open+close cost.
+2. Updated CLI help text to match the new default.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.55 (Dynamic Fee Per Trade in Tuning - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 13:50
+Files Modified:
+- config_tuner.py:269-865 - Added per-trade fee conversion using each bar's ATR/close, applied to EV gating and returns; summary uses median fee_r.
+
+Original Intent: User requested per-trade fee conversion due to high volatility.
+
+Changes Made:
+1. Compute fee_r per entry using ATR% at each bar when fee_per_trade_r is not explicitly provided.
+2. Apply per-trade fees to EV gating, breakeven thresholds, and realized returns in tuning.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.56 (Fee Fallback Metric - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 13:55
+Files Modified:
+- config_tuner.py:269-882,384-392 - Added fee_fallback_pct metric to quantify how often per-trade fee falls back to defaults.
+
+Original Intent: User requested a metric to track when ATR/close-based fee conversion is unavailable.
+
+Changes Made:
+1. Track fallback usage during fee conversion and report fee_fallback_pct per trial.
+2. Print fee_fallback_pct alongside cost metrics in trial reports.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.57 (Default Expected RR Off - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 14:38
+Files Modified:
+- config_tuner.py:83-92,1004-1012 - Default use_expected_rr set to False for tuner and run_config_tuning.
+- train.py:297-310,653 - Added --tune-use-expected-rr flag and defaulted tuning to expected_rr off unless explicitly enabled.
+
+Original Intent: User requested expected_rr gating be disabled by default.
+
+Changes Made:
+1. Changed default tuning behavior to use target_rr only for EV gating.
+2. Added explicit CLI flag to re-enable expected_rr gating when desired.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.58 (Expected RR Overhaul + Win-R Targets - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 15:39
+Files Modified:
+- labels.py:365-571 - Added pullback_win_r and pullback_realized_r label columns (win magnitude + realized R).
+- feature_engine.py:452-453 - Excluded new win/realized R labels from feature columns.
+- models.py:387-920 - Added EV component helper, trained mean + quantile win-R regressors, and returned conservative expected_rr plus mean/q25.
+- trainer.py:279-290 - Train entry regressor on pullback_win_r when available.
+- config_tuner.py:700-717 - EV gating now uses conservative expected_rr components and clipping.
+
+Original Intent: User requested a redesigned expected_rr function with conservative EV components and robust R definitions.
+
+Changes Made:
+1. Added win/realized R labels so expected_rr is trained in consistent R units.
+2. Trained a mean + quantile regressor for win magnitude and exposed conservative expected_rr.
+3. Used the EV helper to compute conservative EV with clipping and dynamic costs in tuning.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.59 (Disable Pruning Flag - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 15:55
+Files Modified:
+- config_tuner.py:83-136,776,1030-1060 - Added enable_pruning flag to ConfigTuner and run_config_tuning; guarded early prune logic.
+- train.py:313-324,661 - Added --tune-no-prune CLI flag and wired to enable_pruning.
+
+Original Intent: User requested a flag to disable Optuna pruning.
+
+Changes Made:
+1. Added enable_pruning parameter to the tuner and disable option via CLI.
+2. Wrapped early prune condition to honor enable_pruning.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.60 (Penalize Insufficient Data Trials - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 16:06
+Files Modified:
+- config_tuner.py:526-832 - Return -1.0 score for no_features / insufficient_folds / insufficient_pullbacks instead of 0.0.
+
+Original Intent: User requested that insufficient-data trials score -1 so Optuna doesn't prefer them over negative scores.
+
+Changes Made:
+1. Penalized early-exit trials with -1.0 scores to discourage Optuna from selecting them.
+
+Testing: Not tested
+
+
+----------------------------------------------------------------------
+v1.61 (Raw vs Cal Metrics + Holdout Entry Report - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 18:21
+Files Modified:
+- models.py:755-780,824-846 - Added raw/cal probability metrics and binary metrics helper for entry model training.
+- trainer.py:279-324,483 - Log raw vs calibrated entry metrics/base rate and use pullback_win_r in two-pass retrain.
+- config_tuner.py:407-414,830-839 - Added raw vs calibrated entry metrics and base rate to tuning reports.
+- train.py:66-166,801-834 - Added holdout entry metrics report for tuned config and included in tuning summary JSON.
+
+Original Intent: User requested raw vs calibrated entry metrics in training/tuning and a holdout-test entry report aligned with backtest split.
+
+Changes Made:
+1. Computed and logged raw vs calibrated accuracy/precision/recall plus base rates in training and tuning.
+2. Added a holdout test-split entry metrics evaluation after tuning and saved it in tuning_summary.json.
+3. Ensured two-pass retrain uses pullback_win_r when available.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.64 (Concatenated Walk-Forward Scoring - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 21:44
+Files Modified:
+- config_tuner.py:879 - Score profit on concatenated OOS returns instead of fold median/IQR.
+
+Original Intent: User requested concatenated walk-forward evaluation using a single OOS trade stream with costs and drawdown across folds.
+
+Changes Made:
+1. Switched profit_score to use concatenated OOS trade metrics from the combined return stream.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.65 (Fold Stability + Coverage Constraints - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 22:03
+Files Modified:
+- config_tuner.py:88-151,668-980,423-445,1164-1203 - Added per-fold trade/coverage constraints, no-opportunity/refusal penalties, stability dispersion penalties, and reporting/params.
+- train.py:423-436,652-661,834-836 - Added CLI flags/validation for per-fold trade minimums and coverage bounds; passed into tuner.
+
+Original Intent: User requested keeping stability penalties and coverage bounds, plus per-fold trade constraints with mild vs strong penalties for no-opportunity vs model-refusal folds.
+
+Changes Made:
+1. Added per-fold trade/coverage constraints and penalties (no-opportunity vs refusal) to concatenated walk-forward scoring.
+2. Applied stability penalties for dispersion across fold scores/trade counts/coverage and surfaced new metrics in reports.
+3. Exposed min trades per fold and coverage bounds via CLI and wired them into the tuner.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.66 (Tuning Stability Output Details - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 22:04
+Files Modified:
+- config_tuner.py:423-430 - Added fold_trades_mean and fold_coverage_mean to stability report output alongside IQRs.
+
+Original Intent: Preserve mean trade/coverage visibility in per-trial stability output.
+
+Changes Made:
+1. Expanded stability line to include mean and IQR for trades and coverage.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.67 (No-Trade Fold Penalty - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 22:12
+Files Modified:
+- config_tuner.py:790-812 - Made zero-trade folds a soft penalty (negative fold score) and exempted them from per-fold hard constraints.
+
+Original Intent: User requested that folds with zero trades be penalized (not hard-rejected), with milder treatment for no-opportunity cases.
+
+Changes Made:
+1. Applied a small negative fold score for zero-trade folds with opportunities.
+2. Avoided per-fold min-trade/coverage hard rejections when trade_count is zero.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.68 (Ops Cost Penalty for Trade Frequency - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 22:59
+Files Modified:
+- config_tuner.py:93-167,277-307,630-955,423-438,1159-1210 - Added convex ops cost penalty based on trades/day, applied per-trade in tuning returns, and reported new metrics/params.
+- train.py:441-472,656-666,838-844 - Added tuning CLI flags to configure ops cost (target/c1/alpha) or disable it; passed through to tuner.
+
+Original Intent: Add a convex frequency-based ops cost penalty (trades/day) to tuning-only scoring.
+
+Changes Made:
+1. Computed trades/day per fold using time span and subtracted ops cost per trade from returns before scoring.
+2. Added ops cost parameters to tuning config and metrics/reporting.
+3. Added CLI flags for ops cost target/scale/alpha and a disable switch.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.69 (Tier Classifier Label Guard - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 23:03
+Files Modified:
+- models.py:659-712 - Skip tier classifier when train has <2 classes; filter val labels to train classes before eval.
+
+Original Intent: Prevent LightGBM label-encoder crash when validation has unseen tier labels during training from tuning configs.
+
+Changes Made:
+1. Added class-count guard for tier classifier training.
+2. Filtered validation tier labels to classes seen in training before passing to eval_set.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.70 (LCB Total Score for Tuning - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 23:13
+Files Modified:
+- config_tuner.py:250-270 - Switched scoring to LCB on total PnL with drawdown penalty and trade-confidence term.
+
+Original Intent: User requested scoring based on LCB_total (sum-based) to better reward scalable edges while keeping DD and trade-confidence penalties.
+
+Changes Made:
+1. Updated _score_trade_metrics to use LCB_total and dd penalty, then apply trade-confidence.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.71 (Softened Trade-Confidence Term - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-26 23:15
+Files Modified:
+- config_tuner.py:262 - Softened trade-confidence multiplier using sqrt(tanh(n/min_trades)).
+
+Original Intent: User requested a softened small-sample guard with LCB_total scoring.
+
+Changes Made:
+1. Applied square-root to the trade-confidence term to reduce double-counting with LCB_total.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.72 (Soft Penalty for Low-Trade Folds - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 00:05
+Files Modified:
+- config_tuner.py:662-1055,441-447 - Replaced hard rejection for low-trade folds with a scaled penalty; added low-trade fold metrics to reports.
+
+Original Intent: User requested that folds with a few trades be penalized less than zero-trade folds, not hard-rejected.
+
+Changes Made:
+1. Added a proportional low-trade penalty for folds with 1..min_trades_fold-1 trades.
+2. Removed the hard reject for insufficient trades per fold and surfaced low-trade fold counts.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.73 (Convex Low-Trade Penalty - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 00:07
+Files Modified:
+- config_tuner.py:801-805 - Applied gamma=1.5 to low-trade fold penalty.
+
+Original Intent: User requested a convex penalty curve for low-trade folds.
+
+Changes Made:
+1. Raised low-trade penalty to the 1.5 power for stronger penalty at very low trades.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.74 (CV Calibration in Tuning Folds - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 00:16
+Files Modified:
+- models.py:447-613 - Added calibration_mode to allow train-only CV calibration even when a validation set exists.
+- config_tuner.py:792 - Forced calibration_mode="cv" during tuning fold scoring to avoid calibrating on scored val.
+
+Original Intent: User requested eliminating calibration leakage by calibrating without touching the scored fold.
+
+Changes Made:
+1. Added calibration_mode parameter to EntryQualityModel.train to select between validation-based and CV calibration.
+2. Updated tuning fold training to use CV calibration on training data only.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.75 (LightGBM CV Calibration Fit Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 00:19
+Files Modified:
+- models.py:618 - Removed unsupported verbose argument from fold_model.fit during CV calibration.
+
+Original Intent: Fix Optuna tuning crash after enabling CV calibration.
+
+Changes Made:
+1. Dropped verbose argument to match LightGBM sklearn API in this environment.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.76 (Two-Pass Ops-Cost EV Gate - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 00:24
+Files Modified:
+- config_tuner.py:767-847 - Added two-pass EV gating so ops cost affects trade selection before returns are scored.
+
+Original Intent: User requested ops cost to influence the EV gate rather than only post-hoc penalizing returns.
+
+Changes Made:
+1. Estimated ops cost from an initial EV mask, then re-gated EV with fee+ops cost and recomputed trade stats.
+2. Kept ops cost applied once in realized returns using the final mask.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.77 (Fix Ops Cost Two-Pass Consistency - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 00:31
+Files Modified:
+- config_tuner.py:812-832 - Kept ops_cost_r fixed from initial estimate during second-pass EV gating.
+
+Original Intent: Ensure ops cost influences EV gating without resetting to zero after re-mask.
+
+Changes Made:
+1. Removed ops-cost recomputation after second-pass masking; trade_rate_day updates but ops_cost_r stays consistent with the gate.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.78 (Train-Split Calibration Mode - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 00:39
+Files Modified:
+- models.py:447-652 - Added train-split calibration mode with stratified shuffle and configurable split fraction.
+- config_tuner.py:792 - Switched tuning folds to calibration_mode="train_split" to reduce over-conservatism on small data.
+
+Original Intent: User requested leak-safe calibration that is less aggressive than CV for 9-day datasets.
+
+Changes Made:
+1. Implemented train-split calibration using a stratified 80/20 split on training data.
+2. Updated tuning to use train-split calibration by default.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.79 (OOF Time-Ordered Calibration - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 01:23
+Files Modified:
+- models.py:447-672 - Added OOF time-ordered calibration mode (K folds) with fallback when OOF coverage is too small.
+- config_tuner.py:792 - Switched tuning folds to calibration_mode="oof" with 3 folds.
+
+Original Intent: User requested OOF calibration (K=3 time-ordered blocks) to avoid leakage while using most train samples.
+
+Changes Made:
+1. Implemented time-ordered OOF calibration by training on earlier blocks and predicting on held-out blocks.
+2. Added fallback to full-train raw probs if OOF coverage is too low.
+3. Updated tuner to use OOF calibration with 3 folds.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.80 (Calibration Shrinkage Blend - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 01:46
+Files Modified:
+- models.py:383-1012 - Added calibration shrinkage blend (w*cal + (1-w)*raw) with shrinkage stats; applied consistently in metrics and predict.
+
+Original Intent: Blend calibrated probabilities toward raw probs based on calibration sample size to avoid overreaction on small datasets.
+
+Changes Made:
+1. Added calibration_shrink_k and stored n_cal/shrink params in calibration stats.
+2. Applied shrinkage in calibration ECE computation, training metrics, and predict.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.81 (Temperature Scaling Default Calibration - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 01:55
+Files Modified:
+- models.py:23-122,447-690,900-1012 - Added TemperatureScaler, made it the default calibration method, and captured calibrator stats.
+
+Original Intent: User requested temperature scaling as the default calibration method, compatible with OOF + shrinkage.
+
+Changes Made:
+1. Implemented TemperatureScaler and switched default calibration_method to temperature scaling.
+2. Preserved shrinkage blending and metrics/predict paths for calibrated probabilities.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.82 (OOF Calibration Mask Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 02:11
+Files Modified:
+- models.py:629-655 - Fit OOF calibrator only on filled OOF predictions; fallback to full-train when coverage is too low.
+
+Original Intent: Fix OOF calibration using zero-filled predictions that could collapse probability spread.
+
+Changes Made:
+1. Filtered OOF calibration inputs to filled indices only before fitting calibrator.
+2. Kept fallback to full-train raw probs when OOF coverage is insufficient.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.83 (OOF Calibration Fill Mask Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 02:13
+Files Modified:
+- models.py:631-653 - Track filled OOF indices explicitly instead of inferring from prob values.
+
+Original Intent: Fix OOF calibration coverage check so low/zero probabilities aren?t mistaken for missing predictions.
+
+Changes Made:
+1. Added explicit filled_mask for OOF predictions and used it for calibration inputs.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.84 (Tuning Calibration Method Flag - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 02:30
+Files Modified:
+- train.py:476-487,846 - Added --tune-calibration-method flag and wired into tuning call.
+- config_tuner.py:96-160,792,1273-1303 - Added calibration_method param and passed into EntryQualityModel training.
+
+Original Intent: User requested a flag to switch between temperature scaling and isotonic calibration.
+
+Changes Made:
+1. Added CLI flag for calibration method selection during tuning.
+2. Threaded calibration_method through ConfigTuner to EntryQualityModel.train.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.85 (Revert Calibration Leak Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 03:03
+Files Modified:
+- config_tuner.py:794-807 - Removed OOF calibration override to restore validation-set calibration.
+- models.py:441-532,771-792,974-978 - Removed shrinkage blend from calibration; updated defaults and _apply_calibration.
+
+Original Intent: Revert the calibration leak fix, remove OOF calibration, and drop shrinkage blending.
+
+Changes Made:
+1. Stopped forcing OOF calibration in tuning so validation-set calibration is used again.
+2. Removed shrinkage blending from calibration outputs and stats; simplified _apply_calibration.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.86 (Rollback Calibration Leak Fix Stack - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 03:12
+Files Modified:
+- models.py:1-120,489-620 - Removed TemperatureScaler and advanced calibration modes; simplified calibration to isotonic-on-validation.
+- config_tuner.py:82-165,794-807,1250-1320 - Removed calibration_method parameter and wiring from tuning.
+- train.py:441-466,869-878 - Removed --tune-calibration-method flag and the tuning call parameter.
+
+Original Intent: Revert all changes introduced after the calibration leak fix.
+
+Changes Made:
+1. Removed temperature scaling, OOF/train-split/CV calibration modes, and shrinkage logic.
+2. Restored default calibration to validation-set isotonic; removed tuning calibration-method flag.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.87 (Restore Calibration Fix Stack - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 03:42
+Files Modified:
+- models.py:30-120,441-742,924-939 - Restored temperature scaling, OOF calibration support, and shrinkage blending.
+- config_tuner.py:101-155,803-805,1289-1325 - Restored calibration_method wiring and OOF calibration for tuning.
+- train.py:449-456,880 - Restored --tune-calibration-method and passed it into tuning.
+
+Original Intent: Put back calibration leak fix (OOF), shrinkage, and temperature scaling.
+
+Changes Made:
+1. Reintroduced temperature scaling and OOF time-ordered calibration with shrinkage blending in EntryQualityModel.
+2. Tuned folds now calibrate on train-only OOF with method selection.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.88 (Default Coverage Bounds - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 03:52
+Files Modified:
+- train.py:428-437 - Set default --tune-min-coverage=0.10 and --tune-max-coverage=0.70.
+- config_tuner.py:88-96,1276-1284 - Updated default min_coverage/max_coverage to 0.10/0.70.
+
+Original Intent: Apply conservative default coverage bounds for tuning and hard-reject out-of-range trials.
+
+Changes Made:
+1. Adjusted CLI defaults for tuning coverage bounds.
+2. Aligned ConfigTuner defaults with the conservative coverage range.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.89 (Hard Penalty on Refusal with Opportunities - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 04:02
+Files Modified:
+- config_tuner.py:706-1078 - Added hard -1 score when trades==0 and pullback_val >= opp_min; removed coverage hard reject.
+- train.py:428-437 - Restored default coverage bounds to 0.0/1.0.
+- config_tuner.py:88-96,1276-1284 - Restored default min_coverage/max_coverage to 0.0/1.0.
+
+Original Intent: Remove coverage hard constraints and instead hard-fail only when real opportunities existed but no trades were taken.
+
+Changes Made:
+1. Added opp_min threshold (max(min_pullback_val_samples, 30)) and hard rejection when trades==0 with opps above threshold.
+2. Kept coverage diagnostics but no longer hard-reject on coverage bounds.
+3. Reverted coverage defaults to full range.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.90 (Purge + Decision-Aligned Metrics - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 04:13
+Files Modified:
+- config_tuner.py:178-210 - Added purge/embargo in walk-forward splits based on forward windows.
+- config_tuner.py:629-636 - Constrained num_leaves <= 2**max_depth.
+- config_tuner.py:729-1193 - Added decision-aligned metrics (selected precision/EV), implied-threshold diagnostics, robust fold aggregation, and pruning tweaks.
+
+Original Intent: Apply leak-safe purging, align metrics with EV-gated decisions, make scoring more robust, and soften pruning.
+
+Changes Made:
+1. Purged last/first H bars in each fold (H=max forward windows) to reduce label leakage.
+2. Added selection-aligned metrics (precision/EV on trade_mask) and implied-threshold dispersion diagnostics.
+3. Switched profit_score to median of fold scores and updated pruning to use per-fold thresholds.
+4. Added a LightGBM sanity clamp on num_leaves.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.91 (EV Margin Sweep in Tuning - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 04:33
+Files Modified:
+- config_tuner.py:488-1438 - Added EV margin grid sweep (0.00..0.20), margin selection by robust fold score, decision-aligned metrics per margin, and updated pruning/reporting.
+- train.py:887-888 - Use tuned best ev_margin_r when building best_cfg.
+
+Original Intent: Add a fast EV margin sweep per trial without retraining, selecting the margin that maximizes robust fold-aggregated performance under constraints.
+
+Changes Made:
+1. Evaluate a small margin grid per fold (two-pass cost logic) and select the best margin by median-fold score minus penalties.
+2. Record margin-specific diagnostics and use the selected margin in metrics, reporting, and best_config.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.92 (Hard-Fail Score Sentinel - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 04:40
+Files Modified:
+- config_tuner.py:216-1182 - Changed hard-fail score from -1.0 to -1e6 to keep it below any real score.
+
+Original Intent: Make hard-fail sentinel always worse than normal negative scores.
+
+Changes Made:
+1. Updated all hard-fail early returns to score = -1e6.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.93 (Fix low_trade_folds NameError - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 04:43
+Files Modified:
+- config_tuner.py:1188-1192 - Defined low_trade_folds from margin_trade_violations for selected margin.
+
+Original Intent: Fix crash after EV margin sweep refactor.
+
+Changes Made:
+1. Set low_trade_folds from selected margin trade violations before metrics logging.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.94 (P25 Fold Aggregation - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 05:44
+Files Modified:
+- config_tuner.py:1127-1135 - Use 25th-percentile fold score for margin scoring.
+- config_tuner.py:1252 - Added fold_score_p25 metric for reporting.
+- config_tuner.py:1328-1330 - Use 25th-percentile fold score for final profit_score base.
+
+Original Intent: Implement the 25th-percentile fold score as the primary aggregator.
+
+Changes Made:
+1. Switched profit score base from median to 25th percentile for margin selection and final scoring.
+2. Added fold_score_p25 metric for visibility while keeping fold_score_median for reference.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.95 (Trend/Regime Gates + Min Fold Aggregator - Dec 2025)
+----------------------------------------------------------------------
+Agent: GPT-5
+Date: 2025-12-27 06:23
+Files Modified:
+- config.py:87-95 - Added trend/regime gating defaults (thresholds, allowed regimes, alignment flag).
+- config_tuner.py:610-653 - Added tuning params for trend/regime gates and logging.
+- config_tuner.py:930-1011,1068-1136 - Trained trend/regime models per fold, built gate masks, applied gates in EV selection.
+- config_tuner.py:1184-1189,1331-1333,1389 - Logged gate rejections and fold_score_min metric.
+- config_tuner.py:1262,1328 - Switched profit score base from median/p25 to min fold.
+- backtest.py:90-147,212,365-368,404-412,501-621 - Added trend/regime gate params, precomputed predictions, gated entries, logged metrics.
+- predictor.py:34-47,539-553 - Added regime probability fields to TrendSignal and populated them.
+- live_trading.py:95-103,312-357,462-501,1249-1310,1610-1622,1736-1845 - Added gate params/defaults, config overrides, gating logic, CLI flags, and logging.
+- live_trading_funds.py:775-905 - Added trend/regime gate CLI flags and passed into LiveFundsTrader.
+- live_trading_funds_simulated.py:1916-2097,2205-2215 - Loaded gate config, passed into backtest/sim, reported gate settings.
+- train.py:230-254,1100-1114,1149-1162,1204-1212 - Added backtest CLI flags for gates, applied config defaults, passed into backtest/log params.
+
+Original Intent: Remove p25 aggregation in favor of min-fold scoring, and integrate trend/regime classifiers as tunable gates across tuning/backtest/live/sim.
+
+Changes Made:
+1. Switched tuning profit-score aggregation to worst-fold (min) and added fold_score_min metric.
+2. Added trend/regime gate parameters to config and Optuna search, trained classifiers per fold, and gated EV selection.
+3. Applied the same gate logic in backtest, live trading, live funds, and simulated live paths, with CLI overrides and config-driven defaults.
+
+Testing: Not tested
+----------------------------------------------------------------------
+v1.96 (Tune EV Margin Fixed - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 06:41
+Files Modified:
+- config_tuner.py:87,138,814-830 - Added ev_margin_fixed option and fixed-mode margin grid handling for tuning.
+
+Original Intent: User requested a flag to fix the EV margin during tuning to avoid low-margin sweep candidates.
+
+Changes Made:
+1. Added ev_margin_fixed parameter to ConfigTuner and stored it.
+2. Updated EV margin grid selection to honor fixed mode (single margin).
+
+Testing: Not tested (configuration change only)
+----------------------------------------------------------------------
+v1.97 (Context Features for Entry Model - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 12:18
+Files Modified:
+- models.py:40-84 - Added context feature names and helper to append trend/regime probabilities to entry features.
+- config.py:87-89 - Defaulted trend/regime gates off to use context features instead of hard gating.
+- trainer.py:15,249-560 - Train regime before entry; inject context features into entry train/val/full retrain.
+- config_tuner.py:23,871-1030 - Train trend/regime before entry and append context features in tuning folds.
+- train.py:9,126-222 - Holdout eval now trains trend/regime and appends context features for entry.
+- backtest.py:14,239-508 - Allow context features, compute trend/regime predictions when needed, inject into entry feature frame.
+- predictor.py:591-634 - Add trend/regime probabilities as entry-model features in live prediction.
+- live_trading_funds_simulated.py:1459-1510 - Add context features to bulk entry prediction.
+- live_trading.py:95-97 - Default trend/regime gating disabled.
+
+Original Intent: Use trend/regime outputs as entry-model features instead of hard gating, and keep tuning/backtest/live consistent.
+
+Changes Made:
+1. Added shared context feature columns and helper in models.py.
+2. Reordered training/tuning to build trend/regime models first and append their probability outputs to entry features.
+3. Updated backtest and live predictors to populate context features from trend/regime predictions, and disabled gates by default.
+
+Testing: Not tested (manual run pending)
+----------------------------------------------------------------------
+v1.98 (Disable Gate Tuning - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 14:24
+Files Modified:
+- config_tuner.py:600-640 - Stopped tuning trend/regime gate parameters; force gates off during tuning.
+
+Original Intent: User asked to stop tuning gate flags/thresholds so refused_with_opportunities hard-fails disappear.
+
+Changes Made:
+1. Removed gate parameter suggestions from Optuna and set use_trend_gate/use_regime_gate to False with neutral defaults.
+
+Testing: Not tested (configuration change only)
+----------------------------------------------------------------------
+v1.99 (Statistical opp_min - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 14:39
+Files Modified:
+- config_tuner.py:833-870,1500-1506 - Compute opp_min via binomial hard-fail rule using p_min/alpha and log diagnostics.
+
+Original Intent: User requested a statistically grounded opp_min and to report it in diagnostics.
+
+Changes Made:
+1. Compute opp_min from p_min and alpha with pb_val median baseline.
+2. Log opportunity_alpha, opportunity_p_min, and opportunity_pb_val_median in metrics.
+
+Testing: Not tested (logic change only)
+----------------------------------------------------------------------
+v2.00 (Tuner Alignment + Context OOF - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 15:06
+Files Modified:
+- config_tuner.py:789-826 - Fix opp_min computation order using min_trades_per_fold + pb_val_median.
+- config_tuner.py:892-1019 - Add time-ordered OOF context predictions and use them for entry training features.
+- config_tuner.py:1121-1132 - Align outcomes_r with expected_rr using pullback_win_r for wins.
+- config_tuner.py:1253 - Avoid double-penalizing zero-trade folds in fold_score.
+- config_tuner.py:1352-1382,1433-1581 - Add coverage violation penalty and soften coverage/min-trade constraints in margin selection.
+
+Original Intent: Align scoring with expected_rr/EV, fix opp_min bug, remove stacking leakage in context features, and make coverage/min-trade handling robust.
+
+Changes Made:
+1. Reordered opp_min calculation to avoid uninitialized pb_val_median usage.
+2. Added time-ordered OOF predictions for trend/regime features in entry training; kept full-train preds for validation.
+3. When expected_rr is enabled, score wins using pullback_win_r to match EV assumptions.
+4. Added explicit coverage-violation penalty and removed hard constraints for coverage/min-trades (hard-refusal remains).
+5. Removed fold-level double penalty for zero trades.
+
+Testing: Not tested (tuning run recommended)
+----------------------------------------------------------------------
+v2.01 (EV Diagnostics for Tuning/Backtest - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 15:34
+Files Modified:
+- config_tuner.py:18-21 - Import compute_expected_calibration_error.
+- config_tuner.py:865-1019,1121-1170,1538-1604 - Collect selected-trade diagnostics (Brier/logloss/ECE, EV bins, RR bias) and print in trial report.
+- backtest.py:12,35-51,61-71,682-791,868-905,985-1416,1522-1551 - Add per-trade EV/fee/threshold fields, compute realized R, build EV diagnostics, print and save in summary.
+
+Original Intent: Add EV-vs-realized diagnostics in both tuning and backtest to explain AUC/EV mismatches.
+
+Changes Made:
+1. Captured selected-trade probability/EV/expected-RR stats during tuning and reported Brier/logloss/ECE, EV bin performance, and expected-RR bias.
+2. Backtest now records per-trade EV components and realized R, builds diagnostics (calibration + EV bins), prints them, and saves in backtest summary.
+3. Ensured diagnostics stay ASCII-friendly and safe when trades are absent.
+
+Testing: Not tested (manual tuning/backtest run recommended)
+----------------------------------------------------------------------
+v2.02 (Default Max Coverage 0.7 - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 16:18
+Files Modified:
+- train.py:515-519 - Set --tune-max-coverage default to 0.7.
+- config_tuner.py:97,1896 - Default max_coverage to 0.7 for tuning.
+
+Original Intent: User requested default max coverage be 0.7.
+
+Changes Made:
+1. Updated tuning CLI default and ConfigTuner/run_config_tuning defaults to 0.7.
+
+Testing: Not tested (config default change only)
+----------------------------------------------------------------------
+v2.03 (Adaptive LCB Z - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 16:34
+Files Modified:
+- config_tuner.py:398-446 - Add adaptive LCB z schedule based on trade count and use it in scoring.
+- config_tuner.py:1294-1362 - Record per-fold lcb_z used in fold details and metrics.
+
+Original Intent: Soften robustness penalty for small sample sizes and tighten as trades grow.
+
+Changes Made:
+1. Implemented adaptive lcb_z (0.6?1.28 ramp) capped by lcb_z setting.
+2. Applied adaptive lcb_z per fold and reported fold_lcb_z diagnostics.
+
+Testing: Not tested (tuning run recommended)
+----------------------------------------------------------------------
+v2.04 (P25 Fold Aggregator - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 16:40
+Files Modified:
+- config_tuner.py:1369-1376,1648-1654 - Use 25th percentile fold score as base profit score instead of min.
+
+Original Intent: Prefer configs that make money even if one fold is weak, vs consistently losing configs.
+
+Changes Made:
+1. Replaced min(fold_scores) with p25(fold_scores) for margin selection and final profit score.
+
+Testing: Not tested (tuning run recommended)
+----------------------------------------------------------------------
+v2.05 (Soft Profitability Floor - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 17:22
+Files Modified:
+- config_tuner.py:1637-1698 - Add soft penalties when profit_factor < 1 or pnl_per_trade_r < 0; report diagnostics.
+
+Original Intent: Ensure consistently losing configs do not outrank mixed but profitable ones while keeping penalties soft.
+
+Changes Made:
+1. Added pf_floor_penalty and pnl_floor_penalty based on aggregate PF and per-trade PnL.
+2. Included penalties in profit_score and logged in metrics.
+
+Testing: Not tested (tuning run recommended)
+----------------------------------------------------------------------
+v2.06 (Scaled Profitability Floors - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 17:35
+Files Modified:
+- config_tuner.py:1698-1749 - Scale PF/pnl-per-trade floor penalties by base profit score and log scale.
+
+Original Intent: Make PF and pnl-per-trade floor penalties comparable to LCB-based fold score terms.
+
+Changes Made:
+1. Compute floor_penalty_scale from p25 base profit score and use it to scale PF/pnl penalties.
+2. Log floor_penalty_scale and updated penalties in metrics.
+
+Testing: Not tested (tuning run recommended)
+----------------------------------------------------------------------
+v2.07 (Stability Penalty Multiplier - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 17:47
+Files Modified:
+- config_tuner.py:98-155 - Add stability_penalty_multiplier configuration and store on tuner.
+- config_tuner.py:1414-1436 - Apply stability_penalty_multiplier during margin selection scoring.
+- config_tuner.py:1696-1708 - Apply stability_penalty_multiplier to final stability penalty and log it.
+- config_tuner.py:1944-1989 - Thread stability_penalty_multiplier through run_config_tuning.
+
+Original Intent: Make stability slightly stronger than profit in the overall score.
+
+Changes Made:
+1. Added a stability penalty multiplier (default 1.5) to scale stability against profit.
+2. Applied the multiplier in both margin selection and final scoring, and logged it.
+
+Testing: Not tested (tuning run recommended)
+----------------------------------------------------------------------
+v2.08 (Quadratic Fold Factor + EV Grid 0.4 - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 19:20
+Files Modified:
+- config_tuner.py:866-877 - Extend EV margin sweep grid to include 0.40.
+- config_tuner.py:1424-1442 - Apply quadratic fold factor to margin-selection profit score and log fold factor.
+- config_tuner.py:1739-1768 - Apply quadratic fold factor to final profit score and log folds_used.
+
+Original Intent: Penalize single-fold trials more strongly and expand EV margin sweep range.
+
+Changes Made:
+1. Added 0.40 to EV margin sweep grid when not fixed.
+2. Scaled profit_score by (folds/3)^2 for both margin selection and final scoring.
+3. Logged fold_factor and folds_used in metrics.
+
+Testing: Not tested (tuning run recommended)
+----------------------------------------------------------------------
+v2.09 (Tuning Pause Menu + Calibration Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 20:22
+Files Modified:
+- config_tuner.py:12-2100 - Add pause listener/menu, candidate backtest/save flow, and include EV margin grid to 0.40.
+- config.py:79-90 - Add labels.use_calibration to persist calibration choice.
+- train.py:888-1160 - Propagate use_calibration from tuning summary and use it as backtest default.
+- live_trading.py:430-455 - Override use_calibration from train_config when CLI default is used.
+- live_trading_funds_simulated.py:1963-2277 - Use train_config use_calibration when CLI default is used.
+
+Original Intent: Allow pausing Optuna tuning to backtest/save top candidates and keep calibration/expected_rr aligned across tuning, backtest, and live.
+
+Changes Made:
+1. Implemented a 'p' key pause listener and interactive menu to list top 5 trials, backtest, and save candidates with trial ID.
+2. Added candidate backtest pipeline inside tuner, using seed ensemble 10 and calibration consistent with tuning.
+3. Expanded EV margin sweep grid to include 0.40 and saved selected trial metadata.
+4. Added labels.use_calibration and propagated it through tuning summary, backtest defaults, and live/sim defaults.
+
+Testing: Not tested (manual tuning/backtest run recommended)
+----------------------------------------------------------------------
+v2.10 (Cross-Platform Pause Listener - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 21:25
+Files Modified:
+- config_tuner.py:647-705 - Add POSIX keypress listener for pause menu.
+
+Original Intent: Make the pause menu work on Ubuntu/Linux.
+
+Changes Made:
+1. Added a POSIX (termios/select) keypress listener fallback when msvcrt is unavailable.
+2. Preserved Windows behavior and restore terminal settings on exit.
+
+Testing: Not tested (manual keypress on Linux recommended)
+----------------------------------------------------------------------
+v2.11 (Backtest EV Gate Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 22:01
+Files Modified:
+- backtest.py:70-760 - Add ops-cost EV gating, raw-prob override, explicit fee_r support, max_bounce_prob gating change, and default trade_side=both.
+- config.py:79-90 - Add labels.fee_per_trade_r for explicit fee override.
+- config_tuner.py:742-930 - Pass fee_per_trade_r, ops-cost settings, and raw-prob override into candidate backtests.
+- train.py:900-1245 - Load fee_per_trade_r from tuning summary and pass to backtest; pass use_raw_probabilities.
+
+Original Intent: Align backtest EV gating/fees/probability mode with tuning and default trade_side to both.
+
+Changes Made:
+1. Added ops-cost to EV gating in backtest, using running trade rate and tuner-style parameters.
+2. Added explicit fee-per-trade R override and raw-prob override in backtest.
+3. Ignored max_bounce_prob when EV gate is enabled.
+4. Defaulted backtest trade_side to both and propagated fee_per_trade_r/use_raw_probabilities from tuning summary.
+
+Testing: Not tested (manual backtest recommended)
+----------------------------------------------------------------------
+v2.12 (Trend/Regime Prob Diagnostics - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 22:15
+Files Modified:
+- backtest.py:184-1360 - Track trend/regime probs for checked signals and print diagnostics.
+
+Original Intent: Print trend/regime probability diagnostics to assess calibration drift.
+
+Changes Made:
+1. Collected trend/regime probabilities and regime IDs for each checked signal.
+2. Added percentile/mean stats and regime counts to diagnostics output.
+
+Testing: Not tested (run a backtest and inspect diagnostics output)
+----------------------------------------------------------------------
+v2.13 (Robust Score Multipliers - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-27 23:49
+Files Modified:
+- config_tuner.py:108-202 - Add stability_k/coverage_k defaults and stability_eps handling.
+- config_tuner.py:582-592 - Add opportunity and score multiplier diagnostics to trial output.
+- config_tuner.py:1814-1860 - Replace margin scoring with p25 * stab * cov_pen * trade_conf * fold_factor.
+- config_tuner.py:1914-2160 - Replace final scoring with new multipliers and add related metrics.
+- config_tuner.py:2389-2432 - Expose stability_k/coverage_k/stability_eps in run_config_tuning.
+
+Original Intent: Implement the new robust scoring framework with stability/coverage/trade-count multipliers and report opp_min.
+
+Changes Made:
+1. Added stability_k/coverage_k defaults and stability_eps, with auto coverage_k based on coverage band width.
+2. Replaced margin selection and final profit scoring with p25 * stability * coverage * trade_conf * fold_factor.
+3. Added diagnostics for opportunity_min and score multipliers in trial output.
+
+Testing: Not tested (no automated tests run)
+----------------------------------------------------------------------
+v2.14 (Pipeline Cache + Split Index Reuse - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 00:06
+Files Modified:
+- config_tuner.py:90-206 - Add in-memory caches for bars/features/labels and split indices.
+- config_tuner.py:247-377 - Add cached split-index generator and cache key helpers.
+- config_tuner.py:1246-1274 - Use cached bars/features/labels in tuning pipeline.
+
+Original Intent: Speed up tuning by caching bars/features/labels and reusing split indices across trials.
+
+Changes Made:
+1. Added cache keys for bars/features/labels based on relevant params and reused cached outputs in _evaluate_config.
+2. Added cached walk-forward split indices keyed by dataset length + ratios + purge window.
+3. Updated split generation to reuse cached indices while preserving purge logic.
+
+Testing: Not tested (run a tuning session to confirm performance and equivalence)
+----------------------------------------------------------------------
+v2.15 (Rust Pipeline CLI + Arrow Output - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 00:56
+Files Modified:
+- rust_pipeline/Cargo.toml:1-13 - Added Rust crate manifest for the pipeline CLI and Arrow IPC output.
+- rust_pipeline/src/pipeline.rs:1-2200 - Implemented Rust bars/features/labels pipeline with pandas-aligned math and Arrow writer.
+- rust_pipeline/src/main.rs:1-21 - Added CLI entrypoint to run the Rust pipeline with config + output dir.
+
+Original Intent: Port bar aggregation, feature engineering, and labeling to Rust with Arrow IPC outputs for cross-platform use.
+
+Changes Made:
+1. Implemented Rust data loader, bar aggregation, feature calculations, and label generation to match Python pipeline semantics.
+2. Added Arrow IPC writer to output dataset and feature column list, with optional intermediate outputs.
+3. Added CLI to run the Rust pipeline from a JSON config and write outputs to ./rust_cache.
+
+Testing: Not tested (cargo build/check requires Rust toolchain and crate downloads)
+----------------------------------------------------------------------
+v2.16 (Rust Pipeline Fixes - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 00:57
+Files Modified:
+- rust_pipeline/src/pipeline.rs:16-2190 - Fixed timestamp parsing/order, NaN handling, config loading, and cross-TF mean logic.
+
+Original Intent: Correct Rust pipeline behavior to match Python semantics and accept tuning_summary.json inputs.
+
+Changes Made:
+1. Parse trade timestamps as f64 and sort by full precision to preserve intrabar ordering; compute bar_time with floor.
+2. Correct cross-timeframe mean calculations to ignore NaNs like pandas and return NaN when no values exist.
+3. Allow load_config to read best_config from tuning_summary.json and fall back to direct config.
+4. Minor cleanup (remove unused base_sorted, add deterministic feature_cols sort, fix volume lookup).
+
+Testing: Not tested (cargo build/check requires Rust toolchain and crate downloads)
+----------------------------------------------------------------------
+v2.17 (Rust Pipeline Parity Tweaks - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 01:00
+Files Modified:
+- rust_pipeline/src/pipeline.rs:320-1220 - Store swing_high/low as numeric columns and add nan-aware min/max helpers for candle features.
+
+Original Intent: Align Rust feature outputs more closely with pandas behavior for NaN handling and higher-TF merges.
+
+Changes Made:
+1. Emitted swing_high/swing_low as f64 (0/1) so they participate in higher-TF merges like pandas, while still using bools internally.
+2. Added nanmax/nanmin helpers and used them in candle wick calculations to mirror pandas skipna behavior.
+
+Testing: Not tested (cargo build/check requires Rust toolchain and crate downloads)
+----------------------------------------------------------------------
+v2.18 (Rust Pipeline Build Fixes - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 02:15
+Files Modified:
+- rust_pipeline/src/pipeline.rs:989-1890 - Fixed bollinger tuple return type, float typing for MFE/MAE, and unused bar_open.
+
+Original Intent: Resolve Rust compile errors and warnings reported by the user.
+
+Changes Made:
+1. Updated bollinger_bands signature to return five vectors (mid/upper/lower/width/position).
+2. Explicitly typed MFE/MAE as f64 to resolve ambiguous float method calls.
+3. Prefixed unused bar_open in EMA touch detection to silence unused variable warnings.
+
+Testing: Not tested (cargo build/check not run)
+----------------------------------------------------------------------
+v2.19 (Rust Pipeline Data Dir Resolution - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 02:23
+Files Modified:
+- rust_pipeline/src/pipeline.rs:2126-2168 - Added resolve_data_dir to find relative data paths from cwd/config ancestors.
+- rust_pipeline/src/main.rs:16-18 - Resolve data_dir before running the pipeline.
+
+Original Intent: Fix missing data_dir when running Rust CLI from rust_pipeline/.
+
+Changes Made:
+1. Added a resolver that searches ancestors of cwd and config path for the relative data_dir and updates config if found.
+2. Wired resolver into the CLI so tuning_summary.json paths work from subdirectories.
+
+Testing: Not tested (cargo build/check not run)
+----------------------------------------------------------------------
+v2.20 (Rust Dataset Reader - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 02:29
+Files Modified:
+- read_rust_dataset.py:1-61 - Added script to read Arrow IPC dataset and report row/column/feature counts.
+
+Original Intent: Provide a quick Python check for Rust Arrow outputs.
+
+Changes Made:
+1. Added a small CLI to read dataset.arrow with pyarrow and print row/column counts.
+2. Added optional feature_cols.json reporting.
+
+Testing: Not tested (requires pyarrow installed)
+----------------------------------------------------------------------
+v2.21 (ConfigTuner Dataset Compare - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 02:43
+Files Modified:
+- compare_rust_python.py:13-67 - Build the Python dataset through ConfigTuner's cached pipeline for parity.
+
+Original Intent: Ensure the Rust/Python comparison uses the same dataset creation method as config_tuner.py.
+
+Changes Made:
+1. Switched the comparison script to use ConfigTuner _get_cached_* calls for bars/features/labels.
+2. Added a ConfigTuner import guard with a clear error message if missing.
+
+Testing: python compare_rust_python.py --config models/RAVEUSDT/tuning_summary.json --rust-arrow rust_cache/dataset.arrow
+----------------------------------------------------------------------
+v2.22 (PyO3 Rust Pipeline Integration - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 03:05
+Files Modified:
+- rust_pipeline/Cargo.toml:6-21 - Added cdylib/rlib and PyO3 dependency for Python bindings.
+- rust_pipeline/src/lib.rs:1-39 - Added PyO3 module exposing run_pipeline to Python.
+- rust_pipeline/pyproject.toml:1-11 - Added maturin build configuration.
+- rust_pipeline_bridge.py:1-97 - Added Python bridge for Rust pipeline and Arrow loading.
+- config_tuner.py:120-2625 - Added Rust pipeline options, availability checks, and dataset loading via Rust.
+- trainer.py:55-140 - Added Rust pipeline path for bars/features/labels with fallback to Python pipeline.
+- train.py:101-116 - Added Rust pipeline option to holdout dataset build in tuning evaluation.
+
+Original Intent: Replace the Rust CLI with PyO3+maturin and integrate Rust pipeline into Python tuning/training flows.
+
+Changes Made:
+1. Added PyO3 bindings and maturin metadata to build a Python extension module.
+2. Implemented a Python bridge to call the Rust pipeline and read Arrow outputs.
+3. Wired ConfigTuner and training to use the Rust pipeline by default with Python fallback.
+
+Testing: Not tested (no maturin build or training run executed)
+----------------------------------------------------------------------
+v2.23 (Rust Memory Pipeline - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 03:15
+Files Modified:
+- rust_pipeline/src/pipeline.rs:2260-2337 - Added in-memory Arrow writer and run_pipeline_in_memory.
+- rust_pipeline/src/lib.rs:3-40 - Added run_pipeline_memory PyO3 binding returning Arrow bytes.
+- rust_pipeline_bridge.py:50-103 - Added memory-only path that reads Arrow bytes instead of dataset.arrow.
+- trainer.py:122-137 - Handle memory-only dataset path in diagnostics.
+
+Original Intent: Switch Rust pipeline to memory-only outputs (no dataset.arrow writes).
+
+Changes Made:
+1. Implemented an in-memory Arrow IPC writer and Rust pipeline function to return bytes.
+2. Exposed a PyO3 entrypoint that returns dataset bytes + feature columns.
+3. Updated the Python bridge to use the memory-only path by default and parse Arrow bytes.
+4. Adjusted trainer diagnostics to record memory-only output paths.
+
+Testing: Not tested (no maturin build or training run executed)
+----------------------------------------------------------------------
+v2.24 (Rust JSON Config Memory Path - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 03:22
+Files Modified:
+- rust_pipeline/src/pipeline.rs:2128-2156 - Added load_config_from_str helper for JSON-based config parsing.
+- rust_pipeline/src/lib.rs:28-61 - Added run_pipeline_memory_json PyO3 entrypoint.
+- rust_pipeline_bridge.py:59-95 - Switched memory-only path to pass JSON string (no config.json writes).
+
+Original Intent: Avoid config.json writes by passing config as a JSON string for memory-only runs.
+
+Changes Made:
+1. Added config parsing from JSON strings in the Rust pipeline.
+2. Exposed a new PyO3 function that accepts JSON directly for in-memory runs.
+3. Updated the Python bridge to call the JSON-based memory path.
+
+Testing: Not tested (no maturin build or runtime call executed)
+----------------------------------------------------------------------
+v2.25 (Rust Trade Cache + Rust-Only Tuning Inputs - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 04:05
+Files Modified:
+- rust_pipeline/src/pipeline.rs:79-366 - Added trade cache keyed by data config; pipeline now reuses cached trades.
+- rust_pipeline/src/lib.rs:34-76 - Added init_trades_cache/clear_trades_cache PyO3 bindings.
+- rust_pipeline_bridge.py:19-96 - Preload trade cache in the bridge and expose init_trades_cache.
+- config_tuner.py:74-420 - Allow trades=None, adjust cache keys, and guard Python bars when trades missing.
+- trainer.py:86-170 - Skip Python trade loading when Rust pipeline is available.
+- train.py:55-1006 - Skip trade loading for Optuna when Rust is available and allow Rust-only holdout eval.
+
+Original Intent: Let Rust manage CSV data and avoid reloading trades on each pipeline call.
+
+Changes Made:
+1. Added a global trade cache in Rust keyed by data config; pipeline now reuses cached trades.
+2. Added PyO3 cache init/clear helpers and used them from the Python bridge.
+3. Made tuning/training paths accept trades=None and skip Python CSV loads when Rust is available.
+
+Testing: Not tested (no build/run executed)
+----------------------------------------------------------------------
+v2.26 (PyO3 0.25 Module Signature Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 04:32
+Files Modified:
+- rust_pipeline/src/lib.rs:1-110 - Updated #[pymodule] signature to use Bound<PyModule> for PyO3 0.25 compatibility.
+
+Original Intent: Fix build errors after upgrading PyO3 for Python 3.14.
+
+Changes Made:
+1. Switched the module entrypoint to accept Bound<PyModule> so add_function works under PyO3 0.25.
+2. Added explicit Bound import to avoid type resolution issues.
+
+Testing: Not tested (no build executed)
+----------------------------------------------------------------------
+v2.27 (PyO3 0.25 Dict Return Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 04:34
+Files Modified:
+- rust_pipeline/src/lib.rs:6-90 - Return Py<PyDict> from PyO3 functions and use dict.unbind() instead of into_py.
+
+Original Intent: Fix PyO3 0.25 build errors about into_py on Bound<PyDict>.
+
+Changes Made:
+1. Switched run_pipeline/run_pipeline_memory/run_pipeline_memory_json/init_trades_cache to return Py<PyDict>.
+2. Replaced dict.into_py(py) with dict.unbind().
+
+Testing: Not tested (no build executed)
+----------------------------------------------------------------------
+v2.28 (Rust Trade Cache Visibility Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 04:36
+Files Modified:
+- rust_pipeline/src/pipeline.rs:170-756 - Made Trade and load_trades_cached pub(crate) to satisfy PyO3 access.
+
+Original Intent: Resolve PyO3 build errors due to private Trade type in public cache API.
+
+Changes Made:
+1. Updated Trade visibility to pub(crate).
+2. Adjusted load_trades_cached visibility to pub(crate).
+
+Testing: python -m maturin build --release (failed: cargo not found in PATH)
+----------------------------------------------------------------------
+v2.29 (Rust Intrabar Exit via Trade Index - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 05:02
+Files Modified:
+- rust_pipeline/src/pipeline.rs:60-870 - Added trade-index cache, per-bar price lists, and Rust exit checks.
+- rust_pipeline/src/lib.rs:6-122 - Added TradeIndex PyO3 class for intrabar TP/SL checks.
+- rust_pipeline_bridge.py:26-60 - Added build_trade_index() helper.
+- backtest.py:211-420 - Use Rust trade index when raw_trades are unavailable.
+
+Original Intent: Restore precise intrabar TP/SL detection without loading trades in Python.
+
+Changes Made:
+1. Added a cached trade index per timeframe in Rust and a check_exit_in_bar helper.
+2. Exposed TradeIndex to Python and created a bridge helper to build it.
+3. Backtest now uses Rust trade index when raw_trades are not loaded.
+
+Testing: python -m maturin build --release (failed: cargo not found in PATH)
+----------------------------------------------------------------------
+v2.30 (Rust Backtest Dataset Path - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 05:24
+Files Modified:
+- train.py:1125-1186 - Backtest dataset now built via Rust pipeline when available; Python pipeline fallback retained.
+
+Original Intent: Ensure backtest uses Rust bars/features/labels when Rust is available.
+
+Changes Made:
+1. Added Rust dataset build path in backtest section and skipped Python trade loading when Rust is available.
+2. Kept Python bars/features/labels fallback when Rust build fails or is unavailable.
+
+Testing: python -m py_compile train.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.31 (Parallel Optuna Jobs + LGBM Thread Control - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 05:54
+Files Modified:
+- config.py:112 - Added ModelConfig.num_threads for LightGBM threading control.
+- models.py:16,51-54,282,372,625,839,886,1207 - Added num_threads helper and applied it to LightGBM params.
+- config_tuner.py:123,191,1378-1379,2455-2488,2585-2664 - Added LGBM thread override and parallel n_jobs support for Optuna.
+- train.py:503,1004 - Added --tune-parallel-jobs flag and passed n_jobs to tuner.
+
+Original Intent: Enable parallel Optuna trials and cap LightGBM threads to avoid CPU oversubscription.
+
+Changes Made:
+1. Added num_threads to ModelConfig and wired it into LightGBM parameter dictionaries.
+2. Added n_jobs support to config tuner and auto-forced num_threads=1 when running parallel jobs.
+3. Added CLI flag to control parallel Optuna jobs from train.py.
+
+Testing: python -m py_compile config.py models.py config_tuner.py train.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; files=['config.py','models.py','config_tuner.py','train.py']; [ast.parse(Path(f).read_text(encoding='utf-8')) for f in files]; print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.32 (Optuna Shared Storage Support - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 05:58
+Files Modified:
+- config_tuner.py:2456-2480,2592-2678 - Added storage/study_name/load_if_exists to Optuna study creation and run_config_tuning.
+- train.py:509-523,1004-1028 - Added CLI flags for storage/study name and passed them into tuning.
+
+Original Intent: Enable shared RDB storage for parallel/multi-process Optuna tuning.
+
+Changes Made:
+1. Added storage/study_name/load_if_exists parameters to ConfigTuner.tune and run_config_tuning.
+2. Wired new CLI flags into train.py and defaulted load_if_exists when storage is set.
+
+Testing: python -m py_compile config_tuner.py train.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; files=['config_tuner.py','train.py']; [ast.parse(Path(f).read_text(encoding='utf-8')) for f in files]; print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.33 (Pause All Optuna Workers - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 06:04
+Files Modified:
+- config_tuner.py:150-171,884-940,1239-1255,2483-2497,2429-2433,1378-1381,1614-1616 - Added global pause/resume events and worker checks for parallel trials.
+
+Original Intent: Pause all Optuna worker threads when opening the tuning menu during parallel runs.
+
+Changes Made:
+1. Added pause/resume events and a pause menu lock to coordinate worker threads.
+2. Listener now triggers a global pause event; objective/fold loop wait on resume.
+3. Pause menu resumes all workers before continuing.
+
+Testing: python -m py_compile config_tuner.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; ast.parse(Path('config_tuner.py').read_text(encoding='utf-8')); print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.34 (Pause Event Race Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 06:34
+Files Modified:
+- config_tuner.py:944-965,2484-2489 - Fixed pause/resume event ordering and added looped wait; pause callback now enforces pause event.
+
+Original Intent: Fix buggy pause behavior during parallel Optuna runs.
+
+Changes Made:
+1. Clear resume event before setting pause, and wait in a loop until pause clears.
+2. Ensure pause event is set from the Optuna callback before opening the menu.
+
+Testing: python -m py_compile config_tuner.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; ast.parse(Path('config_tuner.py').read_text(encoding='utf-8')); print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.35 (Pause Condition Refactor - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 06:38
+Files Modified:
+- config_tuner.py:150-171,944-964 - Replaced pause/resume events with a Condition + boolean to avoid resume deadlocks.
+
+Original Intent: Fix pause/resume not resuming after running backtest while paused.
+
+Changes Made:
+1. Introduced a Condition-based pause gate and replaced event logic.
+2. _wait_if_paused now waits on a condition with timeout to resume reliably.
+
+Testing: python -m py_compile config_tuner.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; ast.parse(Path('config_tuner.py').read_text(encoding='utf-8')); print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.36 (Align Candidate Backtest With Tuning - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 10:13
+Files Modified:
+- config_tuner.py:1108-1187 - Candidate backtest now uses OOF context features and matches tuning calibration/ensemble settings.
+
+Original Intent: Reduce tuning vs backtest gaps by aligning candidate backtest training to tuning settings.
+
+Changes Made:
+1. Use OOF trend/regime predictions for entry-model training (same as tuning).
+2. Match calibration mode/folds and ensemble settings to tuner configuration.
+
+Testing: python -m py_compile config_tuner.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; ast.parse(Path('config_tuner.py').read_text(encoding='utf-8')); print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.37 (Align Training With Tuning OOF Context + Calibration - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 10:31
+Files Modified:
+- config.py:86-90 - Added labels.calibration_method field.
+- config_tuner.py:188-196 - Persisted calibration_method into base config labels for tuning outputs.
+- train.py:1009-1013 - Store tuning calibration_method into best config.
+- trainer.py:13,312-366,426-444 - Added OOF context predictions and aligned entry-model calibration settings with tuning.
+
+Original Intent: Ensure training pipeline matches tuning (OOF context features + OOF calibration) to reduce tuning/backtest gap.
+
+Changes Made:
+1. Added calibration_method to LabelConfig and propagate tuner calibration choice into saved configs.
+2. Trainer now uses OOF trend/regime predictions for entry-model training, matching tuner behavior.
+3. Entry model training now respects use_calibration flag and uses OOF calibration mode/folds.
+
+Testing: python -m py_compile config.py trainer.py config_tuner.py train.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; files=['config.py','trainer.py','config_tuner.py','train.py']; [ast.parse(Path(f).read_text(encoding='utf-8')) for f in files]; print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.38 (Fix OOF Helpers Scope - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 10:33
+Files Modified:
+- trainer.py:15-74 - Moved _slice_pred and _oof_context_preds to module scope.
+
+Original Intent: Fix UnboundLocalError for OOF helper functions during training.
+
+Changes Made:
+1. Promoted OOF helper functions to module level to ensure availability in run_training_pipeline.
+
+Testing: python -m py_compile trainer.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; ast.parse(Path('trainer.py').read_text(encoding='utf-8')); print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.39 (Fix OOF Helper Config Scope - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 10:34
+Files Modified:
+- trainer.py:24-64,346-366 - Passed config into _oof_context_preds to avoid NameError.
+
+Original Intent: Resolve NameError in OOF context feature helper.
+
+Changes Made:
+1. Added config parameter to _oof_context_preds and updated callers.
+
+Testing: python -m py_compile trainer.py (failed: WinError 5 access denied to __pycache__); python -c "import ast; from pathlib import Path; ast.parse(Path('trainer.py').read_text(encoding='utf-8')); print('AST parse ok')" (ok)
+----------------------------------------------------------------------
+v2.40 (Backtest Timestamp Coercion - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 10:42
+Files Modified:
+- trainer.py:8 - Import Optional to keep OOF helper annotations valid.
+- backtest.py:1586-1615 - Coerce numeric trade timestamps to datetime before timedelta math.
+
+Original Intent: Fix runtime errors in training/backtest (OOF helper NameError risk and backtest trade timestamp TypeError).
+
+Changes Made:
+1. Added Optional import for typing annotations used by _oof_context_preds.
+2. Added a datetime coercion helper in trade serialization to handle int/float timestamps.
+
+Testing: python -m py_compile trainer.py backtest.py (failed: WinError 5 access denied to __pycache__); python - <<'PY' AST parse for trainer.py/backtest.py (ok)
+----------------------------------------------------------------------
+v2.41 (Backtest OHLC-Only Flag - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 10:58
+Files Modified:
+- backtest.py:110-279,905-916 - Added use_intrabar_exits flag to disable intrabar TP/SL checks when requested.
+- train.py:395-414,1276-1317,1393 - Added --backtest-ohlc-only flag and wired it through backtest params/logs.
+
+Original Intent: Add a flag to force OHLC-only backtests to test the tuning/backtest mismatch hypothesis.
+
+Changes Made:
+1. Added use_intrabar_exits to SimpleBacktester and bypassed raw-trade/Rust intrabar logic when false.
+2. Added --backtest-ohlc-only CLI flag and stopped passing raw trades when enabled.
+3. Logged backtest_ohlc_only in backtest parameters.
+
+Testing: python -m py_compile backtest.py train.py (failed: WinError 5 access denied to __pycache__); python - <<'PY' AST parse for backtest.py/train.py (ok)
+----------------------------------------------------------------------
+v2.42 (Align Direction With EMA Touch - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 11:24
+Files Modified:
+- backtest.py:600-740 - Use ema_touch_direction for trade direction when available (fallback to slope), adjust trend_aligned.
+- config_tuner.py:1746-1763 - Use ema_touch_direction for gating direction when available (fallback to slope).
+
+Original Intent: Align backtest and tuning direction logic with EMA touch labeling to eliminate systematic mismatch.
+
+Changes Made:
+1. Backtest now prefers ema_touch_direction over base-TF slope for trade direction.
+2. Tuning gate direction now uses ema_touch_direction when present to match labels.
+
+Testing: python -m py_compile backtest.py config_tuner.py (failed: WinError 5 access denied to __pycache__); python - <<'PY' AST parse for backtest.py/config_tuner.py (ok)
+----------------------------------------------------------------------
+v2.43 (Align Backtest Holding Window - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 11:34
+Files Modified:
+- backtest.py:121-214,523-552,864 - Added max_holding_bars (timeout) to match label forward window; store entry_bar_idx.
+- train.py:414-446,1276-1322,1394 - Added --backtest-max-hold-bars and wired entry_forward_window into backtest.
+- config_tuner.py:1186 - Pass entry_forward_window into candidate backtests for alignment.
+
+Original Intent: Align backtest exit logic with label timeout window to remove systematic tuning/backtest mismatch.
+
+Changes Made:
+1. Added max_holding_bars to SimpleBacktester (default from labels.entry_forward_window).
+2. Enforced timeout exits after max_holding_bars in backtest run loop.
+3. Exposed CLI override and logged it; applied to candidate backtests.
+
+Testing: python -m py_compile backtest.py train.py config_tuner.py (failed: WinError 5 access denied to __pycache__); python - <<'PY' AST parse for backtest.py/train.py/config_tuner.py (ok)
+----------------------------------------------------------------------
+v2.44 (Backtest Exit Reason Summary - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 11:41
+Files Modified:
+- backtest.py:1442-1467 - Added exit reason counts (e.g., timeout/TP/SL) in final backtest results.
+
+Original Intent: Report timeout/exit reasons in the final backtest summary.
+
+Changes Made:
+1. Counted trade exit reasons from result.trades and printed them in the summary output.
+
+Testing: python -m py_compile backtest.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.45 (Backtest Context + Entry Window Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 12:11
+Files Modified:
+- backtest.py:542-551 - Skip entries that cannot realize the full max_holding_bars window.
+- backtest.py:561-610 - Always inject trend/regime context features when expected by the entry model.
+
+Original Intent: Align backtest with tuning by using context features and matching label eligibility window.
+
+Changes Made:
+1. Prevented entries in the last max_holding_bars of the dataset to mirror label eligibility.
+2. Injected context probabilities based on entry model expectations instead of feature_cols membership.
+
+Testing: python -m py_compile backtest.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.46 (Robust Pause Menu Trigger - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 12:11
+Files Modified:
+- config_tuner.py:150-157 - Track active study for pause handling.
+- config_tuner.py:890-982 - Route pause requests through _request_pause and spawn menu thread.
+- config_tuner.py:959-982 - Ensure pause requests open menu instead of deadlocking workers.
+- config_tuner.py:2556-2563 - Register active study before listener; callback uses _request_pause.
+
+Original Intent: Make the pause/menu trigger robust so pressing 'P' never stalls tuning without showing the menu.
+
+Changes Made:
+1. Added _active_study and a _request_pause coordinator that opens the menu in a dedicated thread.
+2. Listener and callback now call _request_pause instead of pausing workers directly.
+3. _wait_if_paused triggers the menu if a pause is pending to avoid deadlock.
+
+Testing: Not run (pause/menu requires interactive input).
+----------------------------------------------------------------------
+v2.47 (Menu Backtest OOF Helper Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 13:09
+Files Modified:
+- config_tuner.py:25 - Import trainer OOF helper for candidate backtests.
+- config_tuner.py:1113 - Use trainer OOF helper with config for trend OOF preds.
+- config_tuner.py:1134 - Use trainer OOF helper with config for regime OOF preds.
+
+Original Intent: Fix NameError when running candidate backtests from the pause menu.
+
+Changes Made:
+1. Imported trainer-level _oof_context_preds for reuse in candidate backtests.
+2. Routed trend/regime OOF prediction calls through the trainer helper with config.
+
+Testing: python -m py_compile config_tuner.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.48 (Backtest Feature Audit Reporting - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 13:55
+Files Modified:
+- backtest.py:280-287 - Track feature audit state on the backtester.
+- backtest.py:330-359 - Capture expected/data feature counts and missing/extra lists.
+- backtest.py:352-359 - Include full missing/extra feature names in mismatch errors.
+- backtest.py:1356-1360 - Attach feature audit to diagnostics.
+- backtest.py:1510-1528 - Print feature audit counts and per-feature missing/extra lists.
+
+Original Intent: Audit and compare tuning/backtest features and list mismatches explicitly.
+
+Changes Made:
+1. Recorded expected vs data feature counts plus missing/extra names in backtest diagnostics.
+2. Expanded mismatch errors to include feature names for direct patching.
+3. Printed feature audit summary and per-feature lists in backtest results.
+
+Testing: python -m py_compile backtest.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.49 (Tuning-Style Backtest Module - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 14:07
+Files Modified:
+- backtest_tuning.py:1-215 - New tuning-style backtest runner that reuses ConfigTuner evaluation logic.
+- config_tuner.py:1235-1264 - Persist tuner settings in tuning_summary.json for exact replay.
+- train.py:284-296 - Add --backtest-mode/--backtest-tuning-summary CLI flags.
+- train.py:850-872 - Route backtest-only + tuning mode to backtest_tuning.
+
+Original Intent: Provide a backtest that mirrors tuning exactly so tuning metrics can be reproduced.
+
+Changes Made:
+1. Added backtest_tuning.py to run ConfigTuner-style evaluation from a tuning_summary.json.
+2. Saved tuner settings (min trades, coverage bounds, ops cost, calibration, etc.) into tuning_summary.json.
+3. Added train.py flag to invoke the tuning-style backtest without altering the existing sim backtest.
+
+Testing: python -m py_compile backtest_tuning.py train.py config_tuner.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.50 (Tuning-Style Test Backtest - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 14:25
+Files Modified:
+- backtest_tuning.py:1-330 - Added tuning-style test backtest that trains on tuning slice and evaluates on test split with identical gating/EV/cost logic.
+- backtest_tuning.py:332-363 - Added --mode flag to switch between tuning-fold replay and test-split replay.
+- train.py:286-304 - Added --backtest-mode/--backtest-tuning-summary flags.
+- train.py:850-872 - Route backtest-only + tuning mode to tuning-style test backtest.
+
+Original Intent: Provide a backtest module that mirrors tuning logic but evaluates on the test split.
+
+Changes Made:
+1. Implemented run_tuning_style_test_backtest to replicate tuning gates, EV margins, costs, and labels on the test split.
+2. Added CLI support in backtest_tuning.py for mode=test|tuning (default test).
+3. Updated train.py backtest-only flow to call the test-mode tuning backtest.
+
+Testing: python -m py_compile backtest_tuning.py train.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.51 (Pause Menu Tuning-Style Backtest - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 14:40
+Files Modified:
+- config_tuner.py:1047-1356 - Replace pause-menu candidate backtest with tuning-style test-split evaluation.
+
+Original Intent: Use the tuning-style backtest (label-based, EV-gated) when backtesting candidates from the pause menu.
+
+Changes Made:
+1. Train trend/regime on the tuning slice, then train entry model on tuning pullbacks and evaluate on test pullbacks.
+2. Apply the same EV gate, costs, and ops-cost two-pass logic as tuning on the test split.
+3. Print a concise tuning-style test backtest summary for candidate runs.
+
+Testing: python -m py_compile config_tuner.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.52 (Single-Position Tuning Returns - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 15:20
+Files Modified:
+- config_tuner.py:118-2520 - Add single-position/opposite policy settings, simulate non-overlapping trades, and score on pullback_realized_r.
+- backtest_tuning.py:46-640 - Mirror single-position simulation and realized_r scoring in tuning-style test backtest.
+- train.py:606-1105 - Add tune flags for single-position and opposite policy; pass through to run_config_tuning.
+
+Original Intent: Align tuning with live one-position behavior and include timeout PnL via pullback_realized_r.
+
+Changes Made:
+1. Added single-position/opposite-signal policy settings and persisted them to tuning_summary.json.
+2. Implemented sequential trade simulation (ignore/close/flip) and used pullback_realized_r for returns, net of fees and ops cost.
+3. Updated tuning-style test backtest and CLI to use the same trade simulation and settings.
+
+Testing: python -m py_compile config_tuner.py backtest_tuning.py train.py (failed: WinError 5 access denied to __pycache__)----------------------------------------------------------------------
+v2.53 (Default Single-Position Flip - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 15:27
+Files Modified:
+- train.py:604-1090 - Default to single-position tuning, add --tune-multi-position, and default opposite policy to flip.
+- config_tuner.py:93-3090 - Default opposite_signal_policy to flip in ConfigTuner and run_config_tuning.
+- backtest_tuning.py:250-300 - Default opposite_signal_policy to flip when not stored in summary.
+
+Original Intent: Make tuning default to single-position with flip on opposite signals.
+
+Changes Made:
+1. Added --tune-multi-position to disable single-position; default is now single-position.
+2. Set default opposite_signal_policy to flip in tuner and backtest replay.
+3. Propagated the new defaults through CLI to tuning.
+
+Testing: python -m py_compile config_tuner.py backtest_tuning.py train.py (failed: WinError 5 access denied to __pycache__)
+----------------------------------------------------------------------
+v2.54 (Syntax Check Workaround - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 15:56
+Files Modified:
+- AGENTS.md:102-113 - Added AST-based syntax check workaround to avoid pycache locks
+
+Original Intent: Add a documented workaround for syntax checks when __pycache__ is locked.
+
+Changes Made:
+1. Added an AST parse command example to AGENTS.md for pycache-free syntax validation.
+
+Testing: Not tested (documentation change only)----------------------------------------------------------------------
+v2.55 (Backtest Tuned Config Cleanup - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 17:41
+Files Modified:
+- backtest_tuned_config.py:1-1465 - Removed diff markers, fixed trade slope alignment lookup, repaired entry_time serialization, and corrected summary dict formatting.
+
+Original Intent: Format backtest_tuned_config.py correctly and validate syntax.
+
+Changes Made:
+1. Stripped diff-style prefixes/line numbers from the pasted file content.
+2. Fixed broken inline expressions in trade construction and _trade_to_dict.
+3. Rebuilt save_backtest_logs summary dict to close all structures properly.
+
+Testing: AST compile via inline python (no pycache)
+----------------------------------------------------------------------
+v2.56 (Tuned Backtest Integration - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 18:22
+Files Modified:
+- train.py:1-170,1488-1685 - Switched to backtest_tuned_config, added summary override + mismatch confirmations, and added --backtest-full-data.
+- config_tuner.py:26,1159-1345 - Replaced candidate backtest with run_tuned_backtest and removed SimpleBacktester dependency.
+
+Original Intent: Integrate the tuned backtest module as the default backtest and align runtime settings with tuning summary values.
+
+Changes Made:
+1. Added tuning-summary parsing helpers and override confirmations for backtest CLI mismatches.
+2. Ran backtests through backtest_tuned_config with rust-backed dataset build and logs under ./backtests/{symbol}.
+3. Updated pause-menu candidate backtest to train models then run tuned-style backtest.
+
+Testing: AST parse check (train.py, config_tuner.py, backtest_tuned_config.py)
+----------------------------------------------------------------------
+v2.57 (Backtest Integration Follow-ups - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 18:42
+Files Modified:
+- train.py:401-405 - Default backtest-mode to tuning and update help text.
+- train.py:1362-1526 - Warn/confirm on backtest_mode, trade_side, cooldown flags.
+- diagnostic_val_backtest.py:14-188 - Switch to backtest_tuned_config pipeline and tuned parameter handling for diagnostics.
+
+Original Intent: Fulfill missing integration requirements for the tuned backtest and align diagnostics with tuning-style logic.
+
+Changes Made:
+1. Set backtest-mode default to tuning and added mismatch prompts for backtest_mode, trade_side, and cooldown flags.
+2. Updated diagnostic_val_backtest to build datasets via backtest_tuned_config and run tuning-aligned backtests with tuned metrics/ops cost.
+
+Testing: Syntax check via compile() for train.py, diagnostic_val_backtest.py, backtest_tuned_config.py (py_compile failed due to WinError 5 on pycache write)
+----------------------------------------------------------------------
+v2.58 (Pause Menu Full Backtest Option - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 19:04
+Files Modified:
+- config_tuner.py:1159-1310 - Added use_full_data flag to candidate backtest.
+- config_tuner.py:1408-1444 - Added full-set backtest option to candidate menu.
+
+Original Intent: Add menu options to backtest candidate on test split vs full set.
+
+Changes Made:
+1. Extended candidate backtest helper to accept a full-data toggle and pass it into run_tuned_backtest.
+2. Added "Backtest this (15% test set)" and "Backtest this (full set)" menu entries with save prompts.
+
+Testing: Syntax check via compile() for config_tuner.py
+----------------------------------------------------------------------
+v2.59 (Dynamic Test Label in Pause Menu - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 19:08
+Files Modified:
+- config_tuner.py:1408-1413 - Display dynamic test split percent in candidate backtest menu.
+
+Original Intent: Show actual configured test percent in the pause menu.
+
+Changes Made:
+1. Added dynamic test split percent display using base_config.model.test_ratio.
+
+Testing: Syntax check via compile() for config_tuner.py
+----------------------------------------------------------------------
+v2.60 (Fold Backtest Option - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 19:23
+Files Modified:
+- config_tuner.py:26 - Import _compute_trade_metrics for fold aggregation summaries.
+- config_tuner.py:1340-1668 - Added fold-level candidate backtest runner mirroring tuning splits and training flow.
+- config_tuner.py:1694-1735 - Added folds / tuning splits option to the candidate backtest menu.
+
+Original Intent: Add a candidate backtest option that runs across tuning folds to validate aggregated summary consistency.
+
+Changes Made:
+1. Implemented _run_candidate_backtest_folds to train per-fold models, run tuned backtests on fold validation splits, and print an aggregated R-unit summary.
+2. Wired the new fold backtest option into the pause menu with the same save-to-disk prompt flow.
+
+Testing: python -m py_compile config_tuner.py failed (WinError 5 on __pycache__); inline compile() succeeded.
+----------------------------------------------------------------------
+v2.61 (Single Position Default - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 19:35
+Files Modified:
+- config_tuner.py:117,3174 - Default single_position to True in ConfigTuner and run_config_tuning.
+
+Original Intent: Make single-position trading the default for tuning sessions.
+
+Changes Made:
+1. Set ConfigTuner single_position default to True.
+2. Set run_config_tuning single_position default to True.
+
+Testing: Inline compile() for config_tuner.py (py_compile blocked by WinError 5 on __pycache__).
+----------------------------------------------------------------------
+v2.62 (Missing Fold Imputation - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 20:47
+Files Modified:
+- config_tuner.py:2538-2882 - Impute missing fold scores when folds are skipped and use augmented fold scores for margin selection and metrics.
+
+Original Intent: Penalize trials with fewer than expected folds so they do not get a scoring advantage over full-fold trials.
+
+Changes Made:
+1. Added _impute_missing_fold_scores to synthesize scores for skipped folds (no-opportunity vs insufficient) and apply it per margin.
+2. Switched margin selection and fold aggregation metrics to use augmented fold scores and recorded missing fold diagnostics.
+
+Testing: Inline compile() for config_tuner.py (py_compile blocked by WinError 5 on __pycache__).
+----------------------------------------------------------------------
+v2.63 (Backtest Feature Audit Details - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 21:10
+Files Modified:
+- backtest_tuned_config.py:646-661 - Print missing/extra features line-by-line before raising mismatch error.
+
+Original Intent: Show all missing features during backtest to diagnose feature mismatches.
+
+Changes Made:
+1. Added per-feature printing for missing and extra features in the feature audit block.
+2. Kept the mismatch error to avoid silent invalid backtests.
+
+Testing: Inline compile() for backtest_tuned_config.py (py_compile blocked by WinError 5 on __pycache__).
+----------------------------------------------------------------------
+v2.64 (Backtest Context Feature Audit - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 21:21
+Files Modified:
+- backtest_tuned_config.py:223-234 - Include context_expected in feature audit metadata.
+- backtest_tuned_config.py:1225-1234 - Print context feature names in Feature Audit section.
+
+Original Intent: Show all missing/expected context features after backtest completion when counts differ.
+
+Changes Made:
+1. Added context_expected list to feature audit so context features are visible in diagnostics.
+2. Printed context features in the Feature Audit section after the backtest results.
+
+Testing: Inline compile() for backtest_tuned_config.py (py_compile blocked by WinError 5 on __pycache__).
+----------------------------------------------------------------------
+v2.65 (Trial Selection and Per-Trial Summary - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 21:33
+Files Modified:
+- config_tuner.py:1099-1127 - Add _get_trial_by_number helper for direct selection.
+- config_tuner.py:1620-1678 - Save tuning summaries to both tuning_summary.json and tuning_summary_trial_X.json.
+- config_tuner.py:1669-1694 - Add pause menu option to select trial by number.
+
+Original Intent: Allow selecting a specific trial number from the pause menu and save per-trial tuning summaries.
+
+Changes Made:
+1. Added trial lookup by number and integrated it into the candidate menu.
+2. Saved per-trial summaries as tuning_summary_trial_X.json alongside tuning_summary.json.
+
+Testing: Inline compile() for config_tuner.py (py_compile blocked by WinError 5 on __pycache__).
+----------------------------------------------------------------------
+v2.66 (Train-from-Tuning Calibration Sync - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-28 21:52
+Files Modified:
+- train.py:1121-1124 - Apply calibration_method from tuning_summary tuner_settings during --train-from-tuning.
+
+Original Intent: Keep train-from-tuning calibration method consistent with the tuning run.
+
+Changes Made:
+1. Loaded calibration_method from tuning_summary tuner_settings and applied it to labels.
+
+Testing: Inline compile() for train.py (py_compile blocked by WinError 5 on __pycache__).
+----------------------------------------------------------------------
+v2.67 (Candidate Selection Holdout - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 00:37
+Files Modified:
+- config_tuner.py:127-264 - Add selection settings and validation for test/shadow holdout criteria.
+- config_tuner.py:1139-1611 - Add p25 ranking, candidate backtest prep, test/shadow split, and selection runner.
+- config_tuner.py:1375-1429 - Refactor candidate backtest to use shared prep helper.
+- config_tuner.py:1906-1998 - Extend trial summary saving with selection metrics and settings; allow trial-only save.
+- config_tuner.py:2070-2086 - Add pause menu option to run selection.
+- config_tuner.py:3378-3432 - Run selection automatically after tuning completes.
+- config_tuner.py:3558-3621 - Add selection parameters to run_config_tuning and pass through to ConfigTuner.
+
+Original Intent: Implement a shadow holdout selection step (test 10% + shadow 5%) for top trials and make it available in the pause menu and after tuning.
+
+Changes Made:
+1. Added selection settings/criteria (min trades, PF, max DD%, max coverage, min R) and enforced them in candidate selection.
+2. Added candidate selection runner using test/shadow splits with tuned backtest, and saved per-trial summaries including selection metrics.
+3. Hooked selection into the pause menu and automatic post-tuning flow.
+
+Testing: AST parse check via inline python for config_tuner.py.
+----------------------------------------------------------------------
+v2.76 (Backtest Uses Training Summary Path - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 12:06
+Files Modified:
+- train.py:71-110 - Allow saving extra metadata into train_config.json and read tuning_summary_path.
+- train.py:1008-1363 - Default backtest summary path to the training summary and warn on mismatches.
+
+Original Intent: Make --backtest-only default to the tuning summary used during training and warn when paths differ.
+
+Changes Made:
+1. Saved tuning_summary_path into train_config.json when training from tuning or tune-then-train.
+2. Loaded tuning_summary_path as the default summary for backtests and warned when a different summary is used.
+
+Testing: AST parse check via inline python for train.py.
+v2.75 (Selection Tie-Break Ranking - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 10:54
+Files Modified:
+- config_tuner.py:1184-1236 - Add p25 tie-break grouping and rank by stability/confidence metrics within epsilon.
+
+Original Intent: Rank selection candidates by p25 with robust tie-breakers.
+
+Changes Made:
+1. Grouped trials with similar p25 (epsilon based on p25 and fold IQR).
+2. Applied tie-breakers: fold_score_iqr, trade_confidence, fold_score_median, val_pnl_per_trade_r, val_profit_factor.
+
+Testing: AST parse check via inline python for config_tuner.py.
+v2.74 (Adaptive Top-N Default + Cap 50 - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 03:54
+Files Modified:
+- config_tuner.py:218-221 - Preserve adaptive selection_top_n sentinel instead of forcing min=1.
+- config_tuner.py:1696-1701 - Raise adaptive top-N cap from 40 to 50.
+
+Original Intent: Make adaptive top-N the default and cap it at 50, evaluated at runtime.
+
+Changes Made:
+1. Kept selection_top_n negative to enable adaptive mode.
+2. Increased adaptive top-N cap to 50.
+
+Testing: AST parse check via inline python for config_tuner.py.
+v2.68 (Selection Min Trades Default - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 00:43
+Files Modified:
+- config_tuner.py:127 - Set selection_min_trades default to 30 in ConfigTuner.
+- config_tuner.py:3558 - Set selection_min_trades default to 30 in run_config_tuning.
+
+Original Intent: User requested to change selection minimum trades from 13 to 30.
+
+Changes Made:
+1. Updated selection_min_trades defaults to 30 for both ConfigTuner and run_config_tuning.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v2.69 (Shadow Min Trades Override - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 00:55
+Files Modified:
+- config_tuner.py:127-271 - Add selection_min_trades_shadow option with derived default.
+- config_tuner.py:1480-1607 - Apply distinct min-trades checks for test vs shadow selection.
+- config_tuner.py:1906-1976 - Persist selection_min_trades_shadow in tuning summaries.
+- config_tuner.py:3558-3622 - Add selection_min_trades_shadow to run_config_tuning signature and pass-through.
+
+Original Intent: Allow fewer required trades on the shadow holdout while keeping a higher minimum on the test split.
+
+Changes Made:
+1. Added optional selection_min_trades_shadow with proportional default based on shadow/test split.
+2. Applied separate min-trades thresholds in selection pass/fail for test vs shadow.
+3. Persisted selection_min_trades_shadow in tuner settings and API.
+
+Testing: AST parse check via inline python for config_tuner.py.
+----------------------------------------------------------------------
+v2.70 (Selection Trial Filter - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 01:13
+Files Modified:
+- config_tuner.py:1108-1137 - Add selection validity filter to skip failed/empty trials.
+- config_tuner.py:1140-1148 - Apply validity filter in p25 candidate ranking.
+
+Original Intent: Prevent failed trials (insufficient pullbacks/data) from being selected for backtest.
+
+Changes Made:
+1. Added _trial_is_valid_for_selection to filter by reason, folds, trades, and extreme scores.
+2. Applied the filter when ranking candidates by p25 fold score.
+
+Testing: AST parse check via inline python for config_tuner.py.
+----------------------------------------------------------------------
+v2.71 (Adaptive Shadow Trades Threshold - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 01:31
+Files Modified:
+- config_tuner.py:1540-1598 - Derive shadow min-trades from actual test trades and apply to shadow selection.
+
+Original Intent: Avoid hard-failing strong candidates on shadow due to too-few trades by scaling shadow min-trades to observed test trades.
+
+Changes Made:
+1. Compute shadow_min_trades dynamically as round(test_trades * shadow_pct/test_pct) with floor of 5.
+2. Use the adaptive shadow min-trades in shadow selection pass/fail.
+
+Testing: AST parse check via inline python for config_tuner.py.
+----------------------------------------------------------------------
+v2.72 (Shadow Cap + Review Status - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 01:42
+Files Modified:
+- config_tuner.py:127-268 - Add selection_shadow_cap setting and cap derived shadow min-trades.
+- config_tuner.py:1504-1618 - Apply adaptive shadow min-trades with cap and mark shadow failures as “REVIEW”.
+- config_tuner.py:1906-1983 - Persist selection_shadow_cap and selection_requires_review in summaries.
+- config_tuner.py:3558-3624 - Add selection_shadow_cap to run_config_tuning signature and pass-through.
+
+Original Intent: Cap shadow min-trades at 30 and mark shadow failures as “require review”.
+
+Changes Made:
+1. Added selection_shadow_cap and enforced it in adaptive shadow min-trades calculation.
+2. Added selection_requires_review flag for test-pass/shadow-fail cases and logged status.
+3. Persisted new settings and review status in trial summaries.
+
+Testing: AST parse check via inline python for config_tuner.py.
+----------------------------------------------------------------------
+v2.73 (Adaptive Selection Top-N Cap - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 03:49
+Files Modified:
+- config_tuner.py:1623-1649 - Add adaptive selection top-N resolver (5% of trials, cap 40).
+- config_tuner.py:1494-1509 - Use adaptive top-N in selection runner and print resolved value.
+
+Original Intent: Make selection top-N adaptive to trial count with a cap of 40.
+
+Changes Made:
+1. Added _resolve_selection_top_n to compute adaptive top-N when selection_top_n < 0.
+2. Swapped selection runner to use the adaptive top-N value.
+
+Testing: AST parse check via inline python for config_tuner.py.
+----------------------------------------------------------------------
+v2.74 (Study-Scoped Tuning Artifacts - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 13:19
+Files Modified:
+- config_tuner.py:51-57, 3567-3578 - Add best_trial_number to ConfigTuningResult and populate from Optuna study.
+- train.py:24-230 - Add study naming/prompt helpers plus config load/save by path.
+- train.py:560-610 - Add --backtest-train-config option for backtest-only.
+- train.py:1174-1227 - Prompt for study/trial in backtest-only and load train_config_<trial>.json.
+- train.py:1280-1370 - Prompt for study/trial in train-from-tuning and save train_config_<trial>.json to study folder.
+- train.py:1388-1565 - Default Optuna storage and summaries to study folder; save tuning_summary_<trial>.json and model_<trial>.
+- train.py:1578-1608 - Resolve tuning summary via train_config_<trial>.json when backtesting.
+
+Original Intent: Store tuning summaries, train configs, and models under a study folder, and prompt for study/trial when paths are not provided.
+
+Changes Made:
+1. Added best_trial_number to tuning results and used it for study-scoped artifact naming.
+2. Introduced study naming/prompt helpers and path-based config loading/saving.
+3. Updated tuning, train-from-tuning, and backtest-only flows to use study folders and train_config_<trial>.json.
+
+Testing: AST parse check via inline python for config_tuner.py and train.py.
+----------------------------------------------------------------------
+v2.75 (Program Overview + Study Notes - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 13:19
+Files Modified:
+- PROGRAM_OVERVIEW.md:1-96 - Added end-to-end workflow overview and artifact layout.
+- AGENTS.md:115-125 - Documented study-scoped artifact workflow and default storage behavior.
+
+Original Intent: Provide a high-level system overview and document study-folder conventions for future agents.
+
+Changes Made:
+1. Added PROGRAM_OVERVIEW.md covering data->tuning->training->backtest->live flow and guards.
+2. Updated AGENTS.md with study folder conventions and backtest alignment note.
+
+Testing: Not tested (documentation only).
+----------------------------------------------------------------------
+v2.76 (Remove backtest_tuning Reference - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 14:10
+Files Modified:
+- AGENTS.md:109 - Removed backtest_tuning.py from syntax-check list.
+
+Original Intent: User requested removing AGENTS.md references to backtest_tuning.py and logging its deletion.
+
+Changes Made:
+1. Updated AGENTS.md to drop backtest_tuning.py from the syntax-check loop.
+2. Noted user deletion of backtest_tuning.py (file removed by user).
+
+Testing: Not tested (documentation only).
+----------------------------------------------------------------------
+v2.77 (Ignore Backtests and Pycache Temp - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 14:13
+Files Modified:
+- .gitignore:36, 74 - Ignore backtests/ output folder and .pycache_tmp.
+
+Original Intent: User requested gitignore updates for backtests and .pycache_tmp.
+
+Changes Made:
+1. Added backtests/ to ignored runtime outputs.
+2. Added .pycache_tmp/ to ignored temporary artifacts.
+
+Testing: Not tested (configuration only).
+----------------------------------------------------------------------
+v2.78 (Refresh README and Requirements - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 14:23
+Files Modified:
+- README.txt:1-120 - Updated overview, workflow, tuning/backtest usage, and Rust pipeline notes.
+- requirements.txt:1-18 - Added optuna and pyarrow; documented optional maturin and pybit.
+
+Original Intent: User requested updating README.txt for current program state and requirements.txt for new dependencies.
+
+Changes Made:
+1. Rewrote README.txt to reflect the tuning-aligned backtest and study-scoped artifacts.
+2. Added optuna and pyarrow to requirements; noted optional build/live dependencies.
+
+Testing: Not tested (documentation only).
+----------------------------------------------------------------------
+v2.79 (Ignore Rust Build Artifacts - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 14:27
+Files Modified:
+- .gitignore:64 - Ignore rust_pipeline/target build outputs.
+
+Original Intent: Avoid committing Rust build artifacts before pushing.
+
+Changes Made:
+1. Added rust_pipeline/target/ to .gitignore.
+
+Testing: Not tested (configuration only).

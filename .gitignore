@@ -77,6 +77,7 @@ live_results_funds_logs/
 live_results_funds/
 live_results_simulated/
 backtests-logs-at-close/
+backtests/
 
 # ----------------------------------------------------------------------------
 # Models (trained model artifacts - regeneratable)
@@ -124,6 +125,15 @@ desktop.ini
 # External Dependencies (vendored)
 # ----------------------------------------------------------------------------
 pybit-master/
+rust_pipeline/target/
+
+# ----------------------------------------------------------------------------
+# Local tooling and backups (do not commit)
+# ----------------------------------------------------------------------------
+config_tuner_backup/
+sofia_scripts/
+sync-data.sh
+.pycache_tmp/
 
 # ----------------------------------------------------------------------------
 # Keep these files tracked (use ! to negate ignore)

@@ -41,6 +41,10 @@ class TrendSignal:
     confidence: float  # max probability
     regime: int
     regime_name: str
+    prob_regime_ranging: float
+    prob_regime_trend_up: float
+    prob_regime_trend_down: float
+    prob_regime_volatile: float
 
 
 @dataclass
@@ -50,6 +54,7 @@ class EntrySignal:
     direction: int
     bounce_prob: float
     expected_rr: float
+    expected_rr_mean: float
     is_pullback_zone: bool
     trend_aligned: bool
     signal_quality: str  # 'A', 'B', 'C'
@@ -106,9 +111,14 @@ class TrendFollowerPredictor:
         self.base_tf = config.features.timeframe_names[config.base_timeframe_idx]
 
         if self.use_incremental:
-            touch_threshold = getattr(config.labels, 'touch_threshold_atr', 0.3)
+            # Check for tuned pullback_threshold first, then fallback to touch_threshold_atr, then 0.3
+            touch_threshold = getattr(config.labels, 'pullback_threshold', None)
+            if touch_threshold is None:
+                touch_threshold = getattr(config.labels, 'touch_threshold_atr', 0.3)
+            
             if touch_threshold is None:
                 touch_threshold = 0.3
+            
             min_slope_norm = getattr(config.labels, 'min_slope_norm', 0.03)
             if min_slope_norm is None:
                 min_slope_norm = 0.03
@@ -522,6 +532,10 @@ class TrendFollowerPredictor:
         regime_pred = self.models.regime_classifier.predict(X)
 
         # Create signal
+        prob_ranging = float(regime_pred.get('prob_ranging', [0.0])[0])
+        prob_trend_up = float(regime_pred.get('prob_trend_up', [0.0])[0])
+        prob_trend_down = float(regime_pred.get('prob_trend_down', [0.0])[0])
+        prob_volatile = float(regime_pred.get('prob_volatile', [0.0])[0])
         signal = TrendSignal(
             timestamp=datetime.now(),
             direction=int(trend_pred['prediction'][0]),
@@ -532,7 +546,11 @@ class TrendFollowerPredictor:
                                 trend_pred['prob_down'][0],
                                 trend_pred['prob_neutral'][0])),
             regime=int(regime_pred['regime'][0]),
-            regime_name=self.REGIME_NAMES.get(regime_pred['regime'][0], 'unknown')
+            regime_name=self.REGIME_NAMES.get(regime_pred['regime'][0], 'unknown'),
+            prob_regime_ranging=prob_ranging,
+            prob_regime_trend_up=prob_trend_up,
+            prob_regime_trend_down=prob_trend_down,
+            prob_regime_volatile=prob_volatile,
         )
 
         self.last_trend_signal = signal
@@ -569,6 +587,49 @@ class TrendFollowerPredictor:
                 feature_data[col] = [0 if pd.isna(val) else val]
             else:
                 feature_data[col] = [0]
+
+        need_trend_context = "trend_prob_up" in self.feature_cols
+        need_regime_context = "regime_prob_ranging" in self.feature_cols
+        trend_pred = None
+        regime_pred = None
+        if (need_trend_context or need_regime_context) and self.models is not None:
+            context_cols = self.trend_feature_cols or self.feature_cols
+            context_data = {}
+            for col in context_cols:
+                if col in latest.columns:
+                    val = latest[col].iloc[0]
+                    context_data[col] = [0 if pd.isna(val) else val]
+                else:
+                    context_data[col] = [0]
+            X_context = pd.DataFrame(context_data)
+            if need_trend_context and getattr(self.models, "trend_classifier", None) is not None:
+                try:
+                    trend_pred = self.models.trend_classifier.predict(X_context)
+                except Exception:
+                    trend_pred = None
+            if need_regime_context and getattr(self.models, "regime_classifier", None) is not None:
+                try:
+                    regime_pred = self.models.regime_classifier.predict(X_context)
+                except Exception:
+                    regime_pred = None
+
+        if need_trend_context:
+            prob_up = float(trend_pred.get("prob_up", [0.0])[0]) if trend_pred is not None else 0.0
+            prob_down = float(trend_pred.get("prob_down", [0.0])[0]) if trend_pred is not None else 0.0
+            prob_neutral = float(trend_pred.get("prob_neutral", [0.0])[0]) if trend_pred is not None else 0.0
+            feature_data["trend_prob_up"] = [prob_up]
+            feature_data["trend_prob_down"] = [prob_down]
+            feature_data["trend_prob_neutral"] = [prob_neutral]
+
+        if need_regime_context:
+            prob_ranging = float(regime_pred.get("prob_ranging", [0.0])[0]) if regime_pred is not None else 0.0
+            prob_trend_up = float(regime_pred.get("prob_trend_up", [0.0])[0]) if regime_pred is not None else 0.0
+            prob_trend_down = float(regime_pred.get("prob_trend_down", [0.0])[0]) if regime_pred is not None else 0.0
+            prob_volatile = float(regime_pred.get("prob_volatile", [0.0])[0]) if regime_pred is not None else 0.0
+            feature_data["regime_prob_ranging"] = [prob_ranging]
+            feature_data["regime_prob_trend_up"] = [prob_trend_up]
+            feature_data["regime_prob_trend_down"] = [prob_trend_down]
+            feature_data["regime_prob_volatile"] = [prob_volatile]
 
         X = pd.DataFrame(feature_data)
 
@@ -610,6 +671,7 @@ class TrendFollowerPredictor:
 
         bounce_prob = float(entry_pred['bounce_prob'][0])
         expected_rr = float(entry_pred.get('expected_rr', [1.0])[0])
+        expected_rr_mean = float(entry_pred.get('expected_rr_mean', [expected_rr])[0])
 
         # Determine signal quality
         trend_aligned = (trend_dir != 0)
@@ -626,6 +688,7 @@ class TrendFollowerPredictor:
             direction=int(trend_dir),
             bounce_prob=bounce_prob,
             expected_rr=expected_rr,
+            expected_rr_mean=expected_rr_mean,
             is_pullback_zone=is_pullback,
             trend_aligned=trend_aligned,
             signal_quality=quality

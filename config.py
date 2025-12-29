@@ -74,6 +74,29 @@ class LabelConfig:
     pullback_ema: int = 21              # EMA to detect pullbacks to
     pullback_threshold: float = 0.5     # Price within X ATR of EMA
 
+    # Probability threshold (optimized during tuning)
+    best_threshold: float = 0.5         # Min bounce probability for trade entry
+
+    # EV gating defaults (used by tuning/backtest/live)
+    ev_margin_r: float = 0.0            # Minimum EV margin in R units
+    fee_percent: float = 0.0011         # Round-trip fee as a decimal of price
+    fee_per_trade_r: Optional[float] = None  # Explicit fee in R units (overrides fee_percent)
+    use_expected_rr: bool = False       # Use expected_rr in EV gating when available
+    use_ev_gate: bool = True            # Use EV gate instead of probability threshold
+    use_calibration: bool = True        # Use calibrated probabilities for entry model
+    calibration_method: str = "temperature"  # Calibration method ("temperature" or "isotonic")
+
+    # Trend/regime gating (used by tuning/backtest/live)
+    use_trend_gate: bool = False        # Gate entries by trend classifier probability
+    min_trend_prob: float = 0.0         # Minimum trend probability for directional alignment
+    use_regime_gate: bool = False       # Gate entries by regime classifier
+    min_regime_prob: float = 0.0        # Minimum regime probability for allowed regimes
+    allow_regime_ranging: bool = True
+    allow_regime_trend_up: bool = True
+    allow_regime_trend_down: bool = True
+    allow_regime_volatile: bool = True
+    regime_align_direction: bool = True  # Align regime trend direction with trade direction
+
 
 @dataclass
 class ModelConfig:
@@ -87,6 +110,7 @@ class ModelConfig:
     bagging_fraction: float = 0.8
     bagging_freq: int = 5
     min_child_samples: int = 50
+    num_threads: int = 0
 
     #Test
     # --- Regularization (The "Penalties") ---

@@ -99,6 +99,31 @@ Testing: Not tested (no test data available)
 2. Check for data leakage in feature engineering
 3. Verify probability calibration if modifying prediction logic
 
+## Syntax Check Workaround (Windows file lock)
+If `python -m py_compile` fails due to `__pycache__` lock errors, use an AST parse
+check that avoids bytecode writes:
+
+```
+python - <<'PY'
+import ast
+for p in ["config_tuner.py","train.py"]:
+    ast.parse(open(p,"rb").read(), filename=p)
+print("OK")
+PY
+```
+
+## Study-Scoped Artifact Workflow
+Recent workflow changes rely on study-scoped outputs under `models/<SYMBOL>/<study>/`.
+Key points:
+1) Tuning writes `tuning_summary_<trial>.json` into the study folder.
+2) `--train-from-tuning` saves `train_config_<trial>.json` and models to `model_<trial>/`.
+3) `--backtest-only` expects a `train_config_<trial>.json`; if not provided it will prompt
+   for study name + trial.
+4) Optuna storage defaults to `models/<SYMBOL>/<study>/optuna.db` unless overridden.
+
+When backtesting, always keep the train config and tuning summary from the same
+study/trial to avoid feature mismatch.
+
 ## Do Not Modify
 - Snapshot folders (used as program state "freezes")
 - Files in `pybit-master/` (external dependency)

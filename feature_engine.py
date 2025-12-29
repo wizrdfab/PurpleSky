@@ -449,6 +449,8 @@ def get_feature_columns(df: pd.DataFrame) -> List[str]:
         'pullback_mfe',          # Max Favorable Excursion (future)
         'pullback_mae',          # Max Adverse Excursion (future)
         'pullback_rr',           # Realized R:R (future)
+        'pullback_win_r',        # Win magnitude in R (future)
+        'pullback_realized_r',   # Realized R (future)
         'is_pullback_zone',      # Used for labeling
 
         # New sequential labeling columns (future-looking)

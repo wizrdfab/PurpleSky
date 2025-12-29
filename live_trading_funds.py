@@ -143,7 +143,7 @@ class LiveFundsTrader(LivePaperTrader):
         balance_asset: str = "USDT",
         dry_run: bool = False,
         max_entry_deviation_atr: float = 1.0,
-        ema_touch_mode: str = "base",
+        ema_touch_mode: str = "multi",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -156,9 +156,9 @@ class LiveFundsTrader(LivePaperTrader):
         self.exit_on_bar_close_only = bool(self.dry_run)
 
         # EMA touch mode: "base" = only base TF touch detection, "multi" = multi-TF detection
-        self.ema_touch_mode = str(ema_touch_mode or "base").lower()
+        self.ema_touch_mode = str(ema_touch_mode or "multi").lower()
         if self.ema_touch_mode not in ("base", "multi"):
-            self.ema_touch_mode = "base"
+            self.ema_touch_mode = "multi"
 
         self._bybit: Optional[BybitClient] = None
         self._instrument_info: Optional[dict] = None
@@ -241,7 +241,8 @@ class LiveFundsTrader(LivePaperTrader):
         if trend_dir == 0:
             return {"ema_touch_detected": False, "ema_touch_direction": 0, "ema_touch_dist": None}
 
-        threshold = getattr(self.config.labels, "touch_threshold_atr", 0.3)
+        # Use tuned pullback_threshold (default 0.5 if missing - matches config.py default)
+        threshold = float(getattr(self.config.labels, "pullback_threshold", 0.5))
         mid_bar = (bar_high + bar_low) / 2.0
 
         ema_touched = False
@@ -771,6 +772,29 @@ Examples:
     # Trading params (defaults match live_trading.py/backtest)
     parser.add_argument("--min-quality", type=str, default=DEFAULT_PARAMS["min_quality"], choices=["A", "B", "C"])
     parser.add_argument("--min-trend-prob", type=float, default=DEFAULT_PARAMS["min_trend_prob"])
+    trend_gate_group = parser.add_mutually_exclusive_group()
+    trend_gate_group.add_argument(
+        "--use-trend-gate",
+        action="store_true",
+        help="Enable trend classifier gating (override train_config).",
+    )
+    trend_gate_group.add_argument(
+        "--no-trend-gate",
+        action="store_true",
+        help="Disable trend classifier gating (override train_config).",
+    )
+    parser.add_argument("--min-regime-prob", type=float, default=DEFAULT_PARAMS["min_regime_prob"])
+    regime_gate_group = parser.add_mutually_exclusive_group()
+    regime_gate_group.add_argument(
+        "--use-regime-gate",
+        action="store_true",
+        help="Enable regime classifier gating (override train_config).",
+    )
+    regime_gate_group.add_argument(
+        "--no-regime-gate",
+        action="store_true",
+        help="Disable regime classifier gating (override train_config).",
+    )
     parser.add_argument("--min-bounce-prob", type=float, default=DEFAULT_PARAMS["min_bounce_prob"])
     parser.add_argument("--max-bounce-prob", type=float, default=DEFAULT_PARAMS.get("max_bounce_prob", 1.0),
                        help="Maximum bounce probability for bucket filtering (default: 1.0 = no max)")
@@ -833,9 +857,9 @@ Examples:
     parser.add_argument(
         "--ema-touch-mode",
         type=str,
-        default="base",
+        default="multi",
         choices=["base", "multi"],
-        help="EMA touch detection mode: 'base' uses only base TF EMA touch (default), 'multi' uses multi-TF detection from incremental features.",
+        help="EMA touch detection mode: 'base' uses only base TF EMA touch, 'multi' uses multi-TF detection from incremental features (default).",
     )
 
     # Bybit execution
@@ -858,12 +882,27 @@ Examples:
         logger.error(f"Model directory not found: {model_dir}")
         return
 
+    use_trend_gate = DEFAULT_PARAMS["use_trend_gate"]
+    if args.use_trend_gate:
+        use_trend_gate = True
+    elif args.no_trend_gate:
+        use_trend_gate = False
+
+    use_regime_gate = DEFAULT_PARAMS["use_regime_gate"]
+    if args.use_regime_gate:
+        use_regime_gate = True
+    elif args.no_regime_gate:
+        use_regime_gate = False
+
     trader = LiveFundsTrader(
         model_dir=model_dir,
         symbol=args.symbol,
         testnet=args.testnet,
         min_quality=args.min_quality,
         min_trend_prob=args.min_trend_prob,
+        use_trend_gate=use_trend_gate,
+        use_regime_gate=use_regime_gate,
+        min_regime_prob=args.min_regime_prob,
         min_bounce_prob=args.min_bounce_prob,
         max_bounce_prob=args.max_bounce_prob,
         trade_side=args.trade_side,

@@ -362,6 +362,8 @@ def label_pullback_outcomes(
     result['pullback_mfe'] = np.nan
     result['pullback_mae'] = np.nan
     result['pullback_rr'] = np.nan
+    result['pullback_win_r'] = np.nan
+    result['pullback_realized_r'] = np.nan
 
     # Sequential execution labels
     result['pullback_hit_tp_first'] = np.nan
@@ -540,14 +542,33 @@ def label_pullback_outcomes(
         # SUCCESS LABEL
         success = 1 if hit_tp else 0
         rr = mfe / max(mae, 0.1)
+        stop_atr_multiple = float(config.stop_atr_multiple) if config.stop_atr_multiple > 0 else 1.0
+        win_r = mfe / stop_atr_multiple if stop_atr_multiple > 0 else mfe
 
         result.loc[idx, 'pullback_success'] = success
         result.loc[idx, 'pullback_mfe'] = mfe
         result.loc[idx, 'pullback_mae'] = mae
         result.loc[idx, 'pullback_rr'] = rr
+        if success == 1:
+            result.loc[idx, 'pullback_win_r'] = win_r
         result.loc[idx, 'pullback_hit_tp_first'] = int(hit_tp)
         result.loc[idx, 'pullback_bars_to_exit'] = bars_to_exit
         result.loc[idx, 'pullback_exit_type'] = exit_type
+
+        realized_r = 0.0
+        if hit_tp:
+            realized_r = config.target_rr
+        elif hit_sl:
+            realized_r = -1.0
+        else:
+            exit_idx = min(i + window, n - 1)
+            exit_price = result['close'].iloc[exit_idx]
+            if stop_dist > 0:
+                if trend_dir > 0:
+                    realized_r = (exit_price - entry_price) / stop_dist
+                else:
+                    realized_r = (entry_price - exit_price) / stop_dist
+        result.loc[idx, 'pullback_realized_r'] = realized_r
 
         # MULTI-TIER QUALITY LABEL
         if hit_sl or mfe < 0.5:
@@ -646,9 +667,13 @@ def create_training_dataset(
     # Detect pullback zones - use new multi-TF approach if enabled
     if use_multi_tf_touches:
         print("  Detecting multi-TF EMA touches...")
+        
+        # Pullback threshold from config is the absolute source of truth
+        final_touch_threshold = float(config.pullback_threshold)
+            
         result = detect_multi_tf_ema_touches(
             result, config, feature_config, base_tf,
-            touch_threshold_atr=touch_threshold_atr,
+            touch_threshold_atr=final_touch_threshold,
             min_slope_norm=min_slope_norm,
         )
         pullback_mask = result['ema_touch_detected']

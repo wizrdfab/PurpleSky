@@ -13,7 +13,7 @@ Improvements (v1.2):
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 import pickle
 import json
@@ -29,12 +29,107 @@ except ImportError:
 try:
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.isotonic import IsotonicRegression
+    from sklearn.linear_model import LogisticRegression
     SKLEARN_CALIBRATION_AVAILABLE = True
 except ImportError:
     SKLEARN_CALIBRATION_AVAILABLE = False
     print("Warning: sklearn calibration not available. Run: pip install scikit-learn")
 
 from config import ModelConfig
+
+CONTEXT_FEATURE_NAMES = [
+    "trend_prob_up",
+    "trend_prob_down",
+    "trend_prob_neutral",
+    "regime_prob_ranging",
+    "regime_prob_trend_up",
+    "regime_prob_trend_down",
+    "regime_prob_volatile",
+]
+
+
+def _apply_num_threads(params: Dict[str, Any], config: ModelConfig) -> None:
+    num_threads = getattr(config, "num_threads", 0)
+    if isinstance(num_threads, (int, float)) and int(num_threads) > 0:
+        params["num_threads"] = int(num_threads)
+
+
+def append_context_features(
+    X: pd.DataFrame,
+    trend_pred: Optional[Dict[str, np.ndarray]] = None,
+    regime_pred: Optional[Dict[str, np.ndarray]] = None,
+) -> pd.DataFrame:
+    """Append trend/regime probability outputs as entry-model features."""
+    X_ctx = X.copy()
+    rows = len(X_ctx)
+
+    def _safe_series(pred: Optional[Dict[str, np.ndarray]], key: str) -> np.ndarray:
+        if pred is None:
+            return np.zeros(rows, dtype=float)
+        values = pred.get(key)
+        if values is None:
+            return np.zeros(rows, dtype=float)
+        arr = np.asarray(values, dtype=float)
+        if arr.shape[0] != rows:
+            return np.zeros(rows, dtype=float)
+        return arr
+
+    X_ctx["trend_prob_up"] = _safe_series(trend_pred, "prob_up")
+    X_ctx["trend_prob_down"] = _safe_series(trend_pred, "prob_down")
+    X_ctx["trend_prob_neutral"] = _safe_series(trend_pred, "prob_neutral")
+    X_ctx["regime_prob_ranging"] = _safe_series(regime_pred, "prob_ranging")
+    X_ctx["regime_prob_trend_up"] = _safe_series(regime_pred, "prob_trend_up")
+    X_ctx["regime_prob_trend_down"] = _safe_series(regime_pred, "prob_trend_down")
+    X_ctx["regime_prob_volatile"] = _safe_series(regime_pred, "prob_volatile")
+
+    return X_ctx
+
+
+class TemperatureScaler:
+    def __init__(self, temperature: float = 1.0):
+        self.temperature = float(temperature)
+
+    @staticmethod
+    def _logit(p: np.ndarray) -> np.ndarray:
+        eps = 1e-6
+        p = np.clip(p.astype(float), eps, 1.0 - eps)
+        return np.log(p / (1.0 - p))
+
+    @staticmethod
+    def _sigmoid(x: np.ndarray) -> np.ndarray:
+        x = np.clip(x, -35.0, 35.0)
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def predict(self, probs: np.ndarray) -> np.ndarray:
+        logits = self._logit(probs)
+        scaled = self._sigmoid(logits / float(self.temperature))
+        return np.clip(scaled, 0.0, 1.0)
+
+    def fit(self, probs: np.ndarray, labels: np.ndarray) -> "TemperatureScaler":
+        probs = np.asarray(probs, dtype=float)
+        labels = np.asarray(labels, dtype=float)
+        logits = self._logit(probs)
+        eps = 1e-6
+
+        def nll(temp: float) -> float:
+            if temp <= 0:
+                return float("inf")
+            scaled = self._sigmoid(logits / temp)
+            scaled = np.clip(scaled, eps, 1.0 - eps)
+            return float(-np.mean(labels * np.log(scaled) + (1.0 - labels) * np.log(1.0 - scaled)))
+
+        temps = np.exp(np.linspace(np.log(0.25), np.log(10.0), 25))
+        losses = [nll(t) for t in temps]
+        best_idx = int(np.argmin(losses))
+        best_temp = float(temps[best_idx])
+
+        low = max(0.05, best_temp / 2.0)
+        high = min(20.0, best_temp * 2.0)
+        refine = np.exp(np.linspace(np.log(low), np.log(high), 15))
+        refine_losses = [nll(t) for t in refine]
+        best_refine = int(np.argmin(refine_losses))
+        self.temperature = float(refine[best_refine])
+        return self
 
 
 def compute_expected_calibration_error(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> Dict:
@@ -184,6 +279,7 @@ def filter_features_by_noise(
         'verbose': -1,
         'random_state': 42,
     }
+    _apply_num_threads(quick_params, config)
 
     quick_model = lgb.LGBMClassifier(**quick_params)
     quick_model.fit(X_train_noise, y_train)
@@ -273,6 +369,7 @@ class TrendClassifier:
             'random_state': 42,  # For reproducibility
             'deterministic': True,  # For reproducibility
         }
+        _apply_num_threads(params, self.config)
         
         callbacks = []
         if verbose:
@@ -382,15 +479,55 @@ class EntryQualityModel:
         self.config = config
         self.classifier = None  # Binary: will it bounce? (single model or None if ensembling)
         self.ensemble_classifiers: List = []  # List of classifiers for seed ensembling
-        self.regressor = None   # Continuous: expected R:R
+        self.regressor = None   # Continuous: expected win R (mean)
+        self.regressor_q25 = None  # Conservative win R (quantile)
         self.tier_classifier = None  # Multi-class: quality tier (0-3)
         self.calibrator = None  # Isotonic calibrator for bounce_prob
         self.feature_names: List[str] = []
         self.filtered_feature_names: List[str] = []  # Features after noise filtering
         self.removed_features: List[str] = []  # Features removed by noise filtering
         self.calibration_stats: Optional[Dict] = None
+        self.calibration_shrink_k: float = 300.0
         self.ensemble_seeds: List[int] = []  # Seeds used for ensembling
         self.use_ensemble: bool = False
+
+    @staticmethod
+    def compute_expected_rr_components(
+        probs: np.ndarray,
+        rr_mean: np.ndarray,
+        rr_conservative: Optional[np.ndarray] = None,
+        cost_r: Optional[np.ndarray] = None,
+        p_clip: Tuple[float, float] = (0.01, 0.99),
+        rr_clip: Tuple[float, float] = (0.05, 5.0),
+    ) -> Dict[str, np.ndarray]:
+        p_min, p_max = p_clip
+        rr_min, rr_max = rr_clip
+        p = np.clip(probs.astype(float), p_min, p_max)
+        rr_mean_clipped = np.clip(rr_mean.astype(float), rr_min, rr_max)
+        rr_cons = rr_mean_clipped
+        if rr_conservative is not None:
+            rr_cons = np.minimum(
+                rr_mean_clipped,
+                np.clip(rr_conservative.astype(float), rr_min, rr_max)
+            )
+        if cost_r is None:
+            cost = np.zeros_like(p, dtype=float)
+        else:
+            cost = np.maximum(cost_r.astype(float), 0.0)
+
+        ev_mean = (p * rr_mean_clipped) - ((1.0 - p) * 1.0) - cost
+        ev_cons = (p * rr_cons) - ((1.0 - p) * 1.0) - cost
+        implied_th = (1.0 + cost) / (rr_cons + 1.0)
+
+        return {
+            'ev_mean_r': ev_mean,
+            'ev_conservative_r': ev_cons,
+            'implied_threshold': implied_th,
+            'p_clipped': p,
+            'rr_mean_clipped': rr_mean_clipped,
+            'rr_conservative': rr_cons,
+            'cost_r': cost,
+        }
 
     def train(
         self,
@@ -405,6 +542,10 @@ class EntryQualityModel:
         verbose: bool = True,
         n_estimators: Optional[int] = None,
         calibrate: bool = True,
+        calibration_mode: str = "val",
+        calibration_oof_folds: int = 3,
+        calibration_shrink_k: float = 300.0,
+        calibration_method: str = "temperature",
         use_noise_filtering: bool = False,
         use_seed_ensemble: bool = False,
         n_ensemble_seeds: int = 5,
@@ -419,6 +560,10 @@ class EntryQualityModel:
             verbose: Print training progress
             n_estimators: Override default n_estimators
             calibrate: Whether to apply probability calibration
+            calibration_mode: Calibration data source ("val" or "oof").
+            calibration_oof_folds: Number of OOF folds for time-ordered calibration.
+            calibration_shrink_k: Shrinkage strength for blending calibrated probs with raw probs.
+            calibration_method: Calibration model ("temperature" or "isotonic").
             use_noise_filtering: If True, filter out features ranking below random noise
             use_seed_ensemble: If True, train N models with different seeds and average
             n_ensemble_seeds: Number of seeds to use for ensembling (default: 5)
@@ -428,6 +573,10 @@ class EntryQualityModel:
         """
         if not LIGHTGBM_AVAILABLE:
             raise ImportError("LightGBM is required for training")
+
+        if not np.isfinite(calibration_shrink_k) or calibration_shrink_k < 0:
+            calibration_shrink_k = 0.0
+        self.calibration_shrink_k = float(calibration_shrink_k)
 
         self.feature_names = list(X_train.columns)
         self.use_ensemble = use_seed_ensemble
@@ -473,6 +622,7 @@ class EntryQualityModel:
             # Handle class imbalance automatically (help recall without destroying precision)
             'class_weight': 'balanced',
         }
+        _apply_num_threads(clf_params, self.config)
 
         # =====================================================
         # SEED ENSEMBLING (optional)
@@ -537,42 +687,122 @@ class EntryQualityModel:
             )
 
         # =====================================================
-        # PROBABILITY CALIBRATION (using validation set)
+        # PROBABILITY CALIBRATION
         # =====================================================
-        if calibrate and X_val_filtered is not None and SKLEARN_CALIBRATION_AVAILABLE:
-            if verbose:
-                print("  Calibrating probabilities (Isotonic Regression)...")
+        if calibrate and SKLEARN_CALIBRATION_AVAILABLE:
+            cal_mode = (calibration_mode or "val").strip().lower()
+            use_oof = cal_mode in {"oof", "oof_time", "time_oof"}
+            cal_method_name = (calibration_method or "temperature").strip().lower()
+            if cal_method_name in {"temp", "temperature", "temperature_scaling"}:
+                calibrator_name = "Temperature Scaling"
+                use_temperature = True
+            else:
+                calibrator_name = "Isotonic Regression"
+                use_temperature = False
 
-            # Get raw probabilities on validation set (use ensemble average if applicable)
-            raw_probs = self._get_raw_probs(X_val_filtered)
+            if use_oof:
+                if verbose:
+                    print("  Using OOF time-ordered calibration (Train Only)...")
 
-            # Compute pre-calibration ECE
-            pre_cal_ece = compute_expected_calibration_error(
-                y_success_val.values, raw_probs
-            )
+                n_samples = len(X_train_filtered)
+                k_folds = int(calibration_oof_folds)
+                if k_folds < 2:
+                    k_folds = 2
+                if n_samples < max(200, k_folds * 30):
+                    cal_raw_probs = self._get_raw_probs(X_train_filtered)
+                    cal_y = y_success
+                    cal_method = "OOF Time (Fallback Full)"
+                else:
+                    fold_sizes = np.full(k_folds, n_samples // k_folds, dtype=int)
+                    fold_sizes[: n_samples % k_folds] += 1
+                    indices = np.arange(n_samples)
+                    cal_raw_probs = np.zeros(n_samples, dtype=float)
+                    filled_mask = np.zeros(n_samples, dtype=bool)
+                    start = 0
+                    for fold_idx, fold_size in enumerate(fold_sizes, start=1):
+                        stop = start + fold_size
+                        val_idx = indices[start:stop]
+                        train_idx = indices[:start]
+                        if train_idx.size < 10 or val_idx.size == 0:
+                            start = stop
+                            continue
+                        fold_model = lgb.LGBMClassifier(**clf_params)
+                        fold_model.fit(
+                            X_train_filtered.iloc[train_idx],
+                            y_success.iloc[train_idx],
+                        )
+                        fold_probs = fold_model.predict_proba(X_train_filtered.iloc[val_idx])[:, 1]
+                        cal_raw_probs[val_idx] = fold_probs
+                        filled_mask[val_idx] = True
+                        start = stop
+                    if filled_mask.sum() < max(10, int(0.2 * n_samples)):
+                        cal_raw_probs = self._get_raw_probs(X_train_filtered)
+                        cal_y = y_success
+                        cal_method = "OOF Time (Fallback Full)"
+                    else:
+                        cal_raw_probs = cal_raw_probs[filled_mask]
+                        cal_y = y_success.iloc[filled_mask]
+                        cal_method = f"OOF Time ({k_folds} folds)"
+            else:
+                if X_val_filtered is not None and y_success_val is not None and len(y_success_val) > 0:
+                    cal_X = X_val_filtered
+                    cal_y = y_success_val
+                    cal_method = "Validation Set"
+                else:
+                    cal_X = X_train_filtered
+                    cal_y = y_success
+                    cal_method = "Train Set"
 
-            # Fit isotonic calibrator
-            self.calibrator = IsotonicRegression(out_of_bounds='clip')
-            self.calibrator.fit(raw_probs, y_success_val.values)
+                cal_raw_probs = self._get_raw_probs(cal_X)
 
-            # Compute post-calibration ECE
-            calibrated_probs = self.calibrator.predict(raw_probs)
-            post_cal_ece = compute_expected_calibration_error(
-                y_success_val.values, calibrated_probs
-            )
+            if len(np.unique(cal_y)) < 2:
+                if verbose:
+                    print(f"  Skipping calibration ({cal_method}): Target contains only one class.")
+                self.calibrator = None
+            else:
+                if verbose:
+                    print(f"  Calibrating probabilities ({calibrator_name}) using {cal_method}...")
 
-            self.calibration_stats = {
-                'pre_calibration_ece': pre_cal_ece['ece'],
-                'post_calibration_ece': post_cal_ece['ece'],
-                'ece_improvement': pre_cal_ece['ece'] - post_cal_ece['ece'],
-                'pre_calibration_details': pre_cal_ece,
-                'post_calibration_details': post_cal_ece,
-            }
+                if use_temperature:
+                    self.calibrator = TemperatureScaler().fit(cal_raw_probs, cal_y.values)
+                else:
+                    self.calibrator = IsotonicRegression(out_of_bounds='clip')
+                    self.calibrator.fit(cal_raw_probs, cal_y.values)
 
-            if verbose:
-                print(f"    Pre-calibration ECE:  {pre_cal_ece['ece']:.4f}")
-                print(f"    Post-calibration ECE: {post_cal_ece['ece']:.4f}")
-                print(f"    ECE Improvement:      {pre_cal_ece['ece'] - post_cal_ece['ece']:.4f}")
+                # Compute ECE
+                calibrated_probs = self.calibrator.predict(cal_raw_probs)
+                n_cal = int(len(cal_y))
+                shrink_k = float(self.calibration_shrink_k)
+                shrink_w = 1.0
+                if n_cal > 0 and shrink_k > 0:
+                    shrink_w = float(n_cal / (n_cal + shrink_k))
+                    calibrated_probs = (shrink_w * calibrated_probs) + ((1.0 - shrink_w) * cal_raw_probs)
+
+                ece_res = compute_expected_calibration_error(cal_y.values, calibrated_probs)
+                
+                self.calibration_stats = {
+                    'method': cal_method,
+                    'calibrator': calibrator_name,
+                    'ece': ece_res['ece'],
+                    'details': ece_res,
+                    'n_cal': float(n_cal),
+                    'shrink_k': float(shrink_k),
+                    'shrink_w': float(shrink_w),
+                }
+                if use_temperature:
+                    self.calibration_stats['temperature'] = float(self.calibrator.temperature)
+
+                if verbose:
+                    print(f"    Calibration ECE: {ece_res['ece']:.4f}")
+
+            if verbose and self.calibration_stats:
+                if 'pre_calibration_ece' in self.calibration_stats:
+                    print(f"    Pre-calibration ECE:  {self.calibration_stats['pre_calibration_ece']:.4f}")
+                    print(f"    Post-calibration ECE: {self.calibration_stats['post_calibration_ece']:.4f}")
+                    print(f"    ECE Improvement:      {self.calibration_stats['ece_improvement']:.4f}")
+                else:
+                    # CV / Self-Calibration case
+                    print(f"    Calibration ECE:      {self.calibration_stats['ece']:.4f} ({self.calibration_stats['method']})")
 
         # =====================================================
         # MULTI-TIER QUALITY CLASSIFIER (optional)
@@ -585,12 +815,62 @@ class EntryQualityModel:
             tier_mask_train = y_tier_train.notna()
             X_tier_train = X_train_filtered[tier_mask_train]
             y_tier_train_clean = y_tier_train[tier_mask_train].astype(int)
+            if y_tier_train_clean.nunique() < 2:
+                if verbose:
+                    print("    Skipping tier classifier (need >=2 classes in train).")
+            else:
+                tier_params = {
+                    'objective': 'multiclass',
+                    'num_class': 4,  # Tiers 0, 1, 2, 3
+                    'metric': 'multi_logloss',
+                    'n_estimators': n_estimators // 2,
+                    'max_depth': self.config.max_depth,
+                    'learning_rate': self.config.learning_rate,
+                    'num_leaves': self.config.num_leaves,
+                    'feature_fraction': self.config.feature_fraction,
+                    'bagging_fraction': self.config.bagging_fraction,
+                    'bagging_freq': self.config.bagging_freq,
+                    'min_child_samples': self.config.min_child_samples,
+                    'reg_alpha': self.config.lambdaa_ele1,
+                    'reg_lambda': self.config.lambdaa_ele2,
+                    'min_gain_to_split': self.config.min_gain_to_split,
+                    'verbose': -1,
+                }
+                _apply_num_threads(tier_params, self.config)
 
-            tier_params = {
-                'objective': 'multiclass',
-                'num_class': 4,  # Tiers 0, 1, 2, 3
-                'metric': 'multi_logloss',
-                'n_estimators': n_estimators // 2,
+                self.tier_classifier = lgb.LGBMClassifier(**tier_params)
+
+                tier_eval_set = [(X_tier_train, y_tier_train_clean)]
+                tier_callbacks = []
+
+                if y_tier_val is not None and y_tier_val.notna().sum() > 50:
+                    tier_mask_val = y_tier_val.notna()
+                    X_tier_val = X_val_filtered[tier_mask_val]
+                    y_tier_val_clean = y_tier_val[tier_mask_val].astype(int)
+                    train_classes = set(y_tier_train_clean.unique())
+                    val_mask = y_tier_val_clean.isin(train_classes).to_numpy(dtype=bool)
+                    if val_mask.any():
+                        X_tier_val = X_tier_val[val_mask]
+                        y_tier_val_clean = y_tier_val_clean[val_mask]
+                    if y_tier_val_clean.size > 50:
+                        tier_eval_set.append((X_tier_val, y_tier_val_clean))
+                        tier_callbacks.append(lgb.early_stopping(stopping_rounds=30, verbose=False))
+
+                self.tier_classifier.fit(
+                    X_tier_train, y_tier_train_clean,
+                    eval_set=tier_eval_set,
+                    callbacks=tier_callbacks if tier_callbacks else None
+                )
+
+                if verbose:
+                    tier_train_acc = (self.tier_classifier.predict(X_tier_train) == y_tier_train_clean).mean()
+                    print(f"    Tier classifier train accuracy: {tier_train_acc:.3f}")
+
+        # Train regressors for win magnitude (mean + conservative quantile)
+        success_mask = (y_success == 1) & y_rr.notna()
+        if success_mask.sum() > 100:
+            base_reg_params = {
+                'n_estimators': max(50, self.config.n_estimators // 2),
                 'max_depth': self.config.max_depth,
                 'learning_rate': self.config.learning_rate,
                 'num_leaves': self.config.num_leaves,
@@ -603,51 +883,20 @@ class EntryQualityModel:
                 'min_gain_to_split': self.config.min_gain_to_split,
                 'verbose': -1,
             }
+            _apply_num_threads(base_reg_params, self.config)
 
-            self.tier_classifier = lgb.LGBMClassifier(**tier_params)
-
-            tier_eval_set = [(X_tier_train, y_tier_train_clean)]
-            tier_callbacks = []
-
-            if y_tier_val is not None and y_tier_val.notna().sum() > 50:
-                tier_mask_val = y_tier_val.notna()
-                X_tier_val = X_val_filtered[tier_mask_val]
-                y_tier_val_clean = y_tier_val[tier_mask_val].astype(int)
-                tier_eval_set.append((X_tier_val, y_tier_val_clean))
-                tier_callbacks.append(lgb.early_stopping(stopping_rounds=30, verbose=False))
-
-            self.tier_classifier.fit(
-                X_tier_train, y_tier_train_clean,
-                eval_set=tier_eval_set,
-                callbacks=tier_callbacks if tier_callbacks else None
+            mean_params = dict(base_reg_params)
+            mean_params.update({'objective': 'regression', 'metric': 'rmse'})
+            self.regressor = lgb.LGBMRegressor(**mean_params)
+            self.regressor.fit(
+                X_train_filtered[success_mask],
+                y_rr[success_mask]
             )
 
-            if verbose:
-                tier_train_acc = (self.tier_classifier.predict(X_tier_train) == y_tier_train_clean).mean()
-                print(f"    Tier classifier train accuracy: {tier_train_acc:.3f}")
-
-        # Train regressor (on successful trades only for better R:R prediction)
-        success_mask = y_success == 1
-        if success_mask.sum() > 100:
-            reg_params = {
-                'objective': 'regression',
-                'metric': 'rmse',
-                'n_estimators': self.config.n_estimators // 2,
-                'max_depth': self.config.max_depth,
-                'learning_rate': self.config.learning_rate,
-                'num_leaves': self.config.num_leaves,
-                'feature_fraction': self.config.feature_fraction,
-                'bagging_fraction': self.config.bagging_fraction,
-                'bagging_freq': self.config.bagging_freq,
-                'min_child_samples': self.config.min_child_samples,
-                'reg_alpha': self.config.lambdaa_ele1,
-                'reg_lambda': self.config.lambdaa_ele2,
-                'min_gain_to_split': self.config.min_gain_to_split,
-                'verbose': -1,
-            }
-
-            self.regressor = lgb.LGBMRegressor(**reg_params)
-            self.regressor.fit(
+            q_params = dict(base_reg_params)
+            q_params.update({'objective': 'quantile', 'alpha': 0.25, 'metric': 'quantile'})
+            self.regressor_q25 = lgb.LGBMRegressor(**q_params)
+            self.regressor_q25.fit(
                 X_train_filtered[success_mask],
                 y_rr[success_mask]
             )
@@ -663,6 +912,33 @@ class EntryQualityModel:
             val_pred = self._get_predictions(X_val_filtered)
             metrics['val_accuracy'] = (val_pred == y_success_val).mean()
             metrics['val_precision'] = self._precision(val_pred, y_success_val)
+
+        raw_train_probs = self._get_raw_probs(X_train_filtered)
+        train_raw_metrics = self._binary_metrics_from_probs(raw_train_probs, y_success.values)
+        metrics['train_base_rate'] = float(y_success.mean())
+        metrics['train_accuracy_raw'] = train_raw_metrics['accuracy']
+        metrics['train_precision_raw'] = train_raw_metrics['precision']
+        metrics['train_recall_raw'] = train_raw_metrics['recall']
+
+        cal_train_probs = self._apply_calibration(raw_train_probs)
+        train_cal_metrics = self._binary_metrics_from_probs(cal_train_probs, y_success.values)
+        metrics['train_accuracy_cal'] = train_cal_metrics['accuracy']
+        metrics['train_precision_cal'] = train_cal_metrics['precision']
+        metrics['train_recall_cal'] = train_cal_metrics['recall']
+
+        if X_val_filtered is not None and y_success_val is not None:
+            raw_val_probs = self._get_raw_probs(X_val_filtered)
+            val_raw_metrics = self._binary_metrics_from_probs(raw_val_probs, y_success_val.values)
+            metrics['val_base_rate'] = float(y_success_val.mean())
+            metrics['val_accuracy_raw'] = val_raw_metrics['accuracy']
+            metrics['val_precision_raw'] = val_raw_metrics['precision']
+            metrics['val_recall_raw'] = val_raw_metrics['recall']
+
+            cal_val_probs = self._apply_calibration(raw_val_probs)
+            val_cal_metrics = self._binary_metrics_from_probs(cal_val_probs, y_success_val.values)
+            metrics['val_accuracy_cal'] = val_cal_metrics['accuracy']
+            metrics['val_precision_cal'] = val_cal_metrics['precision']
+            metrics['val_recall_cal'] = val_cal_metrics['recall']
 
         metrics['best_iteration'] = getattr(self.classifier, 'best_iteration_', None)
 
@@ -697,10 +973,49 @@ class EntryQualityModel:
         else:
             return self.classifier.predict_proba(X)[:, 1]
 
+    def _apply_calibration(self, raw_probs: np.ndarray) -> np.ndarray:
+        if self.calibrator is None:
+            return raw_probs
+        cal_probs = self.calibrator.predict(raw_probs)
+        if not self.calibration_stats:
+            return cal_probs
+        n_cal = self.calibration_stats.get('n_cal')
+        shrink_k = self.calibration_stats.get('shrink_k')
+        if n_cal is None or shrink_k is None:
+            return cal_probs
+        n_cal = float(n_cal)
+        shrink_k = float(shrink_k)
+        if n_cal <= 0 or shrink_k <= 0:
+            return cal_probs
+        shrink_w = n_cal / (n_cal + shrink_k)
+        return (shrink_w * cal_probs) + ((1.0 - shrink_w) * raw_probs)
+
     def _get_predictions(self, X: pd.DataFrame) -> np.ndarray:
         """Get binary predictions, using ensemble average if applicable."""
         probs = self._get_raw_probs(X)
         return (probs >= 0.5).astype(int)
+
+    @staticmethod
+    def _binary_metrics_from_probs(
+        probs: np.ndarray,
+        labels: np.ndarray,
+        threshold: float = 0.5,
+    ) -> Dict[str, float]:
+        if probs.size == 0:
+            return {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0}
+        preds = (probs >= threshold).astype(int)
+        accuracy = float((preds == labels).mean())
+        pred_pos = preds == 1
+        if pred_pos.sum() == 0:
+            precision = 0.0
+        else:
+            precision = float((labels[pred_pos] == 1).mean())
+        actual_pos = labels == 1
+        if actual_pos.sum() == 0:
+            recall = 0.0
+        else:
+            recall = float((preds[actual_pos] == 1).mean())
+        return {'accuracy': accuracy, 'precision': precision, 'recall': recall}
 
     def _precision(self, pred, true):
         """Calculate precision"""
@@ -709,7 +1024,15 @@ class EntryQualityModel:
             return 0.0
         return (pred[pred_positive] == true[pred_positive]).mean()
 
-    def predict(self, X: pd.DataFrame, use_calibration: bool = False) -> Dict[str, np.ndarray]:
+    def predict(
+        self,
+        X: pd.DataFrame,
+        use_calibration: bool = False,
+        cost_r: Optional[np.ndarray] = None,
+        compute_ev: bool = False,
+        p_clip: Tuple[float, float] = (0.01, 0.99),
+        rr_clip: Tuple[float, float] = (0.05, 5.0),
+    ) -> Dict[str, np.ndarray]:
         """
         Predict entry quality.
 
@@ -722,7 +1045,10 @@ class EntryQualityModel:
             - bounce_prob: Probability of successful bounce (calibrated if available)
             - bounce_prob_raw: Raw uncalibrated probability
             - bounce_pred: Binary prediction
-            - expected_rr: Expected reward:risk ratio (if regressor trained)
+            - expected_rr: Conservative expected win R (if regressor trained)
+            - expected_rr_mean: Mean predicted win R (if regressor trained)
+            - expected_rr_q25: 25th percentile win R (if quantile regressor trained)
+            - ev_mean_r / ev_conservative_r: Expected value components (if compute_ev=True)
             - tier_prob_*: Tier probabilities (if tier classifier trained)
         """
         if self.classifier is None:
@@ -745,12 +1071,38 @@ class EntryQualityModel:
 
         # Apply calibration if available
         if use_calibration and self.calibrator is not None:
-            result['bounce_prob'] = self.calibrator.predict(raw_prob)
+            result['bounce_prob'] = self._apply_calibration(raw_prob)
         else:
             result['bounce_prob'] = raw_prob
 
         if self.regressor is not None:
-            result['expected_rr'] = self.regressor.predict(X_filtered)
+            rr_mean = self.regressor.predict(X_filtered)
+            rr_q25 = None
+            if self.regressor_q25 is not None:
+                rr_q25 = self.regressor_q25.predict(X_filtered)
+
+            rr_min, rr_max = rr_clip
+            rr_mean_clipped = np.clip(rr_mean, rr_min, rr_max)
+            if rr_q25 is not None:
+                rr_q25_clipped = np.clip(rr_q25, rr_min, rr_max)
+                rr_cons = np.minimum(rr_mean_clipped, rr_q25_clipped)
+                result['expected_rr_q25'] = rr_q25_clipped
+            else:
+                rr_cons = rr_mean_clipped
+
+            result['expected_rr_mean'] = rr_mean_clipped
+            result['expected_rr'] = rr_cons
+
+            if compute_ev and cost_r is not None:
+                ev = self.compute_expected_rr_components(
+                    result['bounce_prob'],
+                    rr_mean_clipped,
+                    rr_conservative=rr_cons,
+                    cost_r=cost_r,
+                    p_clip=p_clip,
+                    rr_clip=rr_clip,
+                )
+                result.update(ev)
 
         # Tier predictions if available
         if self.tier_classifier is not None:
@@ -773,6 +1125,7 @@ class EntryQualityModel:
                 'classifier': self.classifier,
                 'ensemble_classifiers': self.ensemble_classifiers,
                 'regressor': self.regressor,
+                'regressor_q25': self.regressor_q25,
                 'tier_classifier': self.tier_classifier,
                 'calibrator': self.calibrator,
                 'calibration_stats': self.calibration_stats,
@@ -792,6 +1145,7 @@ class EntryQualityModel:
         self.classifier = data['classifier']
         self.ensemble_classifiers = data.get('ensemble_classifiers', [])
         self.regressor = data.get('regressor')
+        self.regressor_q25 = data.get('regressor_q25')
         self.tier_classifier = data.get('tier_classifier')
         self.calibrator = data.get('calibrator')
         self.calibration_stats = data.get('calibration_stats')
@@ -850,6 +1204,7 @@ class RegimeClassifier:
             'min_gain_to_split': self.config.min_gain_to_split,
             'verbose': -1,
         }
+        _apply_num_threads(params, self.config)
         
         self.model = lgb.LGBMClassifier(**params)
         

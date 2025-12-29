@@ -92,9 +92,21 @@ DEFAULT_PARAMS = {
     'stop_padding_pct': 0.0,        # Extra stop distance as fraction of entry (0.0 = disabled)
     'take_profit_rr': 1.5,          # Target reward:risk ratio (matches backtest)
     'min_quality': 'C',             # Quality not gated in backtest
-    'min_trend_prob': 0.0,          # Trend classifier ignored
+    'use_trend_gate': False,        # Gate by trend classifier probability
+    'min_trend_prob': 0.0,          # Minimum trend probability
+    'use_regime_gate': False,       # Gate by regime classifier
+    'min_regime_prob': 0.0,         # Minimum regime probability
+    'allow_regime_ranging': True,
+    'allow_regime_trend_up': True,
+    'allow_regime_trend_down': True,
+    'allow_regime_volatile': True,
+    'regime_align_direction': True,
     'min_bounce_prob': 0.48,        # Minimum bounce probability (matches touch backtest)
     'max_bounce_prob': 1.0,         # Maximum bounce probability for bucket filtering (1.0 = no max)
+    'use_ev_gate': True,            # Use EV gate instead of probability threshold
+    'ev_margin_r': 0.0,             # Minimum EV margin in R units
+    'fee_percent': 0.0011,          # Round-trip fee as a decimal of price
+    'use_expected_rr': False,       # Use expected_rr in EV gating when available
     'cooldown_bars_after_stop': 0,  # Cooldown after stop-loss in base bars (0 = disabled)
     'trade_side': 'long',           # long | short | both
     'use_dynamic_rr': False,        # Use expected_rr from model for TP sizing
@@ -297,8 +309,20 @@ class LivePaperTrader:
         take_profit_rr: float = DEFAULT_PARAMS['take_profit_rr'],
         min_quality: str = DEFAULT_PARAMS['min_quality'],
         min_trend_prob: float = DEFAULT_PARAMS['min_trend_prob'],
+        use_trend_gate: bool = DEFAULT_PARAMS['use_trend_gate'],
+        use_regime_gate: bool = DEFAULT_PARAMS['use_regime_gate'],
+        min_regime_prob: float = DEFAULT_PARAMS['min_regime_prob'],
+        allow_regime_ranging: bool = DEFAULT_PARAMS['allow_regime_ranging'],
+        allow_regime_trend_up: bool = DEFAULT_PARAMS['allow_regime_trend_up'],
+        allow_regime_trend_down: bool = DEFAULT_PARAMS['allow_regime_trend_down'],
+        allow_regime_volatile: bool = DEFAULT_PARAMS['allow_regime_volatile'],
+        regime_align_direction: bool = DEFAULT_PARAMS['regime_align_direction'],
         min_bounce_prob: float = DEFAULT_PARAMS['min_bounce_prob'],
         max_bounce_prob: float = DEFAULT_PARAMS['max_bounce_prob'],
+        use_ev_gate: bool = DEFAULT_PARAMS['use_ev_gate'],
+        ev_margin_r: float = DEFAULT_PARAMS['ev_margin_r'],
+        fee_percent: float = DEFAULT_PARAMS['fee_percent'],
+        use_expected_rr: bool = DEFAULT_PARAMS['use_expected_rr'],
         cooldown_bars_after_stop: int = DEFAULT_PARAMS['cooldown_bars_after_stop'],
         trade_side: str = DEFAULT_PARAMS['trade_side'],
         use_dynamic_rr: bool = DEFAULT_PARAMS['use_dynamic_rr'],
@@ -323,8 +347,20 @@ class LivePaperTrader:
         self.take_profit_rr = take_profit_rr
         self.min_quality = min_quality
         self.min_trend_prob = min_trend_prob
+        self.use_trend_gate = bool(use_trend_gate)
+        self.use_regime_gate = bool(use_regime_gate)
+        self.min_regime_prob = float(min_regime_prob)
+        self.allow_regime_ranging = bool(allow_regime_ranging)
+        self.allow_regime_trend_up = bool(allow_regime_trend_up)
+        self.allow_regime_trend_down = bool(allow_regime_trend_down)
+        self.allow_regime_volatile = bool(allow_regime_volatile)
+        self.regime_align_direction = bool(regime_align_direction)
         self.min_bounce_prob = min_bounce_prob
         self.max_bounce_prob = max_bounce_prob
+        self.use_ev_gate = bool(use_ev_gate)
+        self.ev_margin_r = float(ev_margin_r)
+        self.fee_percent = max(0.0, float(fee_percent))
+        self.use_expected_rr = bool(use_expected_rr)
         self.use_dynamic_rr = use_dynamic_rr
         self.use_calibration = bool(use_calibration)
         self.cooldown_bars_after_stop = max(0, int(cooldown_bars_after_stop))
@@ -382,8 +418,92 @@ class LivePaperTrader:
             # Align config with EMA9-only, pullback 0.3 ATR setup used in backtests
             self.config.features.ema_periods = [9]
             self.config.labels.pullback_ema = 9
-            # Use touch-style pullback threshold (intrabar distance <= 0.02 ATR)
-            self.config.labels.pullback_threshold = 0.02
+            # Use config.py default pullback_threshold if not set (0.5 ATR)
+            # Note: Trained models will have their own tuned value loaded from train_config
+            if not hasattr(self.config.labels, 'pullback_threshold'):
+                self.config.labels.pullback_threshold = 0.5
+
+        # Use tuned thresholds/targets when CLI defaults are left unchanged.
+        if stop_loss_atr == DEFAULT_PARAMS['stop_loss_atr']:
+            tuned_stop = getattr(self.config.labels, 'stop_atr_multiple', None)
+            if tuned_stop is not None:
+                self.stop_loss_atr = float(tuned_stop)
+                self.logger.info(f"Using tuned stop_atr_multiple for stop_loss_atr: {self.stop_loss_atr:.4f}")
+        if take_profit_rr == DEFAULT_PARAMS['take_profit_rr']:
+            tuned_rr = getattr(self.config.labels, 'target_rr', None)
+            if tuned_rr is not None:
+                self.take_profit_rr = float(tuned_rr)
+                self.logger.info(f"Using tuned target_rr for take_profit_rr: {self.take_profit_rr:.4f}")
+        if min_bounce_prob == DEFAULT_PARAMS['min_bounce_prob']:
+            tuned_threshold = getattr(self.config.labels, 'best_threshold', None)
+            if tuned_threshold is not None:
+                self.min_bounce_prob = float(tuned_threshold)
+                self.logger.info(f"Using tuned best_threshold for min_bounce_prob: {self.min_bounce_prob:.4f}")
+        if use_ev_gate == DEFAULT_PARAMS['use_ev_gate']:
+            tuned_use_ev_gate = getattr(self.config.labels, 'use_ev_gate', None)
+            if tuned_use_ev_gate is not None:
+                self.use_ev_gate = bool(tuned_use_ev_gate)
+                self.logger.info(f"Using tuned use_ev_gate: {self.use_ev_gate}")
+        if ev_margin_r == DEFAULT_PARAMS['ev_margin_r']:
+            tuned_ev_margin = getattr(self.config.labels, 'ev_margin_r', None)
+            if tuned_ev_margin is not None:
+                self.ev_margin_r = float(tuned_ev_margin)
+                self.logger.info(f"Using tuned ev_margin_r: {self.ev_margin_r:.4f}")
+        if fee_percent == DEFAULT_PARAMS['fee_percent']:
+            tuned_fee = getattr(self.config.labels, 'fee_percent', None)
+            if tuned_fee is not None:
+                self.fee_percent = float(tuned_fee)
+                self.logger.info(f"Using tuned fee_percent: {self.fee_percent:.5f}")
+        if use_expected_rr == DEFAULT_PARAMS['use_expected_rr']:
+            tuned_use_rr = getattr(self.config.labels, 'use_expected_rr', None)
+            if tuned_use_rr is not None:
+                self.use_expected_rr = bool(tuned_use_rr)
+                self.logger.info(f"Using tuned use_expected_rr: {self.use_expected_rr}")
+        if use_calibration == DEFAULT_PARAMS['use_calibration']:
+            tuned_use_cal = getattr(self.config.labels, 'use_calibration', None)
+            if tuned_use_cal is not None:
+                self.use_calibration = bool(tuned_use_cal)
+                self.logger.info(f"Using tuned use_calibration: {self.use_calibration}")
+        if use_trend_gate == DEFAULT_PARAMS['use_trend_gate']:
+            tuned_use_trend = getattr(self.config.labels, 'use_trend_gate', None)
+            if tuned_use_trend is not None:
+                self.use_trend_gate = bool(tuned_use_trend)
+                self.logger.info(f"Using tuned use_trend_gate: {self.use_trend_gate}")
+        if min_trend_prob == DEFAULT_PARAMS['min_trend_prob']:
+            tuned_min_trend = getattr(self.config.labels, 'min_trend_prob', None)
+            if tuned_min_trend is not None:
+                self.min_trend_prob = float(tuned_min_trend)
+                self.logger.info(f"Using tuned min_trend_prob: {self.min_trend_prob:.4f}")
+        if use_regime_gate == DEFAULT_PARAMS['use_regime_gate']:
+            tuned_use_regime = getattr(self.config.labels, 'use_regime_gate', None)
+            if tuned_use_regime is not None:
+                self.use_regime_gate = bool(tuned_use_regime)
+                self.logger.info(f"Using tuned use_regime_gate: {self.use_regime_gate}")
+        if min_regime_prob == DEFAULT_PARAMS['min_regime_prob']:
+            tuned_min_regime = getattr(self.config.labels, 'min_regime_prob', None)
+            if tuned_min_regime is not None:
+                self.min_regime_prob = float(tuned_min_regime)
+                self.logger.info(f"Using tuned min_regime_prob: {self.min_regime_prob:.4f}")
+        if allow_regime_ranging == DEFAULT_PARAMS['allow_regime_ranging']:
+            tuned_allow = getattr(self.config.labels, 'allow_regime_ranging', None)
+            if tuned_allow is not None:
+                self.allow_regime_ranging = bool(tuned_allow)
+        if allow_regime_trend_up == DEFAULT_PARAMS['allow_regime_trend_up']:
+            tuned_allow = getattr(self.config.labels, 'allow_regime_trend_up', None)
+            if tuned_allow is not None:
+                self.allow_regime_trend_up = bool(tuned_allow)
+        if allow_regime_trend_down == DEFAULT_PARAMS['allow_regime_trend_down']:
+            tuned_allow = getattr(self.config.labels, 'allow_regime_trend_down', None)
+            if tuned_allow is not None:
+                self.allow_regime_trend_down = bool(tuned_allow)
+        if allow_regime_volatile == DEFAULT_PARAMS['allow_regime_volatile']:
+            tuned_allow = getattr(self.config.labels, 'allow_regime_volatile', None)
+            if tuned_allow is not None:
+                self.allow_regime_volatile = bool(tuned_allow)
+        if regime_align_direction == DEFAULT_PARAMS['regime_align_direction']:
+            tuned_align = getattr(self.config.labels, 'regime_align_direction', None)
+            if tuned_align is not None:
+                self.regime_align_direction = bool(tuned_align)
 
         effective_lookback = self.lookback_days
         if effective_lookback is None:
@@ -414,8 +534,11 @@ class LivePaperTrader:
         self.base_tf = self.config.features.timeframe_names[self.config.base_timeframe_idx]
         self.base_tf_seconds = self.config.features.timeframes[self.config.base_timeframe_idx]
         self.cooldown_seconds = float(self.cooldown_bars_after_stop) * float(self.base_tf_seconds)
+        
         # Require price to be essentially on the EMA to enter (in ATR units)
-        self.ema_touch_tolerance_atr = 0.02
+        # Use the tuned pullback_threshold from config if available, else default to 0.5 (config.py default)
+        self.ema_touch_tolerance_atr = float(getattr(self.config.labels, 'pullback_threshold', 0.5))
+        self.logger.info(f"Using EMA touch threshold: {self.ema_touch_tolerance_atr} ATR")
         
         # WebSocket
         self.ws: Optional[WebSocket] = None
@@ -1058,6 +1181,12 @@ class LivePaperTrader:
         # Get model predictions
         trend_dir = entry_signal.direction  # from EMA slope (long-only when >0)
         bounce_prob = entry_signal.bounce_prob
+        expected_rr = getattr(entry_signal, 'expected_rr', None)
+        expected_rr_mean = getattr(entry_signal, 'expected_rr_mean', None)
+        if expected_rr is not None and isinstance(expected_rr, float) and np.isnan(expected_rr):
+            expected_rr = None
+        if expected_rr_mean is not None and isinstance(expected_rr_mean, float) and np.isnan(expected_rr_mean):
+            expected_rr_mean = None
         
         # Determine quality grade (same logic as backtest)
         atr_val = current_atr
@@ -1095,7 +1224,7 @@ class LivePaperTrader:
                 and bar_high is not None
                 and bar_low is not None
             ):
-                threshold = getattr(self.config.labels, 'touch_threshold_atr', 0.3)
+                threshold = self.ema_touch_tolerance_atr
                 mid_bar = (bar_high + bar_low) / 2.0
                 if trend_dir == 1:
                     dist_low = (bar_low - ema) / atr_val
@@ -1123,7 +1252,66 @@ class LivePaperTrader:
         
         # Check entry criteria (SAME AS BACKTEST)
         quality_ok = True  # do not gate by quality
-        trend_prob_ok = True  # trend classifier ignored
+        trend_prob_ok = True
+        regime_prob_ok = True
+        trend_prob = None
+        trend_signal = None
+        if self.use_trend_gate or self.use_regime_gate:
+            try:
+                trend_signal = self.predictor.get_trend_signal()
+            except Exception as exc:
+                self.logger.debug(f"Trend/regime prediction unavailable: {exc}")
+                trend_signal = None
+
+        if trend_signal is not None:
+            trend_prob = trend_signal.prob_up if trend_dir == 1 else trend_signal.prob_down if trend_dir == -1 else 0.0
+
+        if self.use_trend_gate:
+            if trend_prob is None:
+                self.logger.debug("Skipping entry: trend_prob unavailable")
+                return
+            if trend_prob < float(self.min_trend_prob):
+                self.logger.debug(
+                    "Skipping entry: trend_prob {:.3f} < min {:.3f}".format(
+                        trend_prob,
+                        float(self.min_trend_prob),
+                    )
+                )
+                return
+
+        if self.use_regime_gate:
+            if trend_signal is None:
+                self.logger.debug("Skipping entry: regime prediction unavailable")
+                return
+            regime_id = int(trend_signal.regime)
+            if regime_id == 0:
+                regime_prob = float(trend_signal.prob_regime_ranging)
+                allowed = bool(self.allow_regime_ranging)
+            elif regime_id == 1:
+                regime_prob = float(trend_signal.prob_regime_trend_up)
+                allowed = bool(self.allow_regime_trend_up)
+                if self.regime_align_direction and trend_dir != 1:
+                    allowed = False
+            elif regime_id == 2:
+                regime_prob = float(trend_signal.prob_regime_trend_down)
+                allowed = bool(self.allow_regime_trend_down)
+                if self.regime_align_direction and trend_dir != -1:
+                    allowed = False
+            else:
+                regime_prob = float(trend_signal.prob_regime_volatile)
+                allowed = bool(self.allow_regime_volatile)
+
+            if (not allowed) or (regime_prob < float(self.min_regime_prob)):
+                self.logger.debug(
+                    "Skipping entry: regime {} prob {:.3f} < min {:.3f} allowed={}".format(
+                        regime_id,
+                        regime_prob,
+                        float(self.min_regime_prob),
+                        allowed,
+                    )
+                )
+                return
+
         bounce_min_ok = bounce_prob >= self.min_bounce_prob
         bounce_max_ok = bounce_prob <= self.max_bounce_prob
 
@@ -1139,21 +1327,55 @@ class LivePaperTrader:
         if not ema_touched:
             self.logger.debug("Skipping entry: ema_touch not detected")
             return
-        if not bounce_min_ok:
-            self.logger.debug(f"Skipping entry: bounce_prob {bounce_prob:.3f} < min {self.min_bounce_prob}")
-            return
-        if not bounce_max_ok:
-            self.logger.debug(f"Skipping entry: bounce_prob {bounce_prob:.3f} > max {self.max_bounce_prob}")
-            return
+
+        if self.use_ev_gate:
+            entry_model = getattr(getattr(self.predictor, "models", None), "entry_model", None)
+            if entry_model is None:
+                self.logger.debug("Skipping EV gate: entry_model unavailable")
+            else:
+                stop_dist = (self.stop_loss_atr * atr_val) + (self.stop_padding_pct * price)
+                fee_r = 0.0
+                if np.isfinite(stop_dist) and stop_dist > 0 and price > 0:
+                    fee_r = (self.fee_percent * price) / stop_dist
+
+                rr_mean = float(self.take_profit_rr)
+                rr_cons = rr_mean
+                if self.use_expected_rr:
+                    if expected_rr_mean is not None:
+                        rr_mean = float(expected_rr_mean)
+                    if expected_rr is not None:
+                        rr_cons = float(expected_rr)
+
+                ev_components = entry_model.compute_expected_rr_components(
+                    np.asarray([bounce_prob], dtype=float),
+                    np.asarray([rr_mean], dtype=float),
+                    rr_conservative=np.asarray([rr_cons], dtype=float),
+                    cost_r=np.asarray([fee_r], dtype=float),
+                )
+                ev_value = float(ev_components['ev_conservative_r'][0])
+                if ev_value <= float(self.ev_margin_r):
+                    self.logger.debug(
+                        "Skipping entry: EV {:.4f} <= margin {:.4f}".format(
+                            ev_value,
+                            float(self.ev_margin_r),
+                        )
+                    )
+                    return
+        else:
+            if not bounce_min_ok:
+                self.logger.debug(f"Skipping entry: bounce_prob {bounce_prob:.3f} < min {self.min_bounce_prob}")
+                return
+            if not bounce_max_ok:
+                self.logger.debug(f"Skipping entry: bounce_prob {bounce_prob:.3f} > max {self.max_bounce_prob}")
+                return
 
         # Get expected RR from model if dynamic RR is enabled
-        expected_rr = None
-        if self.use_dynamic_rr:
+        if self.use_dynamic_rr and expected_rr is None:
             entry_signal = self.predictor.get_entry_signal()
             if entry_signal and hasattr(entry_signal, 'expected_rr'):
                 expected_rr = entry_signal.expected_rr
 
-        if quality_ok and trend_prob_ok:
+        if quality_ok and trend_prob_ok and regime_prob_ok:
             self._open_position(trend_dir, quality, atr_val, entry_price=price, expected_rr=expected_rr)
     
     def _open_position(self, direction: int, quality: str, atr: float, entry_price: Optional[float] = None, expected_rr: Optional[float] = None):
@@ -1395,7 +1617,19 @@ class LivePaperTrader:
                 'take_profit_rr': self.take_profit_rr,
                 'min_quality': self.min_quality,
                 'min_trend_prob': self.min_trend_prob,
+                'use_trend_gate': self.use_trend_gate,
+                'use_regime_gate': self.use_regime_gate,
+                'min_regime_prob': self.min_regime_prob,
+                'allow_regime_ranging': self.allow_regime_ranging,
+                'allow_regime_trend_up': self.allow_regime_trend_up,
+                'allow_regime_trend_down': self.allow_regime_trend_down,
+                'allow_regime_volatile': self.allow_regime_volatile,
+                'regime_align_direction': self.regime_align_direction,
                 'min_bounce_prob': self.min_bounce_prob,
+                'use_ev_gate': self.use_ev_gate,
+                'ev_margin_r': self.ev_margin_r,
+                'fee_percent': self.fee_percent,
+                'use_expected_rr': self.use_expected_rr,
                 'cooldown_bars_after_stop': self.cooldown_bars_after_stop,
                 'trade_side': self.trade_side,
             },
@@ -1497,6 +1731,30 @@ Examples:
                        help=f"Minimum signal quality (default: {DEFAULT_PARAMS['min_quality']})")
     parser.add_argument('--min-trend-prob', type=float, default=DEFAULT_PARAMS['min_trend_prob'],
                        help=f"Minimum trend probability (default: {DEFAULT_PARAMS['min_trend_prob']})")
+    trend_gate_group = parser.add_mutually_exclusive_group()
+    trend_gate_group.add_argument(
+        '--use-trend-gate',
+        action='store_true',
+        help='Enable trend classifier gating (override train_config).',
+    )
+    trend_gate_group.add_argument(
+        '--no-trend-gate',
+        action='store_true',
+        help='Disable trend classifier gating (override train_config).',
+    )
+    parser.add_argument('--min-regime-prob', type=float, default=DEFAULT_PARAMS['min_regime_prob'],
+                       help=f"Minimum regime probability (default: {DEFAULT_PARAMS['min_regime_prob']})")
+    regime_gate_group = parser.add_mutually_exclusive_group()
+    regime_gate_group.add_argument(
+        '--use-regime-gate',
+        action='store_true',
+        help='Enable regime classifier gating (override train_config).',
+    )
+    regime_gate_group.add_argument(
+        '--no-regime-gate',
+        action='store_true',
+        help='Disable regime classifier gating (override train_config).',
+    )
     parser.add_argument('--min-bounce-prob', type=float, default=DEFAULT_PARAMS['min_bounce_prob'],
                        help=f"Minimum bounce probability (default: {DEFAULT_PARAMS['min_bounce_prob']})")
     parser.add_argument('--max-bounce-prob', type=float, default=DEFAULT_PARAMS['max_bounce_prob'],
@@ -1569,12 +1827,27 @@ Examples:
         return
     
     # Create and start trader
+    use_trend_gate = DEFAULT_PARAMS['use_trend_gate']
+    if args.use_trend_gate:
+        use_trend_gate = True
+    elif args.no_trend_gate:
+        use_trend_gate = False
+
+    use_regime_gate = DEFAULT_PARAMS['use_regime_gate']
+    if args.use_regime_gate:
+        use_regime_gate = True
+    elif args.no_regime_gate:
+        use_regime_gate = False
+
     trader = LivePaperTrader(
         model_dir=model_dir,
         symbol=args.symbol,
         testnet=args.testnet,
         min_quality=args.min_quality,
         min_trend_prob=args.min_trend_prob,
+        use_trend_gate=use_trend_gate,
+        use_regime_gate=use_regime_gate,
+        min_regime_prob=args.min_regime_prob,
         min_bounce_prob=args.min_bounce_prob,
         max_bounce_prob=args.max_bounce_prob,
         trade_side=args.trade_side,

@@ -209,7 +209,7 @@ class SimulatedLiveFundsTrader(LiveFundsTrader):
         starting_balance: float = 10000.0,
         max_entry_deviation_atr: float = 1.0,
         entry_fill_mode: str = "bar_close",
-        ema_touch_mode: str = "base",
+        ema_touch_mode: str = "multi",
         test_start_bar_time: Optional[int] = None,
         test_end_bar_time: Optional[int] = None,
         **kwargs,
@@ -236,9 +236,9 @@ class SimulatedLiveFundsTrader(LiveFundsTrader):
         if self.entry_fill_mode not in ("bar_close", "last_trade"):
             self.entry_fill_mode = "bar_close"
 
-        self.ema_touch_mode = str(ema_touch_mode or "base").lower()
+        self.ema_touch_mode = str(ema_touch_mode or "multi").lower()
         if self.ema_touch_mode not in ("base", "multi"):
-            self.ema_touch_mode = "base"
+            self.ema_touch_mode = "multi"
 
         self.test_start_bar_time = test_start_bar_time
         self.test_end_bar_time = test_end_bar_time
@@ -299,7 +299,9 @@ class SimulatedLiveFundsTrader(LiveFundsTrader):
         if trend_dir == 0:
             return {"ema_touch_detected": False, "ema_touch_direction": 0, "ema_touch_dist": None}
 
-        threshold = getattr(self.config.labels, "touch_threshold_atr", 0.3)
+        threshold = getattr(self.config.labels, "pullback_threshold", None)
+        if threshold is None:
+            threshold = getattr(self.config.labels, "touch_threshold_atr", 0.3)
         mid_bar = (bar_high + bar_low) / 2.0
 
         ema_touched = False
@@ -474,9 +476,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ema-touch-mode",
         type=str,
-        default="base",
+        default="multi",
         choices=["base", "multi"],
-        help="EMA touch detection mode for live simulation (default: base).",
+        help="EMA touch detection mode for live simulation (default: multi).",
     )
     parser.add_argument(
         "--dump-touch-diffs",
@@ -720,6 +722,7 @@ def _build_full_bar_metrics(
 ) -> dict:
     base_tf_seconds = int(cfg.features.timeframes[cfg.base_timeframe_idx])
     pullback_ema = int(cfg.labels.pullback_ema)
+    touch_threshold_atr = float(getattr(cfg.labels, "pullback_threshold", args.touch_threshold_atr))
     ema_col = f"{base_tf}_ema_{pullback_ema}"
     atr_col = f"{base_tf}_atr"
     slope_col = f"{base_tf}_ema_{pullback_ema}_slope_norm"
@@ -800,7 +803,7 @@ def _build_full_bar_metrics(
                 row,
                 base_tf,
                 pullback_ema,
-                float(args.touch_threshold_atr),
+                touch_threshold_atr,
             )
             ema_touch_detected = bool(base_touch.get("ema_touch_detected", False))
             ema_touch_direction = int(base_touch.get("ema_touch_direction", 0) or 0)
@@ -1446,6 +1449,20 @@ def _predict_entry_probs(
     models: TrendFollowerModels,
     use_calibration: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    entry_model = getattr(models, "entry_model", None)
+    expected_cols = []
+    if entry_model is not None:
+        filtered = getattr(entry_model, "filtered_feature_names", None)
+        if filtered:
+            expected_cols = list(filtered)
+        else:
+            feature_names = getattr(entry_model, "feature_names", None)
+            if feature_names:
+                expected_cols = list(feature_names)
+
+    need_trend_context = "trend_prob_up" in expected_cols
+    need_regime_context = "regime_prob_ranging" in expected_cols
+
     feature_data = {}
     rows = len(data)
     for col in feature_cols:
@@ -1453,6 +1470,42 @@ def _predict_entry_probs(
             feature_data[col] = data[col].fillna(0).values
         else:
             feature_data[col] = np.zeros(rows)
+
+    if need_trend_context:
+        prob_up = np.zeros(rows, dtype=float)
+        prob_down = np.zeros(rows, dtype=float)
+        prob_neutral = np.zeros(rows, dtype=float)
+        trend_model = getattr(models, "trend_classifier", None)
+        trend_cols = getattr(trend_model, "feature_names", None) if trend_model is not None else None
+        if trend_model is not None and trend_cols:
+            X_trend = data.reindex(columns=trend_cols).fillna(0)
+            trend_pred = trend_model.predict(X_trend)
+            prob_up = np.asarray(trend_pred.get("prob_up", prob_up), dtype=float)
+            prob_down = np.asarray(trend_pred.get("prob_down", prob_down), dtype=float)
+            prob_neutral = np.asarray(trend_pred.get("prob_neutral", prob_neutral), dtype=float)
+        feature_data["trend_prob_up"] = prob_up
+        feature_data["trend_prob_down"] = prob_down
+        feature_data["trend_prob_neutral"] = prob_neutral
+
+    if need_regime_context:
+        prob_ranging = np.zeros(rows, dtype=float)
+        prob_trend_up = np.zeros(rows, dtype=float)
+        prob_trend_down = np.zeros(rows, dtype=float)
+        prob_volatile = np.zeros(rows, dtype=float)
+        regime_model = getattr(models, "regime_classifier", None)
+        regime_cols = getattr(regime_model, "feature_names", None) if regime_model is not None else None
+        if regime_model is not None and regime_cols:
+            X_regime = data.reindex(columns=regime_cols).fillna(0)
+            regime_pred = regime_model.predict(X_regime)
+            prob_ranging = np.asarray(regime_pred.get("prob_ranging", prob_ranging), dtype=float)
+            prob_trend_up = np.asarray(regime_pred.get("prob_trend_up", prob_trend_up), dtype=float)
+            prob_trend_down = np.asarray(regime_pred.get("prob_trend_down", prob_trend_down), dtype=float)
+            prob_volatile = np.asarray(regime_pred.get("prob_volatile", prob_volatile), dtype=float)
+        feature_data["regime_prob_ranging"] = prob_ranging
+        feature_data["regime_prob_trend_up"] = prob_trend_up
+        feature_data["regime_prob_trend_down"] = prob_trend_down
+        feature_data["regime_prob_volatile"] = prob_volatile
+
     X = pd.DataFrame(feature_data, index=data.index)
     entry_pred = models.entry_model.predict(X, use_calibration=use_calibration)
     bounce_probs = np.array(entry_pred.get("bounce_prob", np.zeros(rows)), dtype=float)
@@ -1899,7 +1952,29 @@ def main() -> None:
         cfg.data.data_dir = Path(args.data_dir)
     if args.lookback_days is not None:
         cfg.data.lookback_days = int(args.lookback_days)
-    cfg.labels.touch_threshold_atr = float(args.touch_threshold_atr)
+
+    final_touch_threshold = float(args.touch_threshold_atr)
+    if args.touch_threshold_atr == 0.3 and hasattr(cfg.labels, "pullback_threshold"):
+        final_touch_threshold = float(cfg.labels.pullback_threshold)
+    cfg.labels.pullback_threshold = final_touch_threshold
+    cfg.labels.touch_threshold_atr = final_touch_threshold
+
+    final_use_ev_gate = bool(getattr(cfg.labels, "use_ev_gate", True))
+    final_ev_margin_r = float(getattr(cfg.labels, "ev_margin_r", 0.0))
+    final_fee_percent = float(getattr(cfg.labels, "fee_percent", 0.0011))
+    final_use_expected_rr = bool(getattr(cfg.labels, "use_expected_rr", False))
+    final_use_calibration = bool(getattr(cfg.labels, "use_calibration", False))
+    if args.use_calibration:
+        final_use_calibration = True
+    final_use_trend_gate = bool(getattr(cfg.labels, "use_trend_gate", True))
+    final_min_trend_prob = float(getattr(cfg.labels, "min_trend_prob", 0.0))
+    final_use_regime_gate = bool(getattr(cfg.labels, "use_regime_gate", True))
+    final_min_regime_prob = float(getattr(cfg.labels, "min_regime_prob", 0.0))
+    allow_regime_ranging = bool(getattr(cfg.labels, "allow_regime_ranging", True))
+    allow_regime_trend_up = bool(getattr(cfg.labels, "allow_regime_trend_up", True))
+    allow_regime_trend_down = bool(getattr(cfg.labels, "allow_regime_trend_down", True))
+    allow_regime_volatile = bool(getattr(cfg.labels, "allow_regime_volatile", True))
+    regime_align_direction = bool(getattr(cfg.labels, "regime_align_direction", True))
 
     base_tf = cfg.features.timeframe_names[cfg.base_timeframe_idx]
 
@@ -1988,7 +2063,7 @@ def main() -> None:
                     row,
                     base_tf,
                     int(cfg.labels.pullback_ema),
-                    float(args.touch_threshold_atr),
+                    float(final_touch_threshold),
                 )
 
     backtest_kwargs = dict(
@@ -1998,14 +2073,27 @@ def main() -> None:
         stop_loss_atr=float(args.stop_loss_atr),
         stop_padding_pct=float(args.stop_padding_pct),
         take_profit_rr=float(args.take_profit_rr),
+        min_trend_prob=float(final_min_trend_prob),
+        use_trend_gate=bool(final_use_trend_gate),
+        use_regime_gate=bool(final_use_regime_gate),
+        min_regime_prob=float(final_min_regime_prob),
+        allow_regime_ranging=bool(allow_regime_ranging),
+        allow_regime_trend_up=bool(allow_regime_trend_up),
+        allow_regime_trend_down=bool(allow_regime_trend_down),
+        allow_regime_volatile=bool(allow_regime_volatile),
+        regime_align_direction=bool(regime_align_direction),
         cooldown_bars_after_stop=int(args.cooldown_bars_after_stop),
         trade_side=str(args.trade_side),
         use_dynamic_rr=bool(args.use_dynamic_rr),
+        use_ev_gate=bool(final_use_ev_gate),
+        ev_margin_r=float(final_ev_margin_r),
+        fee_percent=float(final_fee_percent),
+        use_expected_rr=bool(final_use_expected_rr),
         use_ema_touch_entry=True,
         ema_touch_mode=str(args.ema_touch_mode),
-        touch_threshold_atr=float(args.touch_threshold_atr),
+        touch_threshold_atr=float(final_touch_threshold),
         raw_trades=processed,
-        use_calibration=bool(args.use_calibration),
+        use_calibration=bool(final_use_calibration),
     )
 
     def run_backtest(data: pd.DataFrame):
@@ -2020,7 +2108,7 @@ def main() -> None:
             test,
             feature_cols,
             models,
-            use_calibration=bool(args.use_calibration),
+            use_calibration=bool(final_use_calibration),
         )
         full_bar_metrics = _build_full_bar_metrics(
             test=test,
@@ -2051,7 +2139,15 @@ def main() -> None:
             symbol=symbol,
             testnet=False,
             min_quality=getattr(cfg, "min_quality", "B"),
-            min_trend_prob=0.0,
+            min_trend_prob=float(final_min_trend_prob),
+            use_trend_gate=bool(final_use_trend_gate),
+            use_regime_gate=bool(final_use_regime_gate),
+            min_regime_prob=float(final_min_regime_prob),
+            allow_regime_ranging=bool(allow_regime_ranging),
+            allow_regime_trend_up=bool(allow_regime_trend_up),
+            allow_regime_trend_down=bool(allow_regime_trend_down),
+            allow_regime_volatile=bool(allow_regime_volatile),
+            regime_align_direction=bool(regime_align_direction),
             min_bounce_prob=float(args.min_bounce_prob),
             max_bounce_prob=float(args.max_bounce_prob),
             trade_side=str(args.trade_side),
@@ -2059,7 +2155,11 @@ def main() -> None:
             stop_padding_pct=float(args.stop_padding_pct),
             take_profit_rr=float(args.take_profit_rr),
             use_dynamic_rr=bool(args.use_dynamic_rr),
-            use_calibration=bool(args.use_calibration),
+            use_calibration=bool(final_use_calibration),
+            use_ev_gate=bool(final_use_ev_gate),
+            ev_margin_r=float(final_ev_margin_r),
+            fee_percent=float(final_fee_percent),
+            use_expected_rr=bool(final_use_expected_rr),
             use_incremental=True,
             cooldown_bars_after_stop=int(args.cooldown_bars_after_stop),
             update_interval=0.0,
@@ -2075,9 +2175,10 @@ def main() -> None:
             test_end_bar_time=test_end_bar_time,
         )
 
-        sim_trader.config.labels.touch_threshold_atr = float(args.touch_threshold_atr)
+        sim_trader.config.labels.pullback_threshold = float(final_touch_threshold)
+        sim_trader.config.labels.touch_threshold_atr = float(final_touch_threshold)
         if sim_trader.predictor and sim_trader.predictor.incremental_engine:
-            sim_trader.predictor.incremental_engine.touch_threshold_atr = float(args.touch_threshold_atr)
+            sim_trader.predictor.incremental_engine.touch_threshold_atr = float(final_touch_threshold)
 
         touch_snapshot = {} if args.dump_touch_diffs else None
         bar_snapshot = {} if report_handle is not None else None
@@ -2149,14 +2250,31 @@ def main() -> None:
         fprint(f"lookback_days: {cfg.data.lookback_days}")
         fprint(f"ema_touch_mode: {args.ema_touch_mode}")
         fprint(f"pullback_ema: {pullback_ema}")
-        fprint(f"touch_threshold_atr: {args.touch_threshold_atr}")
+        fprint(f"touch_threshold_atr: {final_touch_threshold}")
         fprint(f"stop_loss_atr: {args.stop_loss_atr}")
         fprint(f"take_profit_rr: {args.take_profit_rr}")
         fprint(f"min_bounce_prob: {args.min_bounce_prob}")
         fprint(f"max_bounce_prob: {args.max_bounce_prob}")
+        fprint(f"use_trend_gate: {final_use_trend_gate}")
+        fprint(f"min_trend_prob: {final_min_trend_prob}")
+        fprint(f"use_regime_gate: {final_use_regime_gate}")
+        fprint(f"min_regime_prob: {final_min_regime_prob}")
+        fprint(
+            "regime_allowed: ranging={} trend_up={} trend_down={} volatile={} align_dir={}".format(
+                allow_regime_ranging,
+                allow_regime_trend_up,
+                allow_regime_trend_down,
+                allow_regime_volatile,
+                regime_align_direction,
+            )
+        )
+        fprint(f"use_ev_gate: {final_use_ev_gate}")
+        fprint(f"ev_margin_r: {final_ev_margin_r}")
+        fprint(f"fee_percent: {final_fee_percent}")
+        fprint(f"use_expected_rr: {final_use_expected_rr}")
         fprint(f"trade_side: {args.trade_side}")
         fprint(f"use_dynamic_rr: {args.use_dynamic_rr}")
-        fprint(f"use_calibration: {args.use_calibration}")
+        fprint(f"use_calibration: {final_use_calibration}")
         fprint(f"cooldown_bars_after_stop: {args.cooldown_bars_after_stop}")
         fprint(f"entry_fill_mode: {args.entry_fill_mode}")
         fprint(f"feature_cols_count: {len(feature_cols)}")
