@@ -8,6 +8,7 @@ metrics and artifacts as the original backtest module.
 from __future__ import annotations
 
 import json
+import sys
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -182,6 +183,22 @@ def _estimate_span_days(data: pd.DataFrame, base_tf_seconds: Optional[float]) ->
     return 0.0
 
 
+def _get_bar_times(data: pd.DataFrame) -> Optional[np.ndarray]:
+    if "bar_time" in data.columns:
+        times = pd.to_numeric(data["bar_time"], errors="coerce").to_numpy(dtype=float)
+        mask = np.isfinite(times)
+        if mask.any():
+            return np.where(mask, times.astype(np.int64), -1)
+        return None
+    if "datetime" in data.columns:
+        dt = pd.to_datetime(data["datetime"], errors="coerce")
+        if dt.notna().any():
+            raw = (dt.view("int64") // 1_000_000_000).astype(np.int64)
+            mask = dt.notna().to_numpy()
+            return np.where(mask, raw, -1)
+    return None
+
+
 def _compute_fee_r_series(
     data: pd.DataFrame,
     base_tf: str,
@@ -202,6 +219,19 @@ def _compute_fee_r_series(
         fee_r[mask] = (fee_percent * close_vals[mask]) / denom[mask]
         fallback_mask[mask] = False
     return fee_r, fallback_mask
+
+
+def _confirm_continue(message: str) -> bool:
+    try:
+        if not sys.stdin.isatty():
+            print(message)
+            print("Proceeding without prompt (non-interactive).")
+            return True
+    except Exception:
+        print(message)
+        return True
+    resp = input(f"{message} Continue? [y/N]: ").strip().lower()
+    return resp in ("y", "yes")
 
 
 def _build_feature_frame(data: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
@@ -427,6 +457,12 @@ def _simulate_single_position_trades(
     fallback_outcomes: np.ndarray,
     opposite_policy: str,
     bars_to_exit: np.ndarray,
+    bar_times: Optional[np.ndarray] = None,
+    trade_index: Optional[Any] = None,
+    use_intrabar: bool = False,
+    expected_rr: Optional[np.ndarray] = None,
+    use_expected_rr: bool = False,
+    target_rr: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
     if trade_mask.size == 0:
         return np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=float), []
@@ -446,6 +482,14 @@ def _simulate_single_position_trades(
         realized_r = fallback_outcomes
     else:
         realized_r = np.where(np.isfinite(realized_r), realized_r, fallback_outcomes)
+
+    intrabar_enabled = bool(use_intrabar and trade_index is not None and bar_times is not None)
+    bar_times_arr = None
+    if intrabar_enabled:
+        bar_times_arr = np.asarray(bar_times, dtype=np.int64)
+        if bar_times_arr.shape[0] != close_vals.shape[0]:
+            intrabar_enabled = False
+            bar_times_arr = None
 
     trade_indices: List[int] = []
     exit_positions: List[int] = []
@@ -478,38 +522,99 @@ def _simulate_single_position_trades(
         bars_exit = int(max(1, bars_to_exit[i]))
         natural_exit_pos = min(entry_pos + bars_exit, close_vals.size - 1)
 
+        effective_rr = float(target_rr)
+        if use_expected_rr and expected_rr is not None:
+            if expected_rr.size > i and expected_rr[i] > 0:
+                effective_rr = float(expected_rr[i])
+        stop_price = entry_price - (direction * stop_dist)
+        target_price = entry_price + (direction * stop_dist * effective_rr)
+
+        next_flip_idx = None
+        next_flip_pos = None
         flipped = False
         if opposite_policy in {"flip", "close"}:
             j = i + 1
             while j < n and pullback_pos[j] <= natural_exit_pos:
                 if trade_mask[j] and int(trend_dir[j]) == -direction:
-                    exit_pos = int(pullback_pos[j])
-                    exit_price = close_vals[exit_pos]
-                    if direction == 1:
-                        realized = (exit_price - entry_price) / stop_dist
-                    else:
-                        realized = (entry_price - exit_price) / stop_dist
-                    returns.append(float(realized))
-                    trade_indices.append(i)
-                    exit_positions.append(exit_pos)
-                    exit_reasons.append("flip" if opposite_policy == "flip" else "close")
-                    if opposite_policy == "flip":
-                        i = j
-                    else:
-                        i = j + 1
-                    flipped = True
+                    next_flip_idx = j
+                    next_flip_pos = int(pullback_pos[j])
                     break
                 j += 1
+
+        if intrabar_enabled and bar_times_arr is not None:
+            check_end = natural_exit_pos
+            if next_flip_pos is not None:
+                check_end = min(check_end, next_flip_pos)
+            exit_pos = None
+            exit_reason = None
+            realized = None
+            if check_end > entry_pos:
+                for bar_pos in range(entry_pos + 1, check_end + 1):
+                    bar_time = int(bar_times_arr[bar_pos])
+                    if bar_time < 0:
+                        continue
+                    exit_code, exit_price = trade_index.check_exit(
+                        bar_time,
+                        int(direction),
+                        float(stop_price),
+                        float(target_price),
+                    )
+                    if exit_code == 1 or exit_code == 2:
+                        exit_pos = bar_pos
+                        exit_reason = "stop_loss" if exit_code == 1 else "take_profit"
+                        if direction == 1:
+                            realized = (exit_price - entry_price) / stop_dist
+                        else:
+                            realized = (entry_price - exit_price) / stop_dist
+                        break
+            if exit_pos is not None:
+                returns.append(float(realized))
+                trade_indices.append(i)
+                exit_positions.append(int(exit_pos))
+                exit_reasons.append(str(exit_reason))
+                k = i + 1
+                while k < n and pullback_pos[k] <= exit_pos:
+                    k += 1
+                i = k
+                continue
+
+        if next_flip_pos is not None and next_flip_idx is not None:
+            exit_pos = int(next_flip_pos)
+            exit_price = close_vals[exit_pos]
+            if direction == 1:
+                realized = (exit_price - entry_price) / stop_dist
+            else:
+                realized = (entry_price - exit_price) / stop_dist
+            returns.append(float(realized))
+            trade_indices.append(i)
+            exit_positions.append(exit_pos)
+            exit_reasons.append("flip" if opposite_policy == "flip" else "close")
+            if opposite_policy == "flip":
+                i = next_flip_idx
+            else:
+                i = next_flip_idx + 1
+            flipped = True
 
         if flipped:
             continue
 
-        returns.append(float(realized_r[i]))
+        if intrabar_enabled:
+            exit_pos = int(natural_exit_pos)
+            exit_price = close_vals[exit_pos]
+            if direction == 1:
+                realized = (exit_price - entry_price) / stop_dist
+            else:
+                realized = (entry_price - exit_price) / stop_dist
+        else:
+            realized = float(realized_r[i])
+            exit_pos = int(natural_exit_pos)
+
+        returns.append(float(realized))
         trade_indices.append(i)
-        exit_positions.append(int(natural_exit_pos))
+        exit_positions.append(int(exit_pos))
         exit_reasons.append("timeout")
         k = i + 1
-        while k < n and pullback_pos[k] <= natural_exit_pos:
+        while k < n and pullback_pos[k] <= exit_pos:
             k += 1
         i = k
 
@@ -568,6 +673,8 @@ def run_tuned_backtest(
     initial_capital: float = 10000.0,
     position_size_pct: float = 0.02,
     ema_touch_mode: str = "multi",
+    use_intrabar: bool = True,
+    confirm_missing_models: bool = True,
 ) -> BacktestResult:
     result = BacktestResult()
     if data is None or len(data) == 0:
@@ -621,13 +728,31 @@ def run_tuned_backtest(
     X_base = test_df.reindex(columns=feature_cols).fillna(0)
     trend_pred = None
     trend_model = getattr(models, "trend_classifier", None)
+    regime_model = getattr(models, "regime_classifier", None)
+    missing_models: List[str] = []
+    if trend_model is None or getattr(trend_model, "model", None) is None:
+        missing_models.append("trend_classifier")
+    if regime_model is None or getattr(regime_model, "model", None) is None:
+        missing_models.append("regime_classifier")
+    if missing_models:
+        warning = (
+            "WARNING: Missing models for context features: "
+            + ", ".join(missing_models)
+            + ". Context probabilities will be zeros, which can drift results."
+        )
+        if confirm_missing_models:
+            if not _confirm_continue(warning):
+                print("Backtest aborted by user.")
+                return result
+        else:
+            print(warning)
+
     if trend_model is not None and getattr(trend_model, "model", None) is not None:
         trend_features = getattr(trend_model, "feature_names", None) or feature_cols
         X_trend = _build_feature_frame(test_df, list(trend_features))
         trend_pred = trend_model.predict(X_trend)
 
     regime_pred = None
-    regime_model = getattr(models, "regime_classifier", None)
     if regime_model is not None and getattr(regime_model, "model", None) is not None:
         regime_features = getattr(regime_model, "feature_names", None) or feature_cols
         X_regime = _build_feature_frame(test_df, list(regime_features))
@@ -685,22 +810,24 @@ def run_tuned_backtest(
     allow_regime_volatile = bool(getattr(config.labels, "allow_regime_volatile", True))
 
     trend_prob_dir = np.zeros_like(trend_dir, dtype=float)
-    if trend_gate_enabled and trend_pred is not None:
+    if trend_pred is not None:
         sliced = _slice_pred(trend_pred, pullback_mask)
         if sliced is not None:
             prob_up = np.asarray(sliced.get("prob_up", np.zeros_like(trend_dir, dtype=float)))
             prob_down = np.asarray(sliced.get("prob_down", np.zeros_like(trend_dir, dtype=float)))
-            trend_prob_dir = np.where(trend_dir == 1, prob_up, np.where(trend_dir == -1, prob_down, 0.0))
-            trend_gate_mask = (trend_prob_dir >= min_trend_prob) & direction_mask
-        else:
-            trend_gate_mask = direction_mask
+            prob_neutral = np.asarray(sliced.get("prob_neutral", np.zeros_like(trend_dir, dtype=float)))
+            trend_prob_dir = np.where(trend_dir == 1, prob_up, np.where(trend_dir == -1, prob_down, prob_neutral))
+
+    if trend_gate_enabled and trend_pred is not None:
+        trend_gate_mask = (trend_prob_dir >= min_trend_prob) & direction_mask
     else:
         trend_gate_mask = direction_mask
 
     regime_prob_dir = np.zeros_like(trend_dir, dtype=float)
     regime_gate_mask = np.ones_like(direction_mask, dtype=bool)
     regime_id_counts: Dict[int, int] = {}
-    if regime_gate_enabled and regime_pred is not None:
+    regimes = None
+    if regime_pred is not None:
         sliced = _slice_pred(regime_pred, pullback_mask)
         if sliced is not None:
             regimes = np.asarray(sliced.get("regime", np.zeros_like(trend_dir, dtype=int)))
@@ -713,19 +840,21 @@ def run_tuned_backtest(
                 prob_ranging,
                 np.where(regimes == 1, prob_trend_up, np.where(regimes == 2, prob_trend_down, prob_volatile)),
             )
-            allowed_mask = np.zeros_like(direction_mask, dtype=bool)
-            allowed_mask = np.where(regimes == 0, allow_regime_ranging, allowed_mask)
-            allowed_mask = np.where(regimes == 1, allow_regime_trend_up, allowed_mask)
-            allowed_mask = np.where(regimes == 2, allow_regime_trend_down, allowed_mask)
-            allowed_mask = np.where(regimes == 3, allow_regime_volatile, allowed_mask)
-            if regime_align_direction:
-                align_mask = np.ones_like(direction_mask, dtype=bool)
-                align_mask = np.where(regimes == 1, trend_dir == 1, align_mask)
-                align_mask = np.where(regimes == 2, trend_dir == -1, align_mask)
-                allowed_mask = allowed_mask & align_mask
-            regime_gate_mask = (regime_prob_dir >= min_regime_prob) & allowed_mask & direction_mask
             for regime_id in regimes.tolist():
                 regime_id_counts[regime_id] = regime_id_counts.get(regime_id, 0) + 1
+
+    if regime_gate_enabled and regime_pred is not None and regimes is not None:
+        allowed_mask = np.zeros_like(direction_mask, dtype=bool)
+        allowed_mask = np.where(regimes == 0, allow_regime_ranging, allowed_mask)
+        allowed_mask = np.where(regimes == 1, allow_regime_trend_up, allowed_mask)
+        allowed_mask = np.where(regimes == 2, allow_regime_trend_down, allowed_mask)
+        allowed_mask = np.where(regimes == 3, allow_regime_volatile, allowed_mask)
+        if regime_align_direction:
+            align_mask = np.ones_like(direction_mask, dtype=bool)
+            align_mask = np.where(regimes == 1, trend_dir == 1, align_mask)
+            align_mask = np.where(regimes == 2, trend_dir == -1, align_mask)
+            allowed_mask = allowed_mask & align_mask
+        regime_gate_mask = (regime_prob_dir >= min_regime_prob) & allowed_mask & direction_mask
 
     gate_mask = trend_gate_mask & regime_gate_mask & direction_mask
     gate_rejected_trend = int(np.sum(direction_mask & ~trend_gate_mask))
@@ -758,6 +887,23 @@ def run_tuned_backtest(
     if use_expected_rr:
         rr_mean = np.asarray(preds.get("expected_rr_mean", rr_mean), dtype=float)
         rr_cons = np.asarray(preds.get("expected_rr", rr_mean), dtype=float)
+
+    trade_index = None
+    bar_times = None
+    intrabar_enabled = False
+    if use_intrabar:
+        bar_times = _get_bar_times(test_df)
+        if bar_times is not None:
+            try:
+                import rust_pipeline_bridge as rust_bridge  # type: ignore
+                if rust_bridge.is_available():
+                    trade_index = rust_bridge.build_trade_index(config)
+                    intrabar_enabled = True
+            except Exception:
+                trade_index = None
+                intrabar_enabled = False
+        if not intrabar_enabled:
+            print("WARNING: Intrabar checks unavailable; using labeled outcomes for exits.")
 
     median_atr_percent = _median_atr_percent(test_df, base_tf)
     fallback_fee_r = float(fee_percent) / (float(config.labels.stop_atr_multiple) * median_atr_percent)
@@ -880,6 +1026,12 @@ def run_tuned_backtest(
             outcomes_r,
             opposite_signal_policy,
             bars_to_exit.astype(int),
+            bar_times=bar_times,
+            trade_index=trade_index,
+            use_intrabar=intrabar_enabled,
+            expected_rr=rr_cons,
+            use_expected_rr=use_expected_rr,
+            target_rr=float(target_rr),
         )
     else:
         if realized_r is not None and realized_r.size == probs.size:
@@ -1041,6 +1193,7 @@ def run_tuned_backtest(
     }
 
     diag: Dict[str, Any] = {"feature_audit": feature_audit}
+    diag["intrabar_used"] = bool(intrabar_enabled)
     if trend_prob_dir.size > 0:
         diag.update({
             "trend_prob_checked_count": float(trend_prob_dir.size),

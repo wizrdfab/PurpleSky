@@ -1660,6 +1660,7 @@ class ConfigTuner:
                 opposite_signal_policy=str(self.opposite_signal_policy),
                 max_holding_bars=max_holding_bars,
                 ema_touch_mode="multi",
+                confirm_missing_models=False,
             )
             print_backtest_results(test_res)
             test_metrics = self._summarize_backtest_result(test_res)
@@ -1703,6 +1704,7 @@ class ConfigTuner:
                     opposite_signal_policy=str(self.opposite_signal_policy),
                     max_holding_bars=max_holding_bars,
                     ema_touch_mode="multi",
+                    confirm_missing_models=False,
                 )
                 print_backtest_results(shadow_res)
                 shadow_metrics = self._summarize_backtest_result(shadow_res)

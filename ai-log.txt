@@ -3755,3 +3755,52 @@ Changes Made:
 1. Added rust_pipeline/target/ to .gitignore.
 
 Testing: Not tested (configuration only).
+----------------------------------------------------------------------
+v2.80 (Default Intrabar Backtest - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 15:06
+Files Modified:
+- backtest_tuned_config.py:185-600 - Added bar time extraction and intrabar TP/SL checks using rust TradeIndex.
+- backtest_tuned_config.py:662-1000 - Enabled intrabar checks by default and wired TradeIndex + bar times into trade simulation.
+- backtest_tuned_config.py:1155-1162 - Logged intrabar usage in diagnostics.
+
+Original Intent: User requested intrabar checks to be the default for all backtests.
+
+Changes Made:
+1. Added bar-time extraction and TradeIndex integration for intrabar TP/SL ordering.
+2. Updated single-position trade simulation to use intrabar exits with flip/timeout handling and expected RR targets.
+3. Enabled intrabar checks by default with safe fallback when the Rust trade index is unavailable.
+
+Testing: AST parse (python - <<'PY' ... ast.parse("backtest_tuned_config.py") ...).
+----------------------------------------------------------------------
+v2.81 (Backtest Missing Model Warning - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 15:36
+Files Modified:
+- backtest_tuned_config.py:224-747 - Added confirmation prompt when trend/regime models are missing; logs warning and can abort.
+- config_tuner.py:1663, 1707 - Disabled missing-model prompts during automated selection backtests.
+
+Original Intent: User requested a warning + confirmation when trend/regime models are missing for backtest.
+
+Changes Made:
+1. Added a confirmation helper and missing-model detection in tuned backtests.
+2. Suppressed prompts for automated selection runs to avoid blocking.
+
+Testing: AST parse (python - <<'PY' ... ast.parse("backtest_tuned_config.py","config_tuner.py") ...).
+----------------------------------------------------------------------
+v2.82 (Always Report Context Probs - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 15:59
+Files Modified:
+- backtest_tuned_config.py:720-820 - Compute trend/regime probabilities regardless of gate flags for diagnostics.
+
+Original Intent: User requested trend/regime probabilities always be shown since context features are still used.
+
+Changes Made:
+1. Compute trend/regime probability arrays even when gates are off.
+2. Keep gate masks conditional while diagnostics always reflect actual probabilities.
+
+Testing: AST parse (python - <<'PY' ... ast.parse("backtest_tuned_config.py") ...).
