@@ -143,6 +143,8 @@ def _load_train_config_meta(model_dir: Path) -> Dict[str, Any]:
     meta = {}
     if "tuning_summary_path" in data:
         meta["tuning_summary_path"] = data["tuning_summary_path"]
+    if "entry_feature_readiness" in data:
+        meta["entry_feature_readiness"] = data["entry_feature_readiness"]
     return meta
 
 
@@ -160,6 +162,8 @@ def _load_train_config_meta_from_path(config_path: Path) -> Dict[str, Any]:
     meta = {}
     if "tuning_summary_path" in data:
         meta["tuning_summary_path"] = data["tuning_summary_path"]
+    if "entry_feature_readiness" in data:
+        meta["entry_feature_readiness"] = data["entry_feature_readiness"]
     return meta
 
 
@@ -1167,6 +1171,7 @@ def main():
 
     base_model_dir = Path(args.model_dir)
     train_meta: Dict[str, Any] = {}
+    entry_readiness: Optional[Dict[str, Any]] = None
     train_config_path: Optional[Path] = None
     study_name: Optional[str] = None
     study_dir: Optional[Path] = None
@@ -1188,6 +1193,7 @@ def main():
         if not train_config_path.exists():
             raise SystemExit(f"Train config not found: {train_config_path}")
         train_meta = _load_train_config_meta_from_path(train_config_path)
+        entry_readiness = train_meta.get("entry_feature_readiness") if isinstance(train_meta, dict) else None
         loaded_cfg = _load_train_config_from_path(train_config_path)
         if loaded_cfg is None:
             raise SystemExit(f"Failed to load train config: {train_config_path}")
@@ -1350,7 +1356,7 @@ def main():
             raise SystemExit("--train-from-tuning requires a non-zero validation split (set --val-ratio > 0).")
 
         print(f"Training models from tuning summary: {tuning_path}")
-        run_training_pipeline(
+        train_results, _, _, _, _ = run_training_pipeline(
             tuned_cfg,
             enable_diagnostics=False,
             two_pass=bool(args.two_pass),
@@ -1358,11 +1364,15 @@ def main():
             use_seed_ensemble=bool(args.use_seed_ensemble),
             n_ensemble_seeds=int(args.n_ensemble_seeds),
         )
+        entry_readiness = train_results.get("entry_feature_readiness") if isinstance(train_results, dict) else None
         train_config_path = Path(study_dir) / f"{_TRAIN_CONFIG_PREFIX}_{trial_number}.json"
         _save_train_config_path(
             tuned_cfg,
             train_config_path,
-            extra_meta={"tuning_summary_path": str(tuning_path)},
+            extra_meta={
+                "tuning_summary_path": str(tuning_path),
+                "entry_feature_readiness": entry_readiness,
+            },
         )
         print("Training done. Saving models to", tuned_cfg.model.model_dir)
         return
@@ -1542,7 +1552,7 @@ def main():
 
         if args.tune_then_train:
             print("\nTraining models using best config from tuning...")
-            run_training_pipeline(
+            train_results, _, _, _, _ = run_training_pipeline(
                 best_cfg,
                 enable_diagnostics=False,
                 two_pass=bool(args.two_pass),
@@ -1550,11 +1560,15 @@ def main():
                 use_seed_ensemble=bool(args.use_seed_ensemble),
                 n_ensemble_seeds=int(args.n_ensemble_seeds),
             )
+            entry_readiness = train_results.get("entry_feature_readiness") if isinstance(train_results, dict) else None
             train_config_path = study_dir / f"{_TRAIN_CONFIG_PREFIX}_{best_trial_number}.json"
             _save_train_config_path(
                 best_cfg,
                 train_config_path,
-                extra_meta={"tuning_summary_path": str(summary_path)},
+                extra_meta={
+                    "tuning_summary_path": str(summary_path),
+                    "entry_feature_readiness": entry_readiness,
+                },
             )
             print("Training done. Saving models to", best_cfg.model.model_dir)
         else:
@@ -1562,7 +1576,7 @@ def main():
         return
     else:
         print("Training models...")
-        run_training_pipeline(
+        train_results, _, _, _, _ = run_training_pipeline(
             cfg,
             enable_diagnostics=False,
             two_pass=bool(args.two_pass),
@@ -1570,9 +1584,15 @@ def main():
             use_seed_ensemble=bool(args.use_seed_ensemble),
             n_ensemble_seeds=int(args.n_ensemble_seeds),
         )
-        _save_train_config(cfg, cfg.model.model_dir)
+        entry_readiness = train_results.get("entry_feature_readiness") if isinstance(train_results, dict) else None
+        _save_train_config(
+            cfg,
+            cfg.model.model_dir,
+            extra_meta={"entry_feature_readiness": entry_readiness},
+        )
         train_config_path = Path(cfg.model.model_dir) / _TRAIN_CONFIG_FILENAME
         train_meta = _load_train_config_meta(cfg.model.model_dir)
+        entry_readiness = train_meta.get("entry_feature_readiness") if isinstance(train_meta, dict) else None
         print("Training done. Saving models to", cfg.model.model_dir)
 
     if args.train_only:
@@ -1882,6 +1902,7 @@ def main():
         opposite_signal_policy="flip",
         max_holding_bars=max_holding_bars,
         ema_touch_mode=str(args.ema_touch_mode),
+        entry_feature_readiness=entry_readiness,
     )
     print_backtest_results(res)
 

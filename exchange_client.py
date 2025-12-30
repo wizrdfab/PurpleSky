@@ -37,13 +37,31 @@ class Position:
     take_profit: Optional[float] = None
 
 
+DEFAULT_RECV_WINDOW_MS = 10000
+
+
 class BybitClient:
     """Small convenience wrapper around pybit.HTTP for unified trading."""
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True, category: str = "linear"):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = True,
+        category: str = "linear",
+        recv_window_ms: int = DEFAULT_RECV_WINDOW_MS,
+        timeout_sec: int = 10,
+    ):
         self.testnet = testnet
         self.category = category
-        self.session = HTTP(testnet=testnet, api_key=api_key, api_secret=api_secret)
+        self.recv_window_ms = int(recv_window_ms)
+        self.session = HTTP(
+            testnet=testnet,
+            api_key=api_key,
+            api_secret=api_secret,
+            recv_window=self.recv_window_ms,
+            timeout=timeout_sec,
+        )
 
     # ------------------------------------------------------------------ utils
     def _to_float(self, value, default: float = 0.0) -> float:
@@ -88,10 +106,12 @@ class BybitClient:
                 if bal is not None:
                     return bal
                 if logger:
-                    logger.warning(f"Balance attempt {acct} retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
+                    logger.warning(
+                        f"ALERT: Balance attempt {acct} retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}"
+                    )
             except Exception as exc:
                 if logger:
-                    logger.warning(f"Balance attempt {acct} error: {exc}")
+                    logger.warning(f"ALERT: Balance attempt {acct} error: {exc}")
                 continue
         return 0.0
 

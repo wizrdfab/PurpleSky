@@ -76,6 +76,8 @@ live_results_logs/
 live_results_funds_logs/
 live_results_funds/
 live_results_simulated/
+live_results/
+live_trader_logs/
 backtests-logs-at-close/
 backtests/
 
@@ -126,6 +128,7 @@ desktop.ini
 # ----------------------------------------------------------------------------
 pybit-master/
 rust_pipeline/target/
+CONTEXT_BRIDGE.md
 
 # ----------------------------------------------------------------------------
 # Local tooling and backups (do not commit)

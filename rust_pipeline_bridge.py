@@ -7,7 +7,7 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
 def is_available() -> bool:
@@ -23,6 +23,11 @@ def init_trades_cache(cfg) -> int:
         raise RuntimeError("Rust pipeline module is not available")
 
     import sofia_rust_pipeline
+    if not hasattr(sofia_rust_pipeline, "run_bars_memory_json"):
+        raise RuntimeError(
+            "Rust module missing run_bars_memory_json; rebuild sofia_rust_pipeline "
+            "in the same venv used to run live_trader.py."
+        )
 
     config_json = json.dumps(
         serialize_config(cfg),
@@ -160,3 +165,43 @@ def build_dataset_from_config(
 
     dataset = _read_arrow_dataset(dataset_path)
     return dataset, feature_cols, dataset_path
+
+
+def build_warmup_bars_from_config(cfg, max_bars: int) -> Dict[str, "object"]:
+    if not is_available():
+        raise RuntimeError("Rust pipeline module is not available")
+
+    import sofia_rust_pipeline
+    if not hasattr(sofia_rust_pipeline, "run_bars_memory_json"):
+        raise RuntimeError(
+            "Rust module missing run_bars_memory_json; rebuild sofia_rust_pipeline "
+            "in the same venv used to run live_trader.py."
+        )
+
+    max_bars_arg = int(max_bars) if max_bars is not None else None
+    config_json = json.dumps(
+        serialize_config(cfg),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    result = sofia_rust_pipeline.run_bars_memory_json(config_json, max_bars_arg)
+    bars_bytes = result.get("bars_bytes", {}) if isinstance(result, dict) else {}
+    if not isinstance(bars_bytes, dict):
+        raise RuntimeError("Rust pipeline returned invalid bars payload")
+
+    bars: Dict[str, "object"] = {}
+    for tf_name, raw in bars_bytes.items():
+        if raw is None:
+            continue
+        if isinstance(raw, memoryview):
+            raw = raw.tobytes()
+        bars[tf_name] = _read_arrow_bytes(raw)
+    return bars
+
+
+def clear_trades_cache() -> bool:
+    if not is_available():
+        return False
+    import sofia_rust_pipeline
+    sofia_rust_pipeline.clear_trades_cache()
+    return True

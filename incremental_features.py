@@ -834,6 +834,8 @@ class TimeframeState:
         swing_result = self.swing.update(h, l, c, atr_val)
         features['dist_from_high'] = swing_result['dist_from_high']
         features['dist_from_low'] = swing_result['dist_from_low']
+        features['swing_high'] = bool(swing_result.get('is_swing_high', False))
+        features['swing_low'] = bool(swing_result.get('is_swing_low', False))
 
         # Candle features
         if atr_val > 0:

@@ -4,8 +4,9 @@ Orchestrates data loading, feature engineering, labeling, and model training.
 """
 import pandas as pd
 import numpy as np
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List, Any
 import time
 
 from config import TrendFollowerConfig, DEFAULT_CONFIG
@@ -14,6 +15,9 @@ from feature_engine import calculate_multi_timeframe_features, get_feature_colum
 from labels import create_training_dataset, detect_pullback_zones
 from models import TrendFollowerModels, TrendClassifier, RegimeClassifier, append_context_features
 from diagnostic_logger import DiagnosticLogger
+
+
+ENTRY_READINESS_WINDOW = 3
 
 
 def _slice_pred(pred, mask):
@@ -26,6 +30,48 @@ def _slice_pred(pred, mask):
         if arr.shape[0] == mask_arr.shape[0]:
             sliced[key] = arr[mask_arr]
     return sliced
+
+
+def _compute_entry_feature_readiness(
+    data: pd.DataFrame,
+    feature_cols: List[str],
+    pullback_mask: pd.Series,
+    base_tf: str,
+    window: int,
+) -> Dict[str, Any]:
+    readiness: Dict[str, Any] = {
+        "version": 1,
+        "source": "entry_model",
+        "mode": "all_finite",
+        "window_bars": int(window),
+        "window_used": 0,
+        "ready_features": [],
+        "not_ready_features": list(feature_cols),
+        "pullback_rows": int(pullback_mask.sum()) if pullback_mask is not None else 0,
+        "base_timeframe": base_tf,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if pullback_mask is None or pullback_mask.sum() == 0:
+        return readiness
+
+    filtered = data.loc[pullback_mask, feature_cols]
+    if filtered.empty:
+        return readiness
+
+    tail = filtered.tail(int(window))
+    readiness["window_used"] = int(len(tail))
+    if tail.empty:
+        return readiness
+
+    numeric = tail.apply(pd.to_numeric, errors="coerce")
+    finite = np.isfinite(numeric.to_numpy())
+    ready_mask = finite.all(axis=0)
+    ready = list(numeric.columns[ready_mask])
+    not_ready = [col for col in numeric.columns if col not in ready]
+    readiness["ready_features"] = ready
+    readiness["not_ready_features"] = not_ready
+    return readiness
 
 
 def _oof_context_preds(model_cls, X, y, config: TrendFollowerConfig, n_folds: int = 3) -> Optional[Dict[str, np.ndarray]]:
@@ -127,6 +173,7 @@ def run_training_pipeline(
         Dictionary with training results and metrics
     """
     results = {}
+    entry_readiness: Optional[Dict[str, Any]] = None
     
     # Initialize diagnostic logger
     diag = DiagnosticLogger('./logs') if enable_diagnostics else None
@@ -413,6 +460,13 @@ def run_training_pipeline(
     # Get pullback samples
     pullback_mask_train = ~train_df['pullback_success'].isna()
     pullback_mask_val = (~val_df['pullback_success'].isna()) if len(val_df) else None
+    entry_readiness = _compute_entry_feature_readiness(
+        train_df,
+        feature_cols,
+        pullback_mask_train,
+        base_tf,
+        ENTRY_READINESS_WINDOW,
+    )
 
 
     if diag:
@@ -638,6 +692,13 @@ def run_training_pipeline(
         print("\n  Retraining Entry Quality Model on Train+Val...")
         start_time = time.time()
         pullback_mask_full = ~full_df['pullback_success'].isna()
+        entry_readiness = _compute_entry_feature_readiness(
+            full_df,
+            feature_cols,
+            pullback_mask_full,
+            base_tf,
+            ENTRY_READINESS_WINDOW,
+        )
         if pullback_mask_full.sum() > 100:
             X_entry_full = append_context_features(
                 X_full[pullback_mask_full],
@@ -737,6 +798,9 @@ def run_training_pipeline(
         log_path = diag.save()
         results['diagnostic_log'] = str(log_path)
     
+    if entry_readiness is not None:
+        results["entry_feature_readiness"] = entry_readiness
+
     return results, models, test_df, X_test, feature_cols
 
 

@@ -3573,6 +3573,74 @@ Changes Made:
 
 Testing: Not tested.
 ----------------------------------------------------------------------
+v3.20 (Session JSONL Logging - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 03:16
+Files Modified:
+- live_trader.py:74-321 - Added session log constants, JSON-safe helper, and alert capture handler.
+- live_trader.py:1206-1224 - Initialized session JSONL logging, event buffers, and top-feature list.
+- live_trader.py:1833-2056 - Added session logging helpers (start/bar/end entries, event drain, snapshots).
+- live_trader.py:2433-2507 - Ensured per-bar session logging after trading logic and readiness gate status.
+- live_trader.py:2510-2760 - Added gate-status diagnostics, model input capture, and top feature values.
+- live_trader.py:2788-3046 - Recorded position open/close/close-request events into session log.
+- live_trader.py:2360-2387, live_trader.py:3223-3226 - Finalized session log on stop and dry-run.
+- ai-log.txt:3576-3597 - Logged session JSONL changes.
+
+Original Intent: Add JSONL session logging per base bar with model diagnostics, top features, positions, and alerts/errors.
+
+Changes Made:
+1. Implemented JSONL session logging under `./live_trader_logs/<SYMBOL>/` with start, per-bar, and end entries.
+2. Logged top-20 entry features (from model importances when available) plus model outputs and gate status per bar.
+3. Captured open/close/close-request events and alerts/errors in the session log, finalizing on stop/dry-run.
+
+Testing: Not tested (user did not request execution).
+----------------------------------------------------------------------
+v3.21 (Status Highlight Color - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 03:33
+Files Modified:
+- live_trader.py:52-181 - Added brighter green color and applied it to Status lines.
+- ai-log.txt:3598-3612 - Logged status color change.
+
+Original Intent: User requested Status line color to be brighter green than Health.
+
+Changes Made:
+1. Added ANSI_BRIGHT_GREEN and applied it to Status log color formatting.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.22 (Ignore Live Outputs - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 03:37
+Files Modified:
+- .gitignore:79-80 - Ignored live_results/ and live_trader_logs/ output folders.
+- ai-log.txt:3614-3627 - Logged .gitignore update.
+
+Original Intent: Exclude live_results and live_trader_logs from version control.
+
+Changes Made:
+1. Added live_results/ and live_trader_logs/ to .gitignore.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v2.95 (WS Reconnect Backoff - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 19:46
+Files Modified:
+- live_trader.py:52-1054 - Added WebSocket health checks, reconnect/backoff logic, and updated health log output.
+
+Original Intent: User requested WS reconnect/backoff and emphasized robustness for live trading.
+
+Changes Made:
+1. Added configurable stale-data checks, reconnect attempts with exponential backoff, and health monitoring loop.
+2. Logged WS reconnect settings at startup and adjusted residual gap warning.
+
+Testing: Not tested (runtime behavior change).
+----------------------------------------------------------------------
 v2.69 (Shadow Min Trades Override - Dec 2025)
 ----------------------------------------------------------------------
 Agent: Codex
@@ -3804,3 +3872,573 @@ Changes Made:
 2. Keep gate masks conditional while diagnostics always reflect actual probabilities.
 
 Testing: AST parse (python - <<'PY' ... ast.parse("backtest_tuned_config.py") ...).
+----------------------------------------------------------------------
+v2.83 (Context Bridge Snapshot - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 16:16
+Files Modified:
+- AGENTS.md:55-59 - Added instructions for maintaining CONTEXT_BRIDGE.md.
+- CONTEXT_BRIDGE.md:1-16 - Added reset snapshot with current program state.
+
+Original Intent: User requested a context snapshot file and guidance for future resets.
+
+Changes Made:
+1. Documented the context bridge workflow in AGENTS.md.
+2. Added CONTEXT_BRIDGE.md with metadata + key state for next session.
+
+Testing: Not tested (documentation only).
+----------------------------------------------------------------------
+v2.84 (Ignore Context Bridge - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 16:17
+Files Modified:
+- .gitignore:65 - Ignore CONTEXT_BRIDGE.md.
+
+Original Intent: User requested CONTEXT_BRIDGE.md be ignored by git.
+
+Changes Made:
+1. Added CONTEXT_BRIDGE.md to .gitignore.
+
+Testing: Not tested (configuration only).
+----------------------------------------------------------------------
+v2.85 (Live Trader Alignment - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 17:57
+Files Modified:
+- live_trader.py:1-1068 - New live/paper trading module aligned with tuned backtest logic.
+- PROGRAM_OVERVIEW.md:44-45 - Replace live_trading_funds.py reference with live_trader.py.
+- PROGRAM_OVERVIEW.md:92-94 - Update live/paper trading workflow notes for live_trader.py.
+
+Original Intent: User requested a new live_trader.py that mirrors tuning/backtest logic, uses incremental features, requires train_config + tuning_summary, and updates PROGRAM_OVERVIEW.md.
+
+Changes Made:
+1. Implemented live_trader.py with incremental feature updates, tuned gating (EV, trend/regime), single-position + opposite policy handling, and live/paper execution flow with mandatory bootstrap.
+2. Updated PROGRAM_OVERVIEW.md to reference live_trader.py for live/paper trading.
+
+Testing: AST parse (python - <<'PY' ... ast.parse("live_trader.py") ...).
+----------------------------------------------------------------------
+v2.86 (Train/Tuning Guard - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 18:11
+Files Modified:
+- live_trader.py:489-503 - Added hard-fail guard for train config vs tuning summary mismatches.
+
+Original Intent: User requested a guard to ensure train config values match the tuning summary and to hard fail on mismatch.
+
+Changes Made:
+1. Compare train config values to tuning summary before applying summary overrides.
+2. Abort live trader startup with a detailed mismatch list when inconsistencies are found.
+
+Testing: Not tested (guard only).
+----------------------------------------------------------------------
+v2.87 (Tuning Summary Path Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 18:16
+Files Modified:
+- live_trader.py:489-500 - Resolve tuning summary path via train-config folder then repo root.
+
+Original Intent: User reported tuning summary path duplication and FileNotFoundError on startup.
+
+Changes Made:
+1. Added fallback resolution for relative tuning summary paths against repo root.
+2. Prefer first existing candidate to avoid duplicated path segments.
+
+Testing: Not tested (path resolution only).
+----------------------------------------------------------------------
+v2.88 (Trade Buffer Cap - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 18:36
+Files Modified:
+- live_trader.py:446-657 - Added bounded trade buffer with drop logging and CLI flag.
+- live_trader.py:1380-1403 - Added --max-pending-trades argument and wired to LiveTrader.
+
+Original Intent: User reported live_trader.py memory usage growing until exhaustion.
+
+Changes Made:
+1. Reworked TradeBuffer to use a capped deque and log when trades are dropped.
+2. Added --max-pending-trades to control buffer size and prevent unbounded growth.
+
+Testing: Not tested (memory fix only).
+----------------------------------------------------------------------
+v2.89 (Bounded Deque Buffer - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 18:41
+Files Modified:
+- live_trader.py:449-477 - Enforced deque maxlen so pending trade buffer cannot exceed cap.
+
+Original Intent: User reported memory still growing despite prior cap.
+
+Changes Made:
+1. Switched TradeBuffer to deque(maxlen=cap) to hard bound memory usage.
+2. Simplified overflow tracking to align with deque drop behavior.
+
+Testing: Not tested (buffer change only).
+----------------------------------------------------------------------
+v2.90 (Rust Warmup Bootstrap - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 19:18
+Files Modified:
+- rust_pipeline/src/pipeline.rs:360-1072 - Added Frame tail slicing and bars builder for warmup.
+- rust_pipeline/src/pipeline.rs:2452-2472 - Exposed write_arrow_bytes for memory bridge.
+- rust_pipeline/src/lib.rs:71-94 - Added run_bars_memory_json rust API export.
+- rust_pipeline_bridge.py:10,165-197 - Added warmup bars loader and clear_trades_cache helper.
+- live_trader.py:690-769 - Bootstrap now uses rust warmup bars with sufficiency checks and cache clear.
+- live_trader.py:17,37 - Imported IncrementalFeatureEngine; removed pandas bootstrap loader.
+
+Original Intent: User requested live_trader bootstrap use rust pipeline to avoid memory blowups and align with tuning/backtest.
+
+Changes Made:
+1. Added rust pipeline API to return per-timeframe bars in memory, with optional tail slicing.
+2. Added python bridge helpers to load warmup bars and clear rust caches.
+3. Switched live_trader bootstrap to rust warmup, validating bar availability before starting.
+
+Testing: Not tested (requires rebuilding rust module).
+----------------------------------------------------------------------
+v2.91 (Rust Len Export - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 19:25
+Files Modified:
+- rust_pipeline/src/pipeline.rs:262 - Exposed Frame.len() for rust lib export.
+
+Original Intent: Fix rust build error (private len method) for new warmup API.
+
+Changes Made:
+1. Made Frame.len() pub(crate) so lib.rs can access it.
+
+Testing: Not tested (awaiting rebuild).
+----------------------------------------------------------------------
+v2.96 (Live Robustness Guards - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 20:12
+Files Modified:
+- live_trader.py:59 - Added entry pause log interval constant for throttled pause logs.
+- live_trader.py:725-731 - Added reconnect cooldown log throttle and pause log tracking.
+- live_trader.py:1133-1176 - Added reconnect cooldown/backoff handling with attempt tracking.
+- live_trader.py:1193-1221 - Wired health checks to pause entries and emit heartbeat logs.
+- live_trader.py:1310-1326 - Skipped new entries when paused with throttled logging.
+- live_trader.py:1812-1842 - Added --dry-run flag for preflight-only runs.
+
+Original Intent: User requested stronger live_trader robustness (stale guards, reconnect/backoff, monitoring, and safe preflight).
+
+Changes Made:
+1. Added reconnect cooldown logic, attempt throttling, and pause-on-stale handling in the main loop.
+2. Added heartbeat monitoring for trade rate, latency, and reconnect tracking.
+3. Skipped entries while paused and added a dry-run CLI option for preflight checks.
+
+Testing: Not tested (behavioral changes only).
+----------------------------------------------------------------------
+v2.97 (Rust Warmup Guard - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 20:16
+Files Modified:
+- rust_pipeline_bridge.py:175-177 - Added guard for missing run_bars_memory_json in warmup loader.
+
+Original Intent: User hit AttributeError when rust module lacked run_bars_memory_json during warmup.
+
+Changes Made:
+1. Added a clear error message when the rust module is missing the warmup API to prompt rebuild in the active venv.
+
+Testing: Not tested (requires rust module rebuild).
+----------------------------------------------------------------------
+v2.98 (Cross-Platform Secrets Loader - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 20:30
+Files Modified:
+- live_trader.py:17-25 - Added keyring/secrets permission helper imports.
+- live_trader.py:100-243 - Added JSON secrets loader, strict permissions validation, keyring lookup, and credential resolver.
+- live_trader.py:828-841 - Resolved API keys via keyring/secrets/env/CLI before Bybit client init.
+- live_trader.py:1028-1035 - Logged API credential source in startup health summary.
+- live_trader.py:1971-2016 - Added --secrets-path and --keyring-service CLI options with resolver wiring.
+
+Original Intent: User requested a robust, cross-platform API key loading flow with keyring support and strict JSON file permissions.
+
+Changes Made:
+1. Implemented keyring -> JSON secrets -> env -> CLI credential resolution with safe logging.
+2. Enforced strict secrets file permissions (posix mode checks; Windows ACL check via icacls).
+3. Added CLI options for secrets path and keyring service selection.
+
+Testing: Not tested (requires runtime validation in target venvs).
+----------------------------------------------------------------------
+v2.99 (Entry Feature Readiness Snapshot - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 21:47
+Files Modified:
+- trainer.py:20,35-82,176,463-700,801-802 - Added entry readiness window, snapshot computation, and persisted metadata.
+- train.py:146-166,1174-1595,1905 - Saved readiness into train_config meta and passed into tuned backtest.
+- backtest_tuned_config.py:247-287,717-724,809-811 - Enforced readiness snapshot and applied strict masking in backtest.
+- live_trader.py:811-836,1031-1062,1137-1143,1600-1602 - Loaded readiness snapshot, enforced ready features, and masked non-ready features in live.
+
+Original Intent: User requested a rigorous readiness snapshot so live/backtest match the feature readiness state at training end, with strict masking and hard fail if missing.
+
+Changes Made:
+1. Computed entry feature readiness from the last N pullback rows (pre-fillna) and stored it in train_config.
+2. Required readiness metadata for backtest/live; masked non-ready features to zero to match training.
+3. Added readiness logging and validation in live_trader and backtest_tuned_config.
+
+Testing: Not tested (requires retraining or backfill to populate readiness snapshots).
+----------------------------------------------------------------------
+v3.00 (Warmup Readiness Gate - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 21:52
+Files Modified:
+- live_trader.py:1000-1019 - Allowed short TF bar counts when readiness snapshot exists; hard fail only on missing TF bars.
+
+Original Intent: User hit warmup failure for 4h bars despite readiness snapshot intent.
+
+Changes Made:
+1. Relaxed warmup bar-count enforcement when readiness snapshot is present, relying on feature readiness checks instead.
+2. Kept strict failure on missing timeframe bars to avoid partial warmup state.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.01 (Warmup Snapshot Override - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 21:55
+Files Modified:
+- live_trader.py:1018-1028 - Allowed incremental warmup to proceed with readiness snapshot when some TFs are short.
+
+Original Intent: Live dry-run stopped on incremental warmup despite readiness snapshot for short TF bars.
+
+Changes Made:
+1. Converted warmup failure into a warning when readiness snapshot exists, deferring gating to readiness checks.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.02 (Incremental Swing Flags - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 21:57
+Files Modified:
+- incremental_features.py:835-838 - Added swing_high/swing_low flags to incremental features.
+
+Original Intent: Live readiness check failed because incremental features lacked swing_high/low fields expected by the model.
+
+Changes Made:
+1. Emitted swing_high and swing_low booleans from the incremental swing detector to match training feature names.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v2.93 (Startup Health Log - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 19:38
+Files Modified:
+- live_trader.py:479-815 - Added startup health logging, warmup metadata tracking, and incremental warmup validation.
+- live_trader.py:608-667 - Avoided duplicate model loads by reusing TrendFollowerModels in predictor.
+
+Original Intent: User requested a startup health log and a robustness audit of live_trader.py.
+
+Changes Made:
+1. Added a structured startup health log with key config, gating, and warmup details.
+2. Stored warmup metadata (bar counts/range) and validated incremental warmup completion.
+3. Reused loaded models in the predictor to reduce duplicate memory use.
+
+Testing: Not tested (runtime behavior change).
+----------------------------------------------------------------------
+v2.94 (Health Gap Log + Rust API Guard - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 19:41
+Files Modified:
+- rust_pipeline_bridge.py:169-176 - Added guard for missing run_bars_memory_json with rebuild guidance.
+- live_trader.py:850-854 - Logged residual robustness gaps in startup health log.
+
+Original Intent: User asked to add the residual robustness gap note and hit missing rust API error.
+
+Changes Made:
+1. Added a clear error when rust module lacks run_bars_memory_json to avoid AttributeError.
+2. Logged the residual robustness gaps at startup as requested.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v2.92 (Rust Frame Visibility - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 19:27
+Files Modified:
+- rust_pipeline/src/pipeline.rs:243 - Made Frame struct pub(crate) for rust API exposure.
+
+Original Intent: Fix rust build errors for the warmup bars API due to private Frame type.
+
+Changes Made:
+1. Made Frame public within the crate so lib.rs can pass it through the API.
+
+Testing: Not tested (awaiting rebuild).
+----------------------------------------------------------------------
+v3.03 (Adaptive Warmup Retry - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 22:07
+Files Modified:
+- live_trader.py:64-1080 - Added adaptive warmup retries and predictor reinit to satisfy readiness features.
+
+Original Intent: Live warmup stopped with non-finite readiness features (atr_percentile/dist_from_high-low) after bootstrap.
+
+Changes Made:
+1. Added warmup retry constants and a predictor reinitialization helper.
+2. Retried bootstrap warmup with more bars until readiness features become finite or limits are reached.
+3. Raised a clear error when more bootstrap history is required.
+
+Testing: Not tested (requires live bootstrap data).
+----------------------------------------------------------------------
+v3.04 (Readiness Pause Gate - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 22:25
+Files Modified:
+- live_trader.py:698-1610 - Removed hard-fail on non-finite readiness features; added pause gate and readiness logging.
+
+Original Intent: Live bootstrap failed when ready features stayed non-finite (dist_from_high/low) even with more bars.
+
+Changes Made:
+1. Logged readiness gaps at warmup completion instead of exiting.
+2. Added readiness pause gate that skips entries until required features are finite.
+3. Logged readiness status in the startup health summary and on state changes.
+
+Testing: Not tested (requires live bootstrap run).
+----------------------------------------------------------------------
+v3.05 (Bybit Recv Window Control - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 22:33
+Files Modified:
+- exchange_client.py:40-62 - Added recv_window_ms default and passed to pybit HTTP client.
+- live_trader.py:42,685-701,862,1166,2131-2184 - Exposed recv_window_ms in live trader, CLI, and health log.
+
+Original Intent: Avoid Bybit ErrCode 10002 timestamp/recv_window errors during startup by setting a safer recv_window.
+
+Changes Made:
+1. Configured BybitClient to use a 10s recv_window by default with an explicit parameter.
+2. Added --recv-window-ms CLI option and wired it through LiveTrader.
+3. Logged recv_window_ms in the startup health summary for visibility.
+
+Testing: Not tested (requires live API call).
+----------------------------------------------------------------------
+v3.06 (Clock Skew Diagnostic - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 22:48
+Files Modified:
+- live_trader.py:925,1249-1296 - Logged a one-time clock-skew diagnostic on startup using Bybit server time.
+
+Original Intent: User requested a startup diagnostic to quantify local vs server clock skew.
+
+Changes Made:
+1. Added a startup clock-skew check that logs local/server timestamps and warns if skew exceeds 2 seconds.
+2. Hooked the diagnostic into startup right after the health summary.
+
+Testing: Not tested (requires live API connectivity).
+----------------------------------------------------------------------
+v3.07 (Model Dir Guard + Pause Clarity - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 23:15
+Files Modified:
+- live_trader.py:347-360 - Prevented tuning summary model_dir from overriding train_config model_dir.
+- live_trader.py:1343-1351 - Only clear pause on data-resume for connectivity pauses, not readiness.
+
+Original Intent: Log showed model_dir overriding train_config and entry pause toggling on data resume.
+
+Changes Made:
+1. Kept model_dir sourced from train_config unless explicitly overridden via CLI.
+2. Avoided clearing readiness pauses on incoming trade data to keep pause state accurate.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.08 (Console UX + Manual Pause Controls - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-29 23:30
+Files Modified:
+- live_trader.py:60-2445 - Added ANSI color formatter, console clear, and keyboard pause/resume overrides.
+
+Original Intent: Improve console clarity with colors, clear screen on startup, and add P/R hotkeys to pause or override readiness.
+
+Changes Made:
+1. Added ANSI color formatting (Health=green, Heartbeat=red, INFO=orange, WARNING=yellow) for console output only.
+2. Added cross-platform console clear at startup (cls/clear).
+3. Added keyboard listener to pause entries with P and override readiness with R.
+
+Testing: Not tested (requires interactive console).
+----------------------------------------------------------------------
+v3.09 (Console Colors + Status/Diagnostics - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 00:31
+Files Modified:
+- live_trader.py:63-2437 - Updated console color scheme (grey INFO, orange Heartbeat), added status lines, balance refresh, latency alerts, and per-bar model diagnostics.
+
+Original Intent: Improve console clarity (grey INFO), color heartbeat orange, add status/position + account funds display, and log per-bar prediction diagnostics with red alerts on out-of-bounds/unsafe conditions.
+
+Changes Made:
+1. Set default/INFO output to grey, Heartbeat to orange, Health to green; added red ALERT tagging for unsafe conditions.
+2. Added 15-minute account balance refresh and periodic status line with position/balance info.
+3. Logged per-base-bar model diagnostics (probabilities, EV, gates, decisions) and added alert checks for latency/probabilities/stop-tp bounds and API failures.
+
+Testing: Not tested (requires interactive console + live stream).
+----------------------------------------------------------------------
+v3.10 (Bold Console Emphasis - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 00:32
+Files Modified:
+- live_trader.py:133-170 - Applied bold styling to console output for improved readability.
+
+Original Intent: User requested larger-looking console text; bold styling approximates this cross-platform.
+
+Changes Made:
+1. Made colored console output bold to improve readability without changing terminal font size.
+
+Testing: Not tested (requires interactive console).
+----------------------------------------------------------------------
+v3.11 (API Error Alerts - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 00:32
+Files Modified:
+- exchange_client.py:82-104 - Prefixed balance API error logs with ALERT for red highlighting.
+
+Original Intent: Ensure API error responses show in red per console alert rules.
+
+Changes Made:
+1. Added ALERT prefix to balance API warning logs so they render as red alerts in console.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.12 (Status Age UTC Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 00:33
+Files Modified:
+- live_trader.py:1641-1655 - Used UTC deltas for position age in status line.
+
+Original Intent: Ensure position age in status line is not skewed by local timezone settings.
+
+Changes Made:
+1. Calculated position age using datetime.utcnow() minus entry_time (both UTC-naive).
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.13 (Syntax Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 00:35
+Files Modified:
+- live_trader.py:2023-2027 - Fixed malformed f-string in readiness diagnostic.
+
+Original Intent: Resolve SyntaxError caused by an escaped f-string in readiness logging.
+
+Changes Made:
+1. Corrected the f-string literal for ATR key lookup.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.14 (Console Alignment + Font Attempt - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 00:51
+Files Modified:
+- live_trader.py:30-2065 - Updated console formatter for aligned columns, wrapped messages, new color palette, and MODEL color; added best-effort font sizing and UTC timestamp fix.
+
+Original Intent: User requested grey INFO, darker warning/orange heartbeat, aligned pipes, wrapped health lines, MODEL sky blue, and a font size increase attempt.
+
+Changes Made:
+1. Implemented aligned, wrapped console formatting with per-line indentation and updated color palette (grey INFO, dark yellow warnings, dark orange heartbeat, sky blue MODEL).
+2. Added best-effort console font sizing (Windows API / Linux OSC 50) and invoked on startup.
+3. Fixed utcfromtimestamp deprecation by using timezone-aware fromtimestamp.
+
+Testing: Not tested (requires interactive console).
+----------------------------------------------------------------------
+v3.15 (Console Palette Tuning - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 00:57
+Files Modified:
+- live_trader.py:72-168 - Darkened Health/Heartbeat colors, set Status/MODEL to white, and bumped console font size.
+
+Original Intent: User requested darker green/orange, white Status/MODEL, and a larger font attempt.
+
+Changes Made:
+1. Set Health to darker green and Heartbeat to darker orange; Status/MODEL now white.
+2. Increased default console font size to 16 (best-effort).
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.16 (Log Formatting + Status Interval - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 01:09
+Files Modified:
+- live_trader.py:30-2065 - Standardized key/value log formatting, adjusted health/heartbeat/model/status text, added 5-minute status interval, and improved font-size diagnostics.
+
+Original Intent: User requested consistent "Key = value" formatting, 5-minute status updates, darker health/heartbeat colors, and better font-size handling.
+
+Changes Made:
+1. Reformatted Health/Heartbeat/Status/MODEL logs with aligned "Key = value" style and pipe separators.
+2. Limited Status output to every 5 minutes and adjusted MODEL diagnostics formatting.
+3. Increased default font size to 18 and added diagnostics when terminals ignore font changes.
+4. Updated clock-skew, latency alert wording, and status formatting for consistency.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.17 (Health Residual Format - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 01:10
+Files Modified:
+- live_trader.py:1494-1498 - Reformatted residual gaps health line to "Key = value" style.
+
+Original Intent: Keep Health log formatting consistent with the new "Key = value" style.
+
+Changes Made:
+1. Updated the residual gaps line to use "Residual gaps = ..." format.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.18 (Log Styling + Deprecation Fix - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 02:37
+Files Modified:
+- live_trader.py:60-2665 - Updated console coloring (heartbeat grey, orange OPEN/CLOSE), ALERT level display, key/value log formatting, 5-minute status cadence, and replaced utcnow usage.
+
+Original Intent: User requested consistent "Key = value" formatting, heartbeat color changes, ALERT level display, 5-minute status logging, and fixing utcnow deprecation warnings.
+
+Changes Made:
+1. Adjusted console formatter to display ALERT level in red and color OPEN/CLOSE in orange while keeping heartbeat grey.
+2. Standardized Health/Heartbeat/Status/MODEL to "Key = value" format and added a 5-minute status interval.
+3. Replaced utcnow calls with timezone-aware UTC timestamps and added safe age calculations.
+4. Added font-size diagnostics and bumped default requested size.
+
+Testing: Not tested.
+----------------------------------------------------------------------
+v3.19 (Heartbeat Price + Palette Tweaks - Dec 2025)
+----------------------------------------------------------------------
+Agent: Codex
+Date: 2025-12-30 02:57
+Files Modified:
+- live_trader.py:72-1860 - Added heartbeat price, made MODEL/orange messages darker, brightened WARNING yellow, and fixed paper balance age refresh.
+
+Original Intent: User requested heartbeat price, orange MODEL lines, brighter WARNING, and non-zero balance age in paper mode.
+
+Changes Made:
+1. Added latest trade price to heartbeat without extra API calls.
+2. Switched MODEL to orange and brightened WARNING color.
+3. Prevented paper balance age from resetting on every heartbeat.
+
+Testing: Not tested.

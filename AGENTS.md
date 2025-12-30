@@ -112,6 +112,11 @@ print("OK")
 PY
 ```
 
+## Context Bridge File
+When a session is about to be reset/closed, write a brief context snapshot to
+`CONTEXT_BRIDGE.md` (metadata + key decisions). Keep it short and overwrite
+the file each time so it does not grow across sessions.
+
 ## Study-Scoped Artifact Workflow
 Recent workflow changes rely on study-scoped outputs under `models/<SYMBOL>/<study>/`.
 Key points:

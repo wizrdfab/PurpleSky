@@ -240,7 +240,7 @@ struct Bar {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Frame {
+pub(crate) struct Frame {
     len: usize,
     f64_cols: HashMap<String, Vec<f64>>,
     i64_cols: HashMap<String, Vec<i64>>,
@@ -259,7 +259,7 @@ impl Frame {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
@@ -353,6 +353,27 @@ impl Frame {
                 }
             }
             out.set_str(name, vals);
+        }
+        out
+    }
+
+    fn slice_tail(&self, max_rows: usize) -> Self {
+        if max_rows == 0 || self.len <= max_rows {
+            return self.clone();
+        }
+        let start = self.len - max_rows;
+        let mut out = Frame::new(max_rows);
+        for (name, col) in &self.f64_cols {
+            out.set_f64(name, col[start..].to_vec());
+        }
+        for (name, col) in &self.i64_cols {
+            out.set_i64(name, col[start..].to_vec());
+        }
+        for (name, col) in &self.bool_cols {
+            out.set_bool(name, col[start..].to_vec());
+        }
+        for (name, col) in &self.str_cols {
+            out.set_str(name, col[start..].to_vec());
         }
         out
     }
@@ -1027,6 +1048,28 @@ fn ema(values: &[f64], period: i64) -> Vec<f64> {
         }
     }
     out
+}
+
+pub(crate) fn build_bars_from_config(
+    config: &PipelineConfig,
+    max_bars: Option<usize>,
+) -> Result<HashMap<String, Frame>> {
+    let trades = load_trades_cached(&config.data)?;
+    let mut bars = create_multi_timeframe_bars(
+        &trades,
+        &config.features.timeframes,
+        &config.features.timeframe_names,
+    );
+    if let Some(max_rows) = max_bars {
+        if max_rows > 0 {
+            for frame in bars.values_mut() {
+                if frame.len() > max_rows {
+                    *frame = frame.slice_tail(max_rows);
+                }
+            }
+        }
+    }
+    Ok(bars)
 }
 
 fn sma(values: &[f64], period: i64) -> Vec<f64> {
@@ -2406,7 +2449,7 @@ fn write_arrow(frame: &Frame, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_arrow_bytes(frame: &Frame) -> Result<Vec<u8>> {
+pub(crate) fn write_arrow_bytes(frame: &Frame) -> Result<Vec<u8>> {
     let mut fields: Vec<Field> = Vec::new();
     let mut arrays: Vec<ArrayRef> = Vec::new();
 

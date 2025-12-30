@@ -42,7 +42,7 @@ Key Modules:
 - backtest_tuned_config.py: Tuning-aligned backtest (default for --backtest-only).
 - train.py: CLI entrypoint for tuning, training, and backtesting.
 - live_trading_funds_simulated.py: Simulation of exchange plus trading on historical data
-- live_trading_funds.py : Live trading (production)
+- live_trader.py: Live/paper trading aligned to tuned backtest logic.
 
 Study-Scoped Artifacts (model_dir/<study>/):
 - optuna.db: Default Optuna storage (sqlite).
@@ -90,8 +90,8 @@ Workflows
 - Uses live_trading_funds_simulated.py to simulate a exchange that feeds trade data into the trading engine.
 
 7) Live / Paper Trading
-- live_trading_funds.py
-- Use the same config fields (EV gate, fees, gates, timeouts) as tuning/backtests.
+- live_trader.py
+- Uses train_config_<trial>.json + tuning_summary_<trial>.json for tuned settings and consistent logic.
 
 
 Consistency Guards

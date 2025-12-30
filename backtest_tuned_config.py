@@ -244,6 +244,45 @@ def _build_feature_frame(data: pd.DataFrame, feature_names: List[str]) -> pd.Dat
     return X.fillna(0)
 
 
+def _apply_entry_readiness_mask(
+    X_entry: pd.DataFrame,
+    readiness: Dict[str, Any],
+    entry_features: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    if not isinstance(readiness, dict):
+        raise SystemExit("entry_feature_readiness is missing or invalid.")
+    ready_features = readiness.get("ready_features")
+    if not isinstance(ready_features, list) or not ready_features:
+        raise SystemExit("entry_feature_readiness missing ready_features.")
+
+    ready_set = set(ready_features)
+    context_cols = set(CONTEXT_FEATURE_NAMES)
+    missing_ready = [col for col in ready_set if col not in X_entry.columns]
+    if missing_ready:
+        missing_str = ", ".join(sorted(missing_ready))
+        raise SystemExit(
+            "entry_feature_readiness mismatch: missing required features: "
+            f"{missing_str}"
+        )
+
+    if entry_features:
+        entry_set = set(entry_features)
+        unexpected = [col for col in ready_set if col not in entry_set and col not in context_cols]
+        if unexpected:
+            bad = ", ".join(sorted(unexpected))
+            raise SystemExit(
+                "entry_feature_readiness contains unexpected features: "
+                f"{bad}"
+            )
+
+    for col in X_entry.columns:
+        if col in context_cols:
+            continue
+        if col not in ready_set:
+            X_entry[col] = 0.0
+    return X_entry
+
+
 def _feature_audit(feature_cols: List[str], entry_model: EntryQualityModel) -> Dict[str, Any]:
     expected = getattr(entry_model, "filtered_feature_names", None) or getattr(entry_model, "feature_names", None)
     if not expected:
@@ -675,10 +714,15 @@ def run_tuned_backtest(
     ema_touch_mode: str = "multi",
     use_intrabar: bool = True,
     confirm_missing_models: bool = True,
+    entry_feature_readiness: Optional[Dict[str, Any]] = None,
 ) -> BacktestResult:
     result = BacktestResult()
     if data is None or len(data) == 0:
         return result
+    if entry_feature_readiness is None:
+        raise SystemExit(
+            "entry_feature_readiness missing; train_config must include readiness snapshot."
+        )
     base_tf = config.features.timeframe_names[config.base_timeframe_idx]
     tf_seconds_map = dict(zip(config.features.timeframe_names, config.features.timeframes))
     base_tf_seconds = tf_seconds_map.get(base_tf, None)
@@ -759,10 +803,14 @@ def run_tuned_backtest(
         regime_pred = regime_model.predict(X_regime)
 
     X_entry = append_context_features(X_base, trend_pred, regime_pred)
-    entry_features = getattr(models.entry_model, "filtered_feature_names", None) or getattr(models.entry_model, "feature_names", None
-          )
+    entry_features = getattr(models.entry_model, "filtered_feature_names", None) or getattr(models.entry_model, "feature_names", None)
     if entry_features:
         X_entry = _build_feature_frame(X_entry, list(entry_features))
+    X_entry = _apply_entry_readiness_mask(
+        X_entry,
+        entry_feature_readiness,
+        entry_features=list(entry_features) if entry_features else None,
+    )
     X_entry = X_entry.loc[pullback_mask]
 
     final_use_calibration = bool(config.labels.use_calibration)
