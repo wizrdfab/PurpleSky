@@ -1,146 +1,79 @@
 """
-Configuration for TrendFollower ML system.
-Adjust these parameters based on your setup and experimentation.
+Central configuration for the Limit Order Quantitative System.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-
 @dataclass
 class DataConfig:
-    """Data loading configuration"""
-    data_dir: Path = Path("./data")  # Directory containing CSV files
-    file_pattern: str = "*.csv"       # Pattern to match trade files
-    lookback_days: Optional[int] = None  # If set, only use the most recent N days of trades
-    
-    # Column mapping (adjust if your CSV has different names)
+    data_dir: Path = Path("data/RAVEUSDT")
+    symbol: str = "RAVEUSDT"
+    trade_subdir: str = "Trade"
+    orderbook_subdir: str = "Orderbook"
+    trade_pattern: str = "*.csv"
+    orderbook_pattern: str = "*.data"
     timestamp_col: str = "timestamp"
     price_col: str = "price"
     size_col: str = "size"
     side_col: str = "side"
-    tick_direction_col: str = "tickDirection"
+    ob_levels: int = 50 
 
+@dataclass
+class StrategyConfig:
+    base_limit_offset_atr: float = 0.88
+    time_limit_bars: int = 36        
+    max_holding_bars: int = 144       
+    stop_loss_atr: float = 3.9       
+    take_profit_atr: float = 0.8     
+    maker_fee: float = 0.0002
+    taker_fee: float = 0.0005
+    risk_per_trade: float = 0.05    
+    max_positions: int = 1
+
+@dataclass
+class LiveSettings:
+    """Production Safety Settings"""
+    max_daily_drawdown_pct: float = 0.03  
+    max_spread_pct: float = 0.002         
+    max_api_errors: int = 5               
+    poll_interval_sec: int = 1           
+    reconcile_interval_sec: int = 60      
+    dry_run: bool = True #Momentary                 
 
 @dataclass
 class FeatureConfig:
-    """Feature engineering configuration"""
-    # Timeframes to generate (in seconds)
-    timeframes: List[int] = field(default_factory=lambda: [
-        60,      # 1m
-        300,     # 5m
-        900,     # 15m
-        3600,    # 1h
-        14400,   # 4h
-    ])
-    timeframe_names: List[str] = field(default_factory=lambda: [
-        '1m', '5m', '15m', '1h', '4h'
-    ])
-    
-    # EMA periods
-    ema_periods: List[int] = field(default_factory=lambda: [10, 21, 50, 100])
-    
-    # Other indicator periods
-    rsi_period: int = 14
-    adx_period: int = 14
+    base_timeframe: str = "5m"      
+    ema_periods: List[int] = field(default_factory=lambda: [9, 21, 50])
     atr_period: int = 14
-    bb_period: int = 20
-    bb_std: float = 2.0
-    
-    # Volume features
-    volume_ma_period: int = 20
-    
-    # Lookback for structure detection (in bars)
-    swing_lookback: int = 10
-
-
-@dataclass
-class LabelConfig:
-    """Label generation configuration"""
-    # Forward windows for labeling (in bars of the base timeframe)
-    trend_forward_window: int = 20      # How far ahead to look for trend
-    entry_forward_window: int = 10      # How far ahead to look for entry success
-    
-    # Trend classification thresholds (in ATR units)
-    trend_up_threshold: float = 2.0     # Must move up this much
-    trend_down_threshold: float = 2.0   # Must move down this much
-    max_adverse_for_trend: float = 1.0  # Max drawdown to still count as trend
-    
-    # Entry success thresholds
-    target_rr: float = 1.5              # Target reward:risk ratio
-    stop_atr_multiple: float = 1.0      # Stop loss in ATR units
-    
-    # Pullback detection
-    pullback_ema: int = 21              # EMA to detect pullbacks to
-    pullback_threshold: float = 0.5     # Price within X ATR of EMA
-
-    # Probability threshold (optimized during tuning)
-    best_threshold: float = 0.5         # Min bounce probability for trade entry
-
-    # EV gating defaults (used by tuning/backtest/live)
-    ev_margin_r: float = 0.0            # Minimum EV margin in R units
-    fee_percent: float = 0.0011         # Round-trip fee as a decimal of price
-    fee_per_trade_r: Optional[float] = None  # Explicit fee in R units (overrides fee_percent)
-    use_expected_rr: bool = False       # Use expected_rr in EV gating when available
-    use_ev_gate: bool = True            # Use EV gate instead of probability threshold
-    use_calibration: bool = True        # Use calibrated probabilities for entry model
-    calibration_method: str = "temperature"  # Calibration method ("temperature" or "isotonic")
-
-    # Trend/regime gating (used by tuning/backtest/live)
-    use_trend_gate: bool = False        # Gate entries by trend classifier probability
-    min_trend_prob: float = 0.0         # Minimum trend probability for directional alignment
-    use_regime_gate: bool = False       # Gate entries by regime classifier
-    min_regime_prob: float = 0.0        # Minimum regime probability for allowed regimes
-    allow_regime_ranging: bool = True
-    allow_regime_trend_up: bool = True
-    allow_regime_trend_down: bool = True
-    allow_regime_volatile: bool = True
-    regime_align_direction: bool = True  # Align regime trend direction with trade direction
-
+    rsi_period: int = 14
+    micro_windows: List[int] = field(default_factory=lambda: [1, 4]) 
 
 @dataclass
 class ModelConfig:
-    """ML model configuration"""
-    # LightGBM parameters
-    n_estimators: int = 500
-    max_depth: int = 6
+    model_type: str = "lightgbm_dart"
+    model_dir: Path = Path("models_v2")
+    n_estimators: int = 1500
     learning_rate: float = 0.05
-    num_leaves: int = 31
-    feature_fraction: float = 0.8
-    bagging_fraction: float = 0.8
-    bagging_freq: int = 5
-    min_child_samples: int = 50
-    num_threads: int = 0
-
-    #Test
-    # --- Regularization (The "Penalties") ---
-    lambdaa_ele1: float = 0.5          # <--- Added this (testing regularization, may need to be changed)
-    lambdaa_ele2: float = 0.5          # <--- Added this (testing regularization, may need to be changed)
-    min_gain_to_split: float = 0.1  # <--- Added this (testing regularization, may need to be changed)
-    
-    # Training
-    train_ratio: float = 0.7            # 70% train
-    val_ratio: float = 0.15             # 15% validation
-    test_ratio: float = 0.15            # 15% test
-    
-    # Model paths
-    model_dir: Path = Path("./models")
-
+    max_depth: int = 5           
+    num_leaves: int = 32         
+    min_child_samples: int = 50  
+    subsample: float = 0.7
+    colsample_bytree: float = 0.6
+    rate_drop: float = 0.1       
+    train_ratio: float = 0.70
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+    model_threshold: float = 0.60
+    early_stopping_rounds: int = 50
 
 @dataclass
-class TrendFollowerConfig:
-    """Main configuration combining all sub-configs"""
+class GlobalConfig:
     data: DataConfig = field(default_factory=DataConfig)
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
-    labels: LabelConfig = field(default_factory=LabelConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
-    
-    # Base timeframe for training (index into timeframes list)
-    base_timeframe_idx: int = 1  # 5m by default
-    
-    # Random seed for reproducibility
+    live: LiveSettings = field(default_factory=LiveSettings)
     seed: int = 42
 
-
-# Default configuration instance
-DEFAULT_CONFIG = TrendFollowerConfig()
+CONF = GlobalConfig()

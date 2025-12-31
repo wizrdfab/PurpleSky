@@ -1,280 +1,242 @@
 """
-Data loader for raw trade data from Bybit.
-Handles loading multiple CSV files and basic preprocessing.
+Advanced Data Loader with Stream Processing.
+Aggregates Trades AND Orderbook snapshots into high-fidelity bars.
 """
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from typing import List, Optional
+import glob
+import json
+import os
 from config import DataConfig
 
+class DataLoader:
+    def __init__(self, config: DataConfig):
+        self.config = config
 
-def load_trades(config: DataConfig, verbose: bool = True, sample_rate: float = 1.0) -> pd.DataFrame:
-    """
-    Load all trade CSV files from the data directory.
-    
-    Args:
-        config: DataConfig with paths and column names
-        verbose: Print progress information
-        sample_rate: Fraction of trades to keep (1.0 = all, 0.1 = 10%)
+    def load_and_merge(self, timeframe: str) -> pd.DataFrame:
+        """Main entry point: Loads trades, loads OB, merges them."""
+        print(f"--- Data Loader ({timeframe}) ---")
         
-    Returns:
-        DataFrame with all trades, sorted by timestamp
-    """
-    data_path = Path(config.data_dir)
-    
-    if not data_path.exists():
-        raise FileNotFoundError(f"Data directory not found: {data_path}")
-    
-    # Find all matching files
-    files = sorted(data_path.glob(config.file_pattern))
-    
-    if not files:
-        raise FileNotFoundError(f"No files matching '{config.file_pattern}' in {data_path}")
-    
-    if verbose:
-        print(f"Found {len(files)} trade files:")
+        # 1. Load Trades
+        trades_df = self._load_trades()
+        if trades_df.empty:
+            return pd.DataFrame()
+            
+        # 2. Aggregate Trades to Bars
+        bars = self._agg_trades(trades_df, timeframe)
+        print(f"Trade Bars: {len(bars)}")
+        
+        # 3. Stream & Aggregate Orderbook
+        ob_bars = self._process_orderbook(timeframe)
+        
+        # 4. Merge
+        if ob_bars.empty:
+            print("Warning: No Orderbook data found. Using Trade data only.")
+            return bars
+            
+        print("Merging Orderbook data...")
+        # Ensure indexes match
+        if 'datetime' in bars.columns: bars.set_index('datetime', inplace=True)
+        # ob_bars already has datetime index
+        
+        merged = bars.join(ob_bars, how='left')
+        
+        # Forward fill OB data (snapshots stick until changed)
+        merged.fillna(method='ffill', inplace=True)
+        merged.fillna(0, inplace=True) # Handle startup NaNs
+        
+        return merged.reset_index()
+
+    def _load_trades(self) -> pd.DataFrame:
+        search_path = self.config.data_dir / self.config.trade_subdir / self.config.trade_pattern
+        files = sorted(glob.glob(str(search_path)))
+        
+        if not files:
+            print("No trade files found.")
+            return pd.DataFrame()
+            
+        dfs = []
         for f in files:
-            print(f"  - {f.name}")
-    
-    # Only load columns we need to save memory
-    use_cols = [
-        config.timestamp_col,
-        config.price_col,
-        config.size_col,
-        config.side_col,
-        config.tick_direction_col,
-    ]
-    
-    # Load files one at a time, already sorted
-    all_trades = []
-    total_original = 0
-    
-    for file in files:
-        # Load only needed columns with optimized dtypes
-        df = pd.read_csv(
-            file, 
-            usecols=lambda c: c in use_cols or c == 'symbol',
-            dtype={
-                config.price_col: 'float32',
-                config.size_col: 'float32',
-            }
-        )
+            try:
+                # Minimal read
+                preview = pd.read_csv(f, nrows=1)
+                has_side = self.config.side_col in preview.columns
+                
+                cols = [self.config.timestamp_col, self.config.price_col, self.config.size_col]
+                if has_side:
+                    cols.append(self.config.side_col)
+                
+                df = pd.read_csv(f, usecols=cols)
+                if not has_side:
+                    df[self.config.side_col] = "Buy" # Default
+                
+                # Force numeric types (handle bad data)
+                df[self.config.price_col] = pd.to_numeric(df[self.config.price_col], errors='coerce')
+                df[self.config.size_col] = pd.to_numeric(df[self.config.size_col], errors='coerce')
+                
+                before_len = len(df)
+                df.dropna(subset=[self.config.price_col, self.config.size_col], inplace=True)
+                after_len = len(df)
+                
+                if after_len < before_len:
+                    print(f"  Dropped {before_len - after_len} rows with invalid numeric data in {os.path.basename(f)}")
+                
+                if not df.empty:
+                    dfs.append(df)
+                else:
+                    print(f"  File {os.path.basename(f)} resulted in empty dataframe.")
+                    
+            except Exception as e:
+                print(f"Error reading {f}: {e}")
+                
+        if not dfs: return pd.DataFrame()
         
-        total_original += len(df)
+        full = pd.concat(dfs, ignore_index=True)
+        full.sort_values(self.config.timestamp_col, inplace=True)
+        return full
+
+    def _agg_trades(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h', '4h': '4h'}
+        rule = tf_map.get(timeframe, '15min')
         
-        # Sample if needed
-        if sample_rate < 1.0:
-            df = df.sample(frac=sample_rate, random_state=42)
+        df = df.copy()
         
-        # Sort this file's trades
-        df = df.sort_values(config.timestamp_col)
+        # Auto-detect timestamp unit
+        if df[self.config.timestamp_col].iloc[0] > 3000000000:
+            unit = 'ms'
+        else:
+            unit = 's'
+        df['datetime'] = pd.to_datetime(df[self.config.timestamp_col], unit=unit)
+        df.set_index('datetime', inplace=True)
         
-        all_trades.append(df)
+        # Microstructure Pre-calc
+        side_map = {'Buy': 1, 'Sell': -1, 'buy': 1, 'sell': -1}
+        df['side_num'] = df[self.config.side_col].map(side_map).fillna(0)
         
-        if verbose:
-            print(f"  Loaded {file.name}: {len(df):,} trades")
+        # Metrics
+        df['vol_buy'] = np.where(df['side_num']==1, df[self.config.size_col], 0)
+        df['vol_sell'] = np.where(df['side_num']==-1, df[self.config.size_col], 0)
+        df['dollar_val'] = df[self.config.price_col] * df[self.config.size_col]
         
-        # Clear memory
-        import gc
-        gc.collect()
-    
-    # Concatenate (files are already sorted, so merge-sort is efficient)
-    if verbose:
-        print("  Merging files...")
-    
-    trades = pd.concat(all_trades, ignore_index=True)
-    del all_trades
-    
-    # Final sort (needed because files might overlap in time)
-    trades = trades.sort_values(config.timestamp_col).reset_index(drop=True)
-
-    # Optional: limit to the most recent N days of trades.
-    lookback_days = getattr(config, 'lookback_days', None)
-    if lookback_days is not None:
-        try:
-            lookback_days_int = int(lookback_days)
-        except Exception:
-            lookback_days_int = None
-
-        if lookback_days_int is not None and lookback_days_int > 0 and len(trades) > 0:
-            max_ts = float(trades[config.timestamp_col].max())
-            cutoff_ts = max_ts - (lookback_days_int * 86400)
-            pre_filter_len = len(trades)
-            trades = trades[trades[config.timestamp_col] >= cutoff_ts].reset_index(drop=True)
-            if verbose:
-                print(
-                    f"Applied lookback: last {lookback_days_int} days -> "
-                    f"{len(trades):,} trades (from {pre_filter_len:,})"
-                )
-    
-    if verbose:
-        print(f"\nTotal trades: {len(trades):,}" + 
-              (f" (sampled from {total_original:,})" if sample_rate < 1.0 else ""))
-        print(f"Date range: {pd.to_datetime(trades[config.timestamp_col].min(), unit='s')} "
-              f"to {pd.to_datetime(trades[config.timestamp_col].max(), unit='s')}")
+        # Aggregation
+        ohlcv = df[self.config.price_col].resample(rule).ohlc()
         
-        # Memory usage
-        mem_mb = trades.memory_usage(deep=True).sum() / 1024 / 1024
-        print(f"Memory usage: {mem_mb:.1f} MB")
-    
-    return trades
-
-
-def preprocess_trades(trades: pd.DataFrame, config: DataConfig) -> pd.DataFrame:
-    """
-    Preprocess raw trade data.
-    
-    Args:
-        trades: Raw trade DataFrame
-        config: DataConfig with column names
+        micro = df.resample(rule).agg({
+            self.config.size_col: 'sum',      # Total Volume
+            'vol_buy': 'sum',                 # Buy Volume
+            'vol_sell': 'sum',                # Sell Volume
+            'side_num': 'count',              # Trade Count
+            'dollar_val': 'sum'               # For VWAP
+        })
         
-    Returns:
-        Preprocessed DataFrame
-    """
-    df = trades.copy()
-    
-    # Convert timestamp to datetime
-    df['datetime'] = pd.to_datetime(df[config.timestamp_col], unit='s')
-    
-    # Encode side as numeric (-1 for Sell, +1 for Buy)
-    df['side_num'] = df[config.side_col].map({'Buy': 1, 'Sell': -1})
-    
-    # Encode tick direction
-    tick_map = {
-        'PlusTick': 1,
-        'ZeroPlusTick': 0.5,
-        'MinusTick': -1,
-        'ZeroMinusTick': -0.5
-    }
-    df['tick_dir_num'] = df[config.tick_direction_col].map(tick_map).fillna(0)
-    
-    # Calculate trade value
-    df['value'] = df[config.price_col] * df[config.size_col]
-    
-    # Calculate signed volume (positive for buys, negative for sells)
-    df['signed_size'] = df[config.size_col] * df['side_num']
-    df['signed_value'] = df['value'] * df['side_num']
-    
-    return df
-
-
-def aggregate_to_bars(
-    trades: pd.DataFrame, 
-    timeframe_seconds: int,
-    config: DataConfig
-) -> pd.DataFrame:
-    """
-    Aggregate raw trades into OHLCV bars.
-    
-    Args:
-        trades: Preprocessed trade DataFrame
-        timeframe_seconds: Bar size in seconds
-        config: DataConfig with column names
+        micro.rename(columns={self.config.size_col: 'volume', 'side_num': 'trade_count'}, inplace=True)
         
-    Returns:
-        DataFrame with OHLCV bars and additional metrics
-    """
-    df = trades.copy()
-    
-    # Create time buckets
-    df['bar_time'] = (df[config.timestamp_col] // timeframe_seconds) * timeframe_seconds
-    df['bar_datetime'] = pd.to_datetime(df['bar_time'], unit='s')
-    
-    # Aggregate
-    bars = df.groupby('bar_time').agg({
-        config.price_col: ['first', 'max', 'min', 'last'],
-        config.size_col: 'sum',
-        'value': 'sum',
-        'side_num': 'sum',  # Net buy/sell count
-        'signed_size': 'sum',  # Net volume
-        'signed_value': 'sum',  # Net value
-        'tick_dir_num': 'mean',  # Average tick direction
-        config.timestamp_col: 'count',  # Trade count
-    })
-    
-    # Flatten column names
-    bars.columns = [
-        'open', 'high', 'low', 'close',
-        'volume', 'value',
-        'net_side', 'net_volume', 'net_value',
-        'avg_tick_dir', 'trade_count'
-    ]
-    
-    bars = bars.reset_index()
-    bars['datetime'] = pd.to_datetime(bars['bar_time'], unit='s')
-    
-    # Calculate additional metrics
-    bars['buy_volume'] = (bars['volume'] + bars['net_volume']) / 2
-    bars['sell_volume'] = (bars['volume'] - bars['net_volume']) / 2
-    bars['buy_sell_imbalance'] = bars['net_volume'] / bars['volume'].replace(0, np.nan)
-    
-    # VWAP
-    bars['vwap'] = bars['value'] / bars['volume'].replace(0, np.nan)
-    
-    # Trade intensity (trades per second)
-    bars['trade_intensity'] = bars['trade_count'] / timeframe_seconds
-    
-    # Average trade size
-    bars['avg_trade_size'] = bars['volume'] / bars['trade_count'].replace(0, np.nan)
-    
-    # Fill NaN values
-    bars = bars.fillna(method='ffill')
-    
-    return bars
-
-
-def create_multi_timeframe_bars(
-    trades: pd.DataFrame,
-    timeframes_seconds: List[int],
-    timeframe_names: List[str],
-    config: DataConfig
-) -> dict:
-    """
-    Create bars for multiple timeframes.
-    
-    Args:
-        trades: Preprocessed trade DataFrame
-        timeframes_seconds: List of timeframe sizes in seconds
-        timeframe_names: Names for each timeframe
-        config: DataConfig
+        # Feature: Taker Buy/Sell Ratio
+        # Feature: VWAP
+        bars = pd.concat([ohlcv, micro], axis=1)
+        bars['vwap'] = bars['dollar_val'] / bars['volume'].replace(0, 1)
+        bars['taker_buy_ratio'] = bars['vol_buy'] / bars['volume'].replace(0, 1)
         
-    Returns:
-        Dictionary mapping timeframe name to bar DataFrame
-    """
-    bars_dict = {}
-    
-    for tf_seconds, tf_name in zip(timeframes_seconds, timeframe_names):
-        print(f"  Creating {tf_name} bars...")
-        bars = aggregate_to_bars(trades, tf_seconds, config)
-        bars_dict[tf_name] = bars
-        print(f"    -> {len(bars):,} bars")
-    
-    return bars_dict
+        # Drop empty
+        bars.dropna(subset=['close'], inplace=True)
+        
+        return bars
 
-
-if __name__ == "__main__":
-    # Test the data loader
-    from config import DEFAULT_CONFIG
-    
-    config = DEFAULT_CONFIG.data
-    
-    # Adjust path for testing
-    config.data_dir = Path("./data")
-    
-    print("Loading trades...")
-    trades = load_trades(config)
-    
-    print("\nPreprocessing...")
-    trades = preprocess_trades(trades, config)
-    
-    print("\nCreating multi-timeframe bars...")
-    bars = create_multi_timeframe_bars(
-        trades,
-        DEFAULT_CONFIG.features.timeframes,
-        DEFAULT_CONFIG.features.timeframe_names,
-        config
-    )
-    
-    print("\nSample 5m bars:")
-    print(bars['5m'].head(10))
+    def _process_orderbook(self, timeframe: str) -> pd.DataFrame:
+        search_path = self.config.data_dir / self.config.orderbook_subdir / self.config.orderbook_pattern
+        files = sorted(glob.glob(str(search_path)))
+        
+        if not files: return pd.DataFrame()
+        
+        print(f"Processing {len(files)} Orderbook files (Stream)...")
+        
+        tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h'}
+        rule = tf_map.get(timeframe, '15min')
+        
+        aggs = []
+        
+        for f in files:
+            try:
+                buffer = []
+                line_counter = 0
+                
+                # We calculate Micro-Price and Imbalance per snapshot
+                with open(f, 'r') as file:
+                    for line in file:
+                        line_counter += 1
+                        # Sample every 50th line to get ~2 snapshots per second (assuming 100ms updates)
+                        # This reduces RAM/CPU but keeps high fidelity compared to 15m bars
+                        if line_counter % 50 != 0: continue
+                        
+                        try:
+                            raw = json.loads(line)
+                            data = raw.get('data', {})
+                            if not data: continue
+                            
+                            ts = raw.get('ts')
+                            bids = data.get('b', [])
+                            asks = data.get('a', [])
+                            
+                            if not bids or not asks: continue
+                            
+                            # Best Bid/Ask
+                            bb_p = float(bids[0][0])
+                            bb_s = float(bids[0][1])
+                            ba_p = float(asks[0][0])
+                            ba_s = float(asks[0][1])
+                            
+                            # 1. Spread
+                            spread = ba_p - bb_p
+                            mid_price = (ba_p + bb_p) / 2
+                            
+                            # 2. Micro-Price (Volume-Weighted Mid Price)
+                            # P_micro = (P_ask * V_bid + P_bid * V_ask) / (V_bid + V_ask)
+                            # Represents the "True" center of liquidity
+                            micro_price = (ba_p * bb_s + bb_p * ba_s) / (bb_s + ba_s + 1e-9)
+                            micro_deviation = (micro_price - mid_price) # Signed distance
+                            
+                            # 3. Depth Imbalance (Top N)
+                            bid_depth = sum([float(b[1]) for b in bids[:self.config.ob_levels]])
+                            ask_depth = sum([float(a[1]) for a in asks[:self.config.ob_levels]])
+                            imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-9)
+                            
+                            buffer.append({
+                                'timestamp': ts,
+                                'ob_spread': spread,
+                                'ob_micro_dev': micro_deviation,
+                                'ob_imbalance': imbalance,
+                                'ob_bid_depth': bid_depth,
+                                'ob_ask_depth': ask_depth
+                            })
+                            
+                        except Exception as e:
+                            continue
+                            
+                if not buffer: continue
+                
+                df_chunk = pd.DataFrame(buffer)
+                df_chunk['datetime'] = pd.to_datetime(df_chunk['timestamp'], unit='ms')
+                df_chunk.set_index('datetime', inplace=True)
+                
+                # Aggregation
+                chunk_agg = df_chunk.resample(rule).agg({
+                    'ob_spread': 'mean',
+                    'ob_micro_dev': ['mean', 'std', 'last'], # Last micro-dev shows immediate pressure
+                    'ob_imbalance': ['mean', 'last'],        # Persistent imbalance vs immediate
+                    'ob_bid_depth': 'mean',
+                    'ob_ask_depth': 'mean'
+                })
+                
+                # Flatten cols
+                chunk_agg.columns = ['_'.join(col).strip() for col in chunk_agg.columns.values]
+                aggs.append(chunk_agg)
+                
+                print(f"  Processed {os.path.basename(f)}")
+                
+            except Exception as e:
+                print(f"  Error {f}: {e}")
+                
+        if not aggs: return pd.DataFrame()
+        
+        full_ob = pd.concat(aggs).sort_index()
+        return full_ob

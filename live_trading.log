@@ -1,0 +1,57 @@
+2025-12-31 00:42:11,740 - INFO - Bootstrapping history for 500 bars...
+2025-12-31 00:42:13,238 - INFO - History bootstrapped. Current bars: 2
+2025-12-31 00:42:13,238 - INFO - Loading champion from models_tournament\RAVEUSDT\rank_1...
+2025-12-31 00:42:13,239 - INFO - Strategy Loaded: Offset=0.652, TP=1.389, SL=3.019
+2025-12-31 00:42:13,448 - INFO - Models Loaded.
+2025-12-31 00:42:13,448 - INFO - --- Starting Live Loop ---
+2025-12-31 00:42:13,449 - INFO - Sleeping for 171.6s until next bar at 2025-12-31 03:45:05
+2025-12-31 00:43:39,208 - INFO - Bootstrapping history for 500 bars...
+2025-12-31 00:43:40,334 - INFO - History bootstrapped. Current bars: 200
+2025-12-31 00:43:40,335 - INFO - Loading champion from models_tournament\RAVEUSDT\rank_1...
+2025-12-31 00:43:40,336 - INFO - Strategy Loaded: Offset=0.652, TP=1.389, SL=3.019
+2025-12-31 00:43:40,390 - INFO - Models Loaded.
+2025-12-31 00:43:40,391 - INFO - --- Starting Live Loop ---
+2025-12-31 00:43:40,392 - INFO - Sleeping for 84.6s until next bar at 2025-12-31 03:45:05
+2025-12-31 00:45:07,292 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:45:18,128 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:45:28,961 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:45:39,790 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:45:50,613 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:46:02,190 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:46:13,010 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:46:24,225 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:46:35,811 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:46:47,004 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:46:58,212 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:47:09,041 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:47:19,864 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:47:30,686 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:47:41,512 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:47:53,452 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:48:04,279 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:48:15,105 - ERROR - Loop Error: "['vol_sell'] not in index"
+2025-12-31 00:49:22,182 - INFO - Bootstrapping history for 500 bars...
+2025-12-31 00:49:23,644 - INFO - History bootstrapped. Current bars: 200
+2025-12-31 00:49:23,645 - INFO - Loading champion from models_tournament\RAVEUSDT\rank_1...
+2025-12-31 00:49:23,646 - INFO - Strategy Loaded: Offset=0.652, TP=1.389, SL=3.019
+2025-12-31 00:49:23,711 - INFO - Models Loaded.
+2025-12-31 00:49:23,712 - INFO - --- Starting Live Loop ---
+2025-12-31 00:49:23,713 - INFO - Sleeping for 641.3s until next bar at 2025-12-31 04:00:05
+2025-12-31 00:53:38,886 - INFO - Bootstrapping history for 500 bars...
+2025-12-31 00:53:39,983 - INFO - History bootstrapped. Current bars: 200
+2025-12-31 00:53:39,983 - INFO - Loading champion from models_tournament\RAVEUSDT\rank_1...
+2025-12-31 00:53:39,984 - INFO - Strategy Loaded: Offset=0.652, TP=1.389, SL=3.019
+2025-12-31 00:53:40,047 - INFO - Models Loaded.
+2025-12-31 00:53:40,047 - INFO - --- Starting Live Loop ---
+2025-12-31 00:53:40,048 - INFO - Sleeping for 385.0s until next bar at 2025-12-31 04:00:05
+2025-12-31 01:00:06,569 - INFO - Bar: 2025-12-31 03:45:00 | Close: 0.4474 | PredL: 0.221 | PredS: 0.082
+2025-12-31 01:00:07,377 - INFO - Sleeping for 897.6s until next bar at 2025-12-31 04:15:05
+2025-12-31 01:11:45,953 - INFO - Bootstrapping history for 500 bars...
+2025-12-31 01:11:47,116 - INFO - History bootstrapped. Current bars: 200
+2025-12-31 01:11:47,116 - INFO - Loading champion from models_tournament\RAVEUSDT\rank_1...
+2025-12-31 01:11:47,117 - INFO - Strategy Loaded: Offset=0.652, TP=1.389, SL=3.019
+2025-12-31 01:11:47,179 - INFO - Models Loaded.
+2025-12-31 01:11:47,179 - INFO - --- Starting Live Loop ---
+2025-12-31 01:11:47,180 - INFO - Sleeping for 197.8s until next bar at 2025-12-31 04:15:05
+2025-12-31 01:15:05,853 - INFO - Bar: 2025-12-31 04:00:00 | Close: 0.44502 | PredL: 0.346 | PredS: 0.120
+2025-12-31 01:15:06,655 - INFO - Sleeping for 898.3s until next bar at 2025-12-31 04:30:05
