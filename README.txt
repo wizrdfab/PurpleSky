@@ -1,6 +1,8 @@
-# Sofia LightGBM (Brox) - TrendFollower ML System
+# PurpleSky - AI-Powered Liquidity Provision & Market Making
 
-A multi-timeframe, ML-driven trend follower for crypto. The pipeline ingests raw trades, builds OHLCV bars, engineers indicators, labels EMA-touch pullbacks, and tunes model + rule parameters with Optuna. Backtests are tuning-aligned by default and use the same EV gating and cost model as tuning.
+It's a liquidity provision / market maker using ML. We help the markets by providing liquidity while using cutting edge advancements in AI.
+
+PurpleSky is a multi-timeframe, ML-driven system for crypto markets. The pipeline ingests raw trades, builds OHLCV bars, engineers features and indicators, trains predictive models, and tunes model + rule parameters with Optuna. Backtests are tuning-aligned by default and use the same EV gating and cost model as tuning.
 
 ## Highlights
 
@@ -70,18 +72,6 @@ python train.py --data-dir ./data/RAVEUSDT --model-dir ./models/RAVEUSDT --backt
 
 Backtests use the tuning-aligned engine (`backtest_tuned_config.py`) by default and inherit gate settings, EV margin, fees, and expected-rr flags from the saved `train_config_<trial>.json` + tuning summary.
 
-## Rust Pipeline (Optional)
-
-A Rust extension can accelerate bars/features/labels. When available, it is used automatically.
-
-Build example (Windows/Linux):
-
-```bash
-# from repo root
-maturin develop -m rust_pipeline/Cargo.toml
-```
-
-If the module is not available, the system falls back to the Python pipeline.
 
 ## Live Trading (Optional)
 
