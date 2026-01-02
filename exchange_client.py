@@ -203,6 +203,37 @@ class ExchangeClient:
             logger.error(f"Error getting position: {e}")
             return 0.0
 
+    def get_position_details(self) -> Dict:
+        """Returns full position details including size, entry price, and timestamps."""
+        try:
+            resp = self.session.get_positions(
+                category="linear",
+                symbol=self.symbol
+            )
+            positions = resp.get('result', {}).get('list', [])
+            for p in positions:
+                if p['symbol'] == self.symbol:
+                    size = self._safe_float(p.get('size'))
+                    side = p.get('side')
+                    
+                    # Bybit V5 returns string timestamps in ms
+                    created_time = int(p.get('createdTime', 0))
+                    updated_time = int(p.get('updatedTime', 0))
+                    
+                    return {
+                        'size': size if side == 'Buy' else -size,
+                        'abs_size': size,
+                        'side': side,
+                        'entry_price': self._safe_float(p.get('avgPrice')),
+                        'mark_price': self._safe_float(p.get('markPrice')),
+                        'created_time': created_time,
+                        'updated_time': updated_time
+                    }
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting position details: {e}")
+            return {}
+
     def close_all_positions(self):
         """
         Safety: Close ALL positions for this symbol (Long and Short).

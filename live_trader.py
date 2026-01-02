@@ -70,7 +70,7 @@ class StateManager:
             "total_pnl": 0.0,
             "max_equity": 0.0,
             "active_orders": {},
-            "position_entry_bar": None,
+            "position_entry_time": None,
             "last_processed_bar": None
         }
         self.load()
@@ -429,30 +429,84 @@ class ChampionBot:
         logger.info(f"!!! TRADING: {side} @ {price} [TP: {tp_p} | SL: {sl_p}] Notional: ${final_qty*price:.2f} !!!")
         if not self.config.live.dry_run:
             resp = self.exchange.place_limit_order(side, price, final_qty, tp=tp_p, sl=sl_p)
-            # Use trade_bars length for indexing
-            if resp: self.state.state["active_orders"][resp['result']['orderId']] = {'idx': len(self.data.trade_bars), 'side': side}
+            if resp: 
+                # Store timestamp (ISO format) for robust time tracking
+                ts = row.name.isoformat() if hasattr(row.name, 'isoformat') else datetime.utcnow().isoformat()
+                self.state.state["active_orders"][resp['result']['orderId']] = {'created_at': ts, 'side': side}
 
     def _reconcile(self):
         if self.config.live.dry_run: return
         orders = self.exchange.get_open_orders()
         ids = [o['orderId'] for o in orders]
-        pos = self.exchange.get_position()
+        
+        # Pull authoritative position details from Exchange
+        pos_details = self.exchange.get_position_details()
+        pos_size = pos_details.get('size', 0.0)
+        abs_size = pos_details.get('abs_size', 0.0)
+        
+        current_time = datetime.utcnow()
+        tf_seconds = 300 # Assuming 5m timeframe
+        
+        # 1. Manage Orders (Cancellation & Cleanup)
         tracked = list(self.state.state["active_orders"].keys())
         for oid in tracked:
+            info = self.state.state["active_orders"][oid]
+            
+            # Check for Expiry
+            if 'created_at' in info:
+                try:
+                    created_at = pd.to_datetime(info['created_at'])
+                    age_seconds = (current_time - created_at).total_seconds()
+                    limit_seconds = self.config.strategy.time_limit_bars * tf_seconds
+                    
+                    if oid in ids and age_seconds > limit_seconds:
+                        logger.info(f"Order {oid} expired ({age_seconds:.0f}s > {limit_seconds}s). Cancelling.")
+                        self.exchange.cancel_order(order_id=oid)
+                        del self.state.state["active_orders"][oid]
+                        continue
+                except Exception as e:
+                    logger.error(f"Date parse error for order {oid}: {e}")
+
+            # Check for Fill/External Cancel
             if oid not in ids:
-                if abs(pos) > 0 and self.state.state["position_entry_bar"] is None:
-                    self.state.state["position_entry_bar"] = self.state.state["active_orders"][oid]['idx']
+                # Order is gone from exchange. Just remove from tracking.
                 del self.state.state["active_orders"][oid]
-        if pos == 0 and self.state.state["position_entry_bar"] is not None:
+        
+        # 2. Manage Position (Max Holding Time)
+        # Use authoritative 'created_time' from exchange (ms timestamp)
+        if abs_size > 0:
             try:
+                created_ms = pos_details.get('created_time', 0)
+                if created_ms > 0:
+                    # Convert exchange timestamp (ms) to datetime
+                    entry_time = datetime.utcfromtimestamp(created_ms / 1000.0)
+                    hold_seconds = (current_time - entry_time).total_seconds()
+                    max_hold_seconds = self.config.strategy.max_holding_bars * tf_seconds
+                    
+                    if hold_seconds > max_hold_seconds:
+                        logger.warning(f"Max Holding Time Exceeded ({hold_seconds:.0f}s). Force Closing Position.")
+                        # If pos > 0 (Long), side is 'Buy', we need to sell.
+                        side = "Buy" if pos_size > 0 else "Sell"
+                        self.exchange.market_close(side, abs_size)
+            except Exception as e:
+                logger.error(f"Position timer error: {e}")
+
+        # 3. Detect Closed Position (PnL & Reset)
+        # If we previously had a position (tracked in state) and now don't, fetch PnL
+        # (This part is tricky without persistent previous state, but 'get_position' == 0 is the trigger)
+        # Simplified: We rely on periodic PnL fetching or just the fact that it's 0 now.
+        if abs_size == 0 and self.state.state.get("last_pos_size", 0) != 0:
+             try:
                 closed = self.exchange.fetch_closed_pnl(limit=1)
                 if closed:
                     pnl = float(closed[0]['closedPnl'])
                     self.health.record_trade(pnl)
                     self.state.update_pnl(pnl)
                     logger.info(f"Trade Closed. PnL: {pnl:.4f} USDT | Health: {self.health.check_health()}")
-            except: pass
-            self.state.state["position_entry_bar"] = None
+             except: pass
+        
+        # Update local state tracker for next loop
+        self.state.state["last_pos_size"] = abs_size
         self.state.save()
 
 if __name__ == "__main__":
