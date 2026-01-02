@@ -95,6 +95,33 @@ class FeatureEngine:
             # Normalized by ATR. High values = Makers are adjusting rapidly = Risk
             df['micro_dev_vol'] = df['ob_micro_dev_std'] / df['atr'].replace(0, 1)
 
+            # 7. Liquidity Elasticity (Slope/Gradient)
+            # Captures "Strength" vs "Fragility" of the walls
+            if 'ob_bid_slope_mean' in df.columns:
+                # Normalize slopes by Price/ATR to make them comparable across symbols
+                # A slope is (Price_Diff / Volume). 
+                # We want (Price_Diff_in_Basis_Points / Volume)
+                df['ob_bid_elasticity'] = (df['ob_bid_slope_mean'] / df['close'].replace(0, 1)) * 10000
+                df['ob_ask_elasticity'] = (df['ob_ask_slope_mean'] / df['close'].replace(0, 1)) * 10000
+                
+                # Relative Elasticity (The Alpha Signal)
+                # If Ratio > 1.0: Bids are "Thin" (Steep slope), Asks are "Thick" (Flat slope).
+                df['ob_slope_ratio'] = df['ob_bid_elasticity'] / df['ob_ask_elasticity'].replace(0, 1)
+                
+                # Slope Shock (Z-Score)
+                # Detecting when the wall suddenly becomes "Thin/Glassy"
+                df['bid_slope_z'] = (df['ob_bid_elasticity'] - df['ob_bid_elasticity'].rolling(24).mean()) / df['ob_bid_elasticity'].rolling(24).std().replace(0, 1)
+
+            # 8. Wall Integrity (Intention)
+            # High = Concentrated liquidity at the front (Strong Intent)
+            # Low = Scattered/Layered liquidity (Weak/Passive Intent)
+            if 'ob_bid_integrity_mean' in df.columns:
+                df['ob_integrity_skew'] = df['ob_bid_integrity_mean'] - df['ob_ask_integrity_mean']
+                
+                # Integrity Momentum
+                df['bid_integrity_chg'] = df['ob_bid_integrity_mean'].diff()
+                df['ask_integrity_chg'] = df['ob_ask_integrity_mean'].diff()
+
         cols_to_drop = ['tr0', 'tr1', 'tr2', 'tr', 'up_move', 'down_move', 'plus_dm', 'minus_dm', 'price_chg', 'imb_chg']
         df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
         

@@ -148,7 +148,7 @@ class DataLoader:
         
         if not files: return pd.DataFrame()
         
-        print(f"Processing {len(files)} Orderbook files (Stream)...")
+        print(f"Processing {len(files)} Orderbook files (Full Reconstruction)...")
         
         tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h'}
         rule = tf_map.get(timeframe, '15min')
@@ -158,18 +158,20 @@ class DataLoader:
         for f in files:
             try:
                 buffer = []
-                line_counter = 0
+                # Local Orderbook State: Dict[Price(str), Size(float)]
+                # Using string keys for precision/matching, floats for values
+                local_bids = {}
+                local_asks = {}
                 
-                # We calculate Micro-Price and Imbalance per snapshot
+                line_counter = 0
+                snapshot_counter = 0
+                
                 with open(f, 'r') as file:
                     for line in file:
                         line_counter += 1
-                        # Sample every 50th line to get ~2 snapshots per second (assuming 100ms updates)
-                        # This reduces RAM/CPU but keeps high fidelity compared to 15m bars
-                        if line_counter % 50 != 0: continue
-                        
                         try:
                             raw = json.loads(line)
+                            msg_type = raw.get('type') # 'snapshot' or 'delta'
                             data = raw.get('data', {})
                             if not data: continue
                             
@@ -177,28 +179,79 @@ class DataLoader:
                             bids = data.get('b', [])
                             asks = data.get('a', [])
                             
-                            if not bids or not asks: continue
+                            # 1. Update Local State
+                            if msg_type == 'snapshot':
+                                local_bids = {p: float(s) for p, s in bids}
+                                local_asks = {p: float(s) for p, s in asks}
+                            else:
+                                # Process Deltas
+                                for p, s in bids:
+                                    size = float(s)
+                                    if size == 0:
+                                        local_bids.pop(p, None)
+                                    else:
+                                        local_bids[p] = size
+                                        
+                                for p, s in asks:
+                                    size = float(s)
+                                    if size == 0:
+                                        local_asks.pop(p, None)
+                                    else:
+                                        local_asks[p] = size
                             
-                            # Best Bid/Ask
-                            bb_p = float(bids[0][0])
-                            bb_s = float(bids[0][1])
-                            ba_p = float(asks[0][0])
-                            ba_s = float(asks[0][1])
+                            # 2. Sample State (e.g., every 50 updates to save RAM, or ~200ms)
+                            # We MUST sample from the *reconstructed* state, not the raw line
+                            if line_counter % 50 != 0: continue
                             
-                            # 1. Spread
+                            if not local_bids or not local_asks: continue
+                            
+                            # 3. Sort & Slice (Reconstruct the L2 View)
+                            # Bids: Descending Price
+                            sorted_bids = sorted(local_bids.items(), key=lambda x: float(x[0]), reverse=True)
+                            # Asks: Ascending Price
+                            sorted_asks = sorted(local_asks.items(), key=lambda x: float(x[0]))
+                            
+                            # Slice to configured depth
+                            bids_slice = sorted_bids[:self.config.ob_levels]
+                            asks_slice = sorted_asks[:self.config.ob_levels]
+                            
+                            if not bids_slice or not asks_slice: continue
+
+                            # --- Calculate Features on RECONSTRUCTED Book ---
+                            
+                            bb_p = float(bids_slice[0][0])
+                            bb_s = bids_slice[0][1]
+                            ba_p = float(asks_slice[0][0])
+                            ba_s = asks_slice[0][1]
+                            
+                            # Spread & Micro
                             spread = ba_p - bb_p
                             mid_price = (ba_p + bb_p) / 2
-                            
-                            # 2. Micro-Price (Volume-Weighted Mid Price)
-                            # P_micro = (P_ask * V_bid + P_bid * V_ask) / (V_bid + V_ask)
-                            # Represents the "True" center of liquidity
                             micro_price = (ba_p * bb_s + bb_p * ba_s) / (bb_s + ba_s + 1e-9)
-                            micro_deviation = (micro_price - mid_price) # Signed distance
+                            micro_deviation = (micro_price - mid_price)
                             
-                            # 3. Depth Imbalance (Top N)
-                            bid_depth = sum([float(b[1]) for b in bids[:self.config.ob_levels]])
-                            ask_depth = sum([float(a[1]) for a in asks[:self.config.ob_levels]])
+                            # Depth
+                            bid_depth = sum([s for _, s in bids_slice])
+                            ask_depth = sum([s for _, s in asks_slice])
                             imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-9)
+                            
+                            # Gradient (Slope)
+                            bid_slope = 0.0
+                            if bid_depth > 0 and len(bids_slice) > 1:
+                                deepest_bid = float(bids_slice[-1][0])
+                                bid_slope = (bb_p - deepest_bid) / bid_depth
+                                
+                            ask_slope = 0.0
+                            if ask_depth > 0 and len(asks_slice) > 1:
+                                deepest_ask = float(asks_slice[-1][0])
+                                ask_slope = (deepest_ask - ba_p) / ask_depth
+                                
+                            # NEW: Wall Integrity (Intention)
+                            # Ratio of Best_Bid_Size to Total_Bid_Depth
+                            # High = Concentrated Intent (Front-loaded)
+                            # Low = Scattered/Layered
+                            bid_integrity = bb_s / bid_depth if bid_depth > 0 else 0
+                            ask_integrity = ba_s / ask_depth if ask_depth > 0 else 0
                             
                             buffer.append({
                                 'timestamp': ts,
@@ -206,7 +259,11 @@ class DataLoader:
                                 'ob_micro_dev': micro_deviation,
                                 'ob_imbalance': imbalance,
                                 'ob_bid_depth': bid_depth,
-                                'ob_ask_depth': ask_depth
+                                'ob_ask_depth': ask_depth,
+                                'ob_bid_slope': bid_slope,
+                                'ob_ask_slope': ask_slope,
+                                'ob_bid_integrity': bid_integrity,
+                                'ob_ask_integrity': ask_integrity
                             })
                             
                         except Exception as e:
@@ -221,17 +278,19 @@ class DataLoader:
                 # Aggregation
                 chunk_agg = df_chunk.resample(rule).agg({
                     'ob_spread': 'mean',
-                    'ob_micro_dev': ['mean', 'std', 'last'], # Last micro-dev shows immediate pressure
-                    'ob_imbalance': ['mean', 'last'],        # Persistent imbalance vs immediate
+                    'ob_micro_dev': ['mean', 'std', 'last'],
+                    'ob_imbalance': ['mean', 'last'],
                     'ob_bid_depth': 'mean',
-                    'ob_ask_depth': 'mean'
+                    'ob_ask_depth': 'mean',
+                    'ob_bid_slope': 'mean',
+                    'ob_ask_slope': 'mean',
+                    'ob_bid_integrity': 'mean',
+                    'ob_ask_integrity': 'mean'
                 })
                 
-                # Flatten cols
                 chunk_agg.columns = ['_'.join(col).strip() for col in chunk_agg.columns.values]
                 aggs.append(chunk_agg)
-                
-                print(f"  Processed {os.path.basename(f)}")
+                print(f"  Processed {os.path.basename(f)} ({line_counter} msgs)")
                 
             except Exception as e:
                 print(f"  Error {f}: {e}")
