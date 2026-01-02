@@ -1,6 +1,6 @@
 """
-Production-Grade Live Trading System.
-Features: State Persistence, Risk Management, Exchange Reconciliation, Verbose Dashboard.
+Sofia Lone Champion - Professional Live Trading System.
+Optimized for single-model high-fidelity execution.
 """
 import os
 import time
@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from config import CONF, GlobalConfig
 from exchange_client import ExchangeClient
@@ -26,21 +26,50 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(log_dir / "production_bot.log"),
+        logging.FileHandler(log_dir / "lone_champion.log"),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("ProdBot")
+logger = logging.getLogger("ChampionBot")
+
+class HealthMonitor:
+    """Tracks strategy health live to detect Concept Drift."""
+    def __init__(self, window=20):
+        self.window = window
+        self.outcomes = [] 
+        self.confidences = [] 
+        
+    def record_trade(self, pnl: float):
+        self.outcomes.append(1 if pnl > 0 else 0)
+        if len(self.outcomes) > self.window: self.outcomes.pop(0)
+        
+    def record_prediction(self, pred_val: float):
+        self.confidences.append(pred_val)
+        if len(self.confidences) > 12: self.confidences.pop(0)
+        
+    def check_sentiment(self):
+        if not self.confidences: return "CALIBRATING"
+        avg_conf = sum(self.confidences) / len(self.confidences)
+        state = "NEUTRAL (Healthy)"
+        if avg_conf > 0.75: state = "PINNED BULLISH (Trend Risk)"
+        elif avg_conf < 0.25: state = "PINNED BEARISH (Trend Risk)"
+        return f"{state} | 1H Avg: {avg_conf:.3f}"
+
+    def check_health(self):
+        if len(self.outcomes) < 5: return "CALIBRATING"
+        wr = sum(self.outcomes) / len(self.outcomes)
+        status = "HEALTHY"
+        if wr < 0.40: status = "CRITICAL (Drift Detected)"
+        elif wr < 0.50: status = "WARNING (Low WR)"
+        return f"{status} | Rolling WR: {wr:.1%}"
 
 class StateManager:
-    """Handles persistent state (disk I/O) to survive restarts."""
     def __init__(self, symbol: str):
-        self.file_path = Path(f"bot_state_{symbol}.json")
+        self.file_path = Path(f"bot_state_{symbol}_champion.json")
         self.state = {
             "total_pnl": 0.0,
-            "daily_pnl": 0.0,
-            "last_reset_date": datetime.utcnow().strftime('%Y-%m-%d'),
-            "active_orders": {},  # {order_id: {entry_bar: int, side: str}}
+            "max_equity": 0.0,
+            "active_orders": {},
             "position_entry_bar": None,
             "last_processed_bar": None
         }
@@ -49,570 +78,386 @@ class StateManager:
     def load(self):
         if self.file_path.exists():
             try:
-                with open(self.file_path, 'r') as f:
-                    self.state.update(json.load(f))
-                logger.info("State restored from disk.")
-            except Exception as e:
-                logger.error(f"Failed to load state: {e}")
+                with open(self.file_path, 'r') as f: self.state.update(json.load(f))
+                logger.info("Champion state restored.")
+            except: pass
 
     def save(self):
         try:
-            with open(self.file_path, 'w') as f:
-                json.dump(self.state, f, indent=4)
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-
-    def update_pnl(self, realized_pnl: float):
-        # Reset daily PnL if new day
-        today = datetime.utcnow().strftime('%Y-%m-%d')
-        if self.state["last_reset_date"] != today:
-            self.state["daily_pnl"] = 0.0
-            self.state["last_reset_date"] = today
+            with open(self.file_path, 'w') as f: json.dump(self.state, f, indent=4)
+        except: pass
         
-        self.state["total_pnl"] += realized_pnl
-        self.state["daily_pnl"] += realized_pnl
+    def update_pnl(self, pnl):
+        self.state["total_pnl"] += pnl
         self.save()
+        
+    def update_hwm(self, current_equity):
+        if current_equity > self.state["max_equity"]:
+            self.state["max_equity"] = current_equity
+            self.save()
 
 class RiskManager:
-    """Safety checks before execution."""
     def __init__(self, config: GlobalConfig, state: StateManager):
-        self.config = config
-        self.state = state
-
-    def can_trade(self, spread_pct: float) -> bool:
-        if spread_pct > self.config.live.max_spread_pct:
-            logger.warning(f"Risk: Spread too high ({spread_pct:.4%}). No trade.")
-            return False
-        return True
-
+        self.config, self.state = config, state
+        
     def check_drawdown(self, equity: float) -> bool:
-        limit = -1 * equity * self.config.live.max_daily_drawdown_pct
-        if self.state.state["daily_pnl"] < limit:
-            logger.critical(f"KILL SWITCH: Daily Drawdown Limit Hit ({self.state.state['daily_pnl']:.2f}). Stopping.")
-            return False
+        self.state.update_hwm(equity)
+        hwm = self.state.state["max_equity"]
+        if hwm > 0:
+            dd_pct = (equity - hwm) / hwm
+            if dd_pct < -0.10:
+                logger.critical(f"!!! KILL SWITCH TRIGGERED !!! Drawdown: {dd_pct:.2%}. Peak: ${hwm}.")
+                return False
         return True
 
 class LiveDataManager:
-    """
-    Maintains a rolling window of OHLCV + Orderbook bars.
-    Bootstraps history on startup for immediate readiness.
-    Accumulates snapshots to build high-fidelity bars.
-    """
-    def __init__(self, config: GlobalConfig, exchange: ExchangeClient, window_size: int = 500):
-        self.config = config
-        self.exchange = exchange
-        self.window_size = window_size
-        self.bars = pd.DataFrame()
-        self.ob_buffer = [] # Accumulator for current bar snapshots
-        self.current_bar_idx = None
-        
-        self.tf_seconds = 15 * 60 
-        if "5m" in config.features.base_timeframe: self.tf_seconds = 300
-        elif "15m" in config.features.base_timeframe: self.tf_seconds = 900
-        elif "1h" in config.features.base_timeframe: self.tf_seconds = 3600
-        
-        self.bootstrap_history()
+    def __init__(self, config: GlobalConfig, exchange: ExchangeClient):
+        self.config, self.exchange = config, exchange
+        self.trade_bars = pd.DataFrame()
+        self.ob_bars = pd.DataFrame()
+        self.ob_buffer, self.current_bar_idx, self.window_size = [], None, 500
+        self.total_snapshots = 0
+        self.new_bar_event = False
+        self.history_file = Path(f"data_history_{config.data.symbol}.csv")
+        self.load_history()
+        self.bootstrap()
 
-    def bootstrap_history(self):
-        """Fetch historical klines to pre-fill the bar window."""
-        logger.info(f"Bootstrapping history for {self.window_size} bars...")
+    def get_bars(self):
+        """Merge Trades and OB data on demand."""
+        if self.trade_bars.empty: return pd.DataFrame()
         
-        interval_map = {300: "5", 900: "15", 3600: "60", 14400: "240"}
-        bybit_interval = interval_map.get(self.tf_seconds, "15")
+        # Left join trades with OB (OB might be sparse or lagged)
+        merged = self.trade_bars.join(self.ob_bars, how='left')
         
-        klines = self.exchange.fetch_kline(interval=bybit_interval, limit=200)
-        
-        if klines.empty:
-            logger.error("Failed to bootstrap klines.")
-            return
+        # Forward fill OB data (last known state) and fill remaining with 0
+        merged.fillna(method='ffill', inplace=True)
+        merged.fillna(0, inplace=True)
+        return merged
 
+    def load_history(self):
+        if self.history_file.exists():
+            try:
+                df = pd.read_csv(self.history_file, index_col='datetime', parse_dates=True)
+                # Split back into components
+                ob_cols = ['ob_spread_mean', 'ob_imbalance_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean', 'ob_micro_dev_mean', 'ob_micro_dev_std']
+                trade_cols = [c for c in df.columns if c not in ob_cols]
+                
+                self.trade_bars = df[trade_cols].copy()
+                self.ob_bars = df[ob_cols].copy()
+                
+                if not self.trade_bars.empty: self.current_bar_idx = self.trade_bars.index[-1]
+                logger.info(f"Loaded {len(df)} bars from history.")
+            except Exception as e: logger.error(f"Failed to load history: {e}")
+
+    def save_history(self):
+        try:
+            df = self.get_bars()
+            if not df.empty:
+                save_df = df.iloc[-self.window_size:]
+                save_df.to_csv(self.history_file)
+        except Exception as e: logger.error(f"Failed to save history: {e}")
+
+    def bootstrap(self):
+        if len(self.trade_bars) >= self.window_size: return
+        logger.info("Bootstrapping history...")
+        klines = self.exchange.fetch_kline(interval="5", limit=200)
+        if klines.empty: return
         df = pd.DataFrame()
         df['datetime'] = pd.to_datetime(klines['timestamp'], unit='s')
         df.set_index('datetime', inplace=True)
+        df['open'], df['high'], df['low'], df['close'], df['volume'] = klines['open'], klines['high'], klines['low'], klines['close'], klines['volume']
+        df['vol_delta'], df['vol_buy'], df['vol_sell'], df['sell_vol'], df['trade_count'] = 0.0, df['volume']/2, df['volume']/2, df['volume']/2, 100
+        df['total_val'], df['vwap'], df['taker_buy_ratio'] = klines['turnover'], df['close'], 0.5
         
-        df['open'] = klines['open']
-        df['high'] = klines['high']
-        df['low'] = klines['low']
-        df['close'] = klines['close']
-        df['volume'] = klines['volume']
+        # Combine with existing
+        if not self.trade_bars.empty:
+            self.trade_bars = self.trade_bars.combine_first(df)
+            self.trade_bars.sort_index(inplace=True)
+            self.trade_bars = self.trade_bars.iloc[-self.window_size:]
+        else: self.trade_bars = df
         
-        df['vol_delta'] = 0.0
-        df['vol_buy'] = df['volume'] / 2.0
-        df['vol_sell'] = df['volume'] / 2.0
-        df['sell_vol'] = df['volume'] / 2.0
-        df['trade_count'] = 1 
-        df['total_val'] = klines['turnover']
-        df['vwap'] = df['total_val'] / df['volume'].replace(0, 1)
-        df['taker_buy_ratio'] = 0.5
-        
-        # Neutral init
-        df['ob_spread_mean'] = df['close'] * 0.0001
-        df['ob_imbalance_mean'] = 0.0
-        df['ob_bid_depth_mean'] = df['volume'] 
-        df['ob_ask_depth_mean'] = df['volume']
-        df['ob_micro_dev_mean'] = 0.0
-        df['ob_micro_dev_std'] = 0.0
-        
-        self.bars = df
-        if not self.bars.empty:
-            self.current_bar_idx = self.bars.index[-1]
-            
-        logger.info(f"History bootstrapped. Current bars: {len(self.bars)}")
+        if not self.trade_bars.empty: self.current_bar_idx = self.trade_bars.index[-1]
 
-    def update(self, ob_snapshot: dict):
-        """
-        Polls trades and accumulates OB snapshots.
-        """
-        trades = self.exchange.fetch_recent_trades(limit=100) 
-        self._process_new_trades(trades, is_bootstrap=False)
+    def update(self, ob_snapshot: dict) -> pd.DataFrame:
+        trades = self.exchange.fetch_recent_trades(limit=200)
+        self._process_trades(trades)
         
-        if self.bars.empty: return self.bars
+        if self.trade_bars.empty: return pd.DataFrame()
+        last_idx = self.trade_bars.index[-1]
         
-        # Check if we moved to a new bar
-        last_idx = self.bars.index[-1]
+        if self.current_bar_idx is None: self.current_bar_idx = last_idx
         if self.current_bar_idx != last_idx:
-            # New bar started, reset buffer
+            self.new_bar_event = True
             self.ob_buffer = []
             self.current_bar_idx = last_idx
             
-        if ob_snapshot:
+        if ob_snapshot: 
             self._buffer_snapshot(ob_snapshot, last_idx)
-            
-        return self.bars
-        
-    def _process_new_trades(self, trades_df: pd.DataFrame, is_bootstrap: bool = False):
+            self.total_snapshots += 1
+        return self.get_bars()
+
+    def _process_trades(self, trades_df):
         if trades_df.empty: return
-        
-        resample_rule = '5min' if self.tf_seconds == 300 else '15min'
         df = trades_df.copy()
-        
-        # Standardize
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
         df.set_index('datetime', inplace=True)
-        
         side_map = {'Buy': 1, 'Sell': -1}
         df['side_num'] = df['side'].map(side_map).fillna(0)
-        df['vol_buy'] = np.where(df['side_num']==1, df['size'], 0)
-        df['vol_sell'] = np.where(df['side_num']==-1, df['size'], 0)
-        df['dollar_val'] = df['price'] * df['size']
+        df['vol_buy'], df['vol_sell'], df['dollar_val'] = np.where(df['side_num']==1, df['size'], 0), np.where(df['side_num']==-1, df['size'], 0), df['price'] * df['size']
         df['vol_delta_calc'] = df['size'] * df['side_num']
-        
-        # Aggregate
+        resample_rule = '5min'
         ohlcv = df['price'].resample(resample_rule).ohlc()
-        agg = df.resample(resample_rule).agg({
-            'size': 'sum',
-            'vol_buy': 'sum',
-            'vol_sell': 'sum',
-            'side_num': 'count',
-            'dollar_val': 'sum',
-            'vol_delta_calc': 'sum'
-        }).rename(columns={'size': 'volume', 'side_num': 'trade_count', 'vol_delta_calc':'vol_delta'})
-
-        current_bars = pd.concat([ohlcv, agg], axis=1)
-        current_bars['vwap'] = current_bars['dollar_val'] / current_bars['volume'].replace(0, 1)
-        current_bars['taker_buy_ratio'] = current_bars['vol_buy'] / current_bars['volume'].replace(0, 1)
-        current_bars['sell_vol'] = current_bars['vol_sell']
+        agg = df.resample(resample_rule).agg({'size':'sum','vol_buy':'sum','vol_sell':'sum','side_num':'count','dollar_val':'sum','vol_delta_calc':'sum'}).rename(columns={'size':'volume','side_num':'trade_count','vol_delta_calc':'vol_delta'})
+        new_bars = pd.concat([ohlcv, agg], axis=1)
+        new_bars['vwap'] = new_bars['dollar_val'] / new_bars['volume'].replace(0, 1)
+        new_bars['taker_buy_ratio'] = new_bars['vol_buy'] / new_bars['volume'].replace(0, 1)
+        new_bars['sell_vol'] = new_bars['vol_sell']
+        new_bars.dropna(subset=['close'], inplace=True)
         
-        current_bars.dropna(subset=['close'], inplace=True)
-
-        if is_bootstrap:
-            self.bars = current_bars
+        if not self.trade_bars.empty:
+            last_idx = self.trade_bars.index[-1]
+            new_idx = new_bars.index[-1]
+            if new_idx == last_idx:
+                # Update in place
+                for col in new_bars.columns:
+                    self.trade_bars.loc[last_idx, col] = new_bars.loc[new_idx, col]
+            else:
+                self.trade_bars = pd.concat([self.trade_bars, new_bars])
         else:
-            if not self.bars.empty:
-                self.bars = self.bars[:-1]
-            self.bars = pd.concat([self.bars, current_bars])
-            self.bars = self.bars[~self.bars.index.duplicated(keep='last')]
+            self.trade_bars = new_bars
             
-        if len(self.bars) > self.window_size:
-            self.bars = self.bars.iloc[-self.window_size:]
-        
-        # Fix deprecated fillna
-        self.bars.ffill(inplace=True)
-        self.bars.fillna(0, inplace=True)
+        self.trade_bars = self.trade_bars[~self.trade_bars.index.duplicated(keep='last')]
+        if len(self.trade_bars) > self.window_size: self.trade_bars = self.trade_bars.iloc[-self.window_size:]
+        self.trade_bars.ffill(inplace=True)
 
     def _buffer_snapshot(self, ob, idx):
-        bids = ob.get('b', [])
-        asks = ob.get('a', [])
-        if not bids or not asks: 
-            return
-        
+        bids, asks = ob.get('b', []), ob.get('a', [])
+        if not bids or not asks: return
         bid_depth = sum([float(b[1]) for b in bids[:self.config.data.ob_levels]])
         ask_depth = sum([float(a[1]) for a in asks[:self.config.data.ob_levels]])
-        bb = float(bids[0][0])
-        ba = float(asks[0][0])
-        
-        # Micro
-        bb_s = float(bids[0][1])
-        ba_s = float(asks[0][1])
+        bb, ba = float(bids[0][0]), float(asks[0][0])
+        bb_s, ba_s = float(bids[0][1]), float(asks[0][1])
         micro = (ba * bb_s + bb * ba_s) / (bb_s + ba_s + 1e-9)
         mid = (ba + bb) / 2
-        
-        snap = {
-            'spread': ba - bb,
-            'imbalance': (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-9),
-            'bid_depth': bid_depth,
-            'ask_depth': ask_depth,
-            'micro_dev': micro - mid
-        }
-        self.ob_buffer.append(snap)
-        
-        # Update Current Bar State
+        self.ob_buffer.append({'spread':ba-bb,'imbalance':(bid_depth-ask_depth)/(bid_depth+ask_depth+1e-9),'bid_depth':bid_depth,'ask_depth':ask_depth,'micro_dev':micro-mid})
         df_buf = pd.DataFrame(self.ob_buffer)
-        self.bars.loc[idx, 'ob_spread_mean'] = df_buf['spread'].mean()
-        self.bars.loc[idx, 'ob_imbalance_mean'] = df_buf['imbalance'].mean()
-        self.bars.loc[idx, 'ob_bid_depth_mean'] = df_buf['bid_depth'].mean()
-        self.bars.loc[idx, 'ob_ask_depth_mean'] = df_buf['ask_depth'].mean()
-        self.bars.loc[idx, 'ob_micro_dev_mean'] = df_buf['micro_dev'].mean()
-        self.bars.loc[idx, 'ob_micro_dev_std'] = df_buf['micro_dev'].std() if len(df_buf) > 1 else 0.0
-
-class ProductionBot:
-    def __init__(self, rank_dir: str):
-        self.config = CONF
         
-        # 1. API Keys
-        key = os.getenv("BYBIT_API_KEY")
-        secret = os.getenv("BYBIT_API_SECRET")
+        # Update Separate OB DataFrame
+        # If row exists, update. If not, create.
+        vals = [df_buf['spread'].mean(), df_buf['imbalance'].mean(), df_buf['bid_depth'].mean(), df_buf['ask_depth'].mean(), df_buf['micro_dev'].mean()]
+        cols = ['ob_spread_mean','ob_imbalance_mean','ob_bid_depth_mean','ob_ask_depth_mean','ob_micro_dev_mean']
+        
+        if idx not in self.ob_bars.index:
+            # Create new row
+            new_row = pd.DataFrame([vals + [0.0]], columns=cols+['ob_micro_dev_std'], index=[idx])
+            self.ob_bars = pd.concat([self.ob_bars, new_row])
+        else:
+            self.ob_bars.loc[idx, cols] = vals
+            self.ob_bars.loc[idx, 'ob_micro_dev_std'] = df_buf['micro_dev'].std() if len(df_buf) > 1 else 0.0
+            
+        if len(self.ob_bars) > self.window_size: self.ob_bars = self.ob_bars.iloc[-self.window_size:]
+
+class ChampionBot:
+    def __init__(self, model_root: str):
+        self.config = CONF
+        key, secret = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
         if not key or not secret:
-            logger.warning("API Keys not found in ENV. Using Dry Run mode.")
             self.config.live.dry_run = True
-            key = "dummy"
-            secret = "dummy"
+            key, secret = "dummy", "dummy"
+        else: self.config.live.dry_run = False
             
         self.exchange = ExchangeClient(key, secret, self.config.data.symbol)
-        
-        # Fetch Instrument Rules
-        self.instr_info = {}
-        if not self.config.live.dry_run:
-            self.instr_info = self.exchange.fetch_instrument_info()
-            logger.info(f"Instrument Rules: {self.instr_info}")
-        
-        # 2. Components
+        if not self.config.live.dry_run: self.exchange.set_leverage(10)
+            
+        self.instr_info = self.exchange.fetch_instrument_info() if not self.config.live.dry_run else {'min_qty':1.0,'qty_step':0.1,'tick_size':0.0001}
         self.state = StateManager(self.config.data.symbol)
         self.risk = RiskManager(self.config, self.state)
+        self.health = HealthMonitor()
         self.data = LiveDataManager(self.config, self.exchange)
         self.fe = FeatureEngine(self.config.features)
-        self.mm = ModelManager(self.config.model)
         
-        # 3. Load Model
-        self._load_champion(rank_dir)
-        self._print_system_manifest(rank_dir)
-        
-        self.error_count = 0
+        # Load Lone Champion
+        self._load_champion(model_root)
+        self._print_manifest(model_root)
 
-    def _load_champion(self, rank_dir):
-        path = Path(rank_dir)
-        if not path.exists():
-            raise FileNotFoundError(f"Model path {path} not found!")
-            
-        with open(path / "params.json") as f:
-            p = json.load(f)
-            
-        self.config.strategy.base_limit_offset_atr = p['limit_offset_atr']
-        self.config.strategy.take_profit_atr = p['take_profit_atr']
-        self.config.strategy.stop_loss_atr = p['stop_loss_atr']
-        self.config.model.model_threshold = p['model_threshold']
-        
-        self.mm.model_long = joblib.load(path / "model_long.pkl")
-        self.mm.model_short = joblib.load(path / "model_short.pkl")
-        self.mm.feature_cols = joblib.load(path / "features.pkl")
+    def _load_champion(self, root):
+        root_path = Path(root)
+        rank_path = root_path / "rank_1"
+        if not rank_path.exists(): raise Exception("No champion found in rank_1!")
+        logger.info(f"Loading Champion from {rank_path}...")
+        with open(rank_path / "params.json") as f: p = json.load(f)
+        self.champion = {
+            'ml': joblib.load(rank_path / "model_long.pkl"),
+            'ms': joblib.load(rank_path / "model_short.pkl"),
+            'features': joblib.load(rank_path / "features.pkl"),
+            'params': p
+        }
 
-    def _print_system_manifest(self, rank_dir):
-        """Prints a detailed report of the bot's configuration and health on startup."""
-        logger.info("\n" + "="*60)
-        logger.info("PRE-FLIGHT SYSTEM MANIFEST")
-        logger.info("="*60)
-        
-        # 1. Environment & Paths
-        logger.info(f"[PATHS]")
-        logger.info(f"  Symbol:         {self.config.data.symbol}")
-        logger.info(f"  Model Folder:   {rank_dir}")
-        logger.info(f"  Data Folder:    {self.config.data.data_dir}")
-        logger.info(f"  State File:     {self.state.file_path}")
-        
-        # 2. Model & Features
-        logger.info(f"\n[MODEL BRAIN]")
-        logger.info(f"  Feature Count:  {len(self.mm.feature_cols)}")
-        logger.info(f"  Model Type:     {self.config.model.model_type}")
-        logger.info(f"  Threshold:      {self.config.model.model_threshold:.3f}")
-        
-        # 3. Strategy Parameters
-        logger.info(f"\n[STRATEGY]")
-        logger.info(f"  Limit Offset:   {self.config.strategy.base_limit_offset_atr:.3f} ATR")
-        logger.info(f"  Take Profit:    {self.config.strategy.take_profit_atr:.3f} ATR")
-        logger.info(f"  Stop Loss:      {self.config.strategy.stop_loss_atr:.3f} ATR")
-        logger.info(f"  Order Timeout:  {self.config.strategy.time_limit_bars} bars")
-        
-        # 4. Account & Network Health
-        logger.info(f"\n[ACCOUNT & NETWORK]")
+    def _print_manifest(self, root):
+        logger.info("\n" + "="*60 + f"\nLONE CHAMPION STARTUP MANIFEST\n" + "="*60)
+        logger.info(f"Symbol: {self.config.data.symbol} | Model Root: {root}")
+        logger.info(f"Clock Drift: {self.exchange.check_time_sync():.1f}ms")
         if not self.config.live.dry_run:
-            t0 = time.time()
             bal = self.exchange.get_wallet_balance()
-            latency = (time.time() - t0) * 1000
-            pos = self.exchange.get_position()
-            
-            logger.info(f"  Latency (Ping): {latency:.1f}ms")
-            logger.info(f"  USDT Equity:    ${bal.get('equity', 0.0):.2f}")
-            logger.info(f"  Available:      ${bal.get('available', 0.0):.2f}")
-            logger.info(f"  Current Pos:    {pos}")
-        else:
-            logger.info("  MODE: DRY RUN (Simulated)")
-            logger.info("  Latency: N/A")
-            logger.info("  Balance: $10,000.00 (Dummy)")
-            
+            logger.info(f"Account: ${bal['equity']:.2f} Equity | ${bal['available']:.2f} Available")
+        else: logger.info("MODE: DRY RUN")
         logger.info("="*60 + "\n")
 
     def run(self):
-        logger.info(f"Bot Started. Dry Run: {self.config.live.dry_run}")
-        
-        last_poll = 0
-        last_reconcile = 0
-        
+        last_poll, last_reconcile, last_status, last_risk_check = 0, 0, 0, 0
         while True:
             try:
                 now = time.time()
-                
-                # 1. High-Frequency Polling (Every 1s)
+                if now - last_risk_check >= 5.0:
+                    if not self._monitor_risk(): break
+                    last_risk_check = now
                 if now - last_poll >= 1.0:
-                    self._tick_fast()
+                    self.data.update(self.exchange.fetch_orderbook())
                     last_poll = now
-                
-                # 2. Reconcile (Every 60s)
+                if now - last_status >= 30.0:
+                    # Use trade_bars for quick stats (faster than get_bars merge)
+                    curr_p = self.data.trade_bars['close'].iloc[-1] if not self.data.trade_bars.empty else 0.0
+                    pos_s = self.exchange.get_position() if not self.config.live.dry_run else 0.0
+                    logger.info(f"[HEARTBEAT] Price: {curr_p:.4f} | Pos: {pos_s} | Bars: {len(self.data.trade_bars)} | Snaps: {len(self.data.ob_buffer)} | Health: {self.health.check_health()}")
+                    last_status = now
                 if now - last_reconcile >= 60.0:
                     self._reconcile()
                     last_reconcile = now
-                    
-                # 3. Bar Close Logic
                 self._check_bar_close()
-                
-                # SUCCESS: Reset error counters
-                self.error_count = 0
-                
                 time.sleep(0.1)
-                
-            except KeyboardInterrupt:
-                logger.info("Stopping...")
-                break
+            except KeyboardInterrupt: break
             except Exception as e:
-                err_str = str(e).lower()
-                
-                # 1. Check for Fatal Errors (Auth/IP)
-                if "10003" in err_str or "ip" in err_str or "permission" in err_str or "auth" in err_str:
-                    logger.critical(f"FATAL API ERROR: {e}. Checking API Permissions/IP Binding.")
-                    break
-                
-                # 2. Network/Transient Errors -> Exponential Backoff
-                self.error_count += 1
-                
-                # Backoff: 5s, 10s, 20s, 40s... max 60s
-                sleep_time = min(5 * (2 ** (self.error_count - 1)), 60)
-                
-                logger.error(f"Network/API Error ({self.error_count}/{self.config.live.max_api_errors}): {e}")
-                logger.info(f"Retrying in {sleep_time}s...")
-                
-                if self.error_count >= self.config.live.max_api_errors:
-                    logger.critical("Max errors exceeded. Connection lost for too long. Shutting down.")
-                    break
-                    
-                time.sleep(sleep_time)
-                
-                # Attempt to Re-Initialize Client if connection completely broke
-                if self.error_count > 2:
-                    try:
-                        logger.info("Attempting to re-initialize Exchange Client...")
-                        key = os.getenv("BYBIT_API_KEY")
-                        secret = os.getenv("BYBIT_API_SECRET")
-                        if key and secret:
-                            self.exchange = ExchangeClient(key, secret, self.config.data.symbol)
-                            # Update references
-                            self.data.exchange = self.exchange
-                    except:
-                        pass # Keep retrying loop
+                logger.error(f"Loop Error: {e}\n{traceback.format_exc()}")
+                time.sleep(5)
 
-    def _tick_fast(self):
-        ob = self.exchange.fetch_orderbook()
-        self.data.update(ob)
+    def _monitor_risk(self) -> bool:
+        if self.config.live.dry_run: return True
+        try:
+            bal = self.exchange.get_wallet_balance()
+            equity = bal.get('equity', 0.0)
+            if not self.risk.check_drawdown(equity):
+                self._emergency_shutdown()
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Risk Monitor Error: {e}")
+            return True
+
+    def _emergency_shutdown(self):
+        logger.critical("!!! EMERGENCY SHUTDOWN PROTOCOL !!!")
+        for i in range(1, 11):
+            try:
+                self.exchange.cancel_all_orders()
+                self.exchange.close_all_positions()
+                time.sleep(2.0)
+                if self.exchange.get_position() == 0:
+                    logger.info("SUCCESS: Account Flat. Exiting.")
+                    os._exit(0)
+            except Exception as e: logger.error(f"Retry {i} failed: {e}")
+        while True:
+            try:
+                import winsound
+                winsound.Beep(1000, 500); winsound.Beep(500, 500)
+            except: print('\a')
+            self.exchange.close_all_positions()
+            time.sleep(5)
 
     def _check_bar_close(self):
-        if len(self.data.bars) < 60: return
-
-        now = datetime.utcnow()
-        # Trigger window
-        bar_min = 5 if self.data.tf_seconds == 300 else 15
-        is_close_window = (now.minute % bar_min == 0) and (now.second < 10)
-        
-        if is_close_window:
-            df = self.data.bars
-            last_closed_time = df.index[-2]
+        if self.data.new_bar_event:
+            self.data.new_bar_event = False
             
-            if self.state.state["last_processed_bar"] != str(last_closed_time):
-                logger.info(f"\n{'='*20} BAR CLOSE: {last_closed_time} {'='*20}")
+            # Use get_bars() for the full picture
+            full_bars = self.data.get_bars()
+            
+            if len(full_bars) < 60:
+                logger.warning(f"History too short ({len(full_bars)} bars). Waiting for 60.")
+                return
                 
-                self._reconcile()
-                
-                df_feat = self.fe.calculate_features(df)
-                df_pred = self.mm.predict(df_feat)
-                latest = df_pred.iloc[-2]
-                
-                # Measuring Latency for Dashboard
-                t0 = time.time()
-                bal = self.exchange.get_wallet_balance() if not self.config.live.dry_run else {'equity':10000}
-                latency = (time.time() - t0) * 1000
-                equity = bal.get('equity', 0.0)
-                
-                self._log_dashboard(latest, equity, latency)
-                
-                spread_pct = latest['ob_spread_mean'] / latest['close']
-                if self.risk.can_trade(spread_pct) and self.risk.check_drawdown(equity):
-                    self._execute_logic(latest)
-                
-                self.state.state["last_processed_bar"] = str(last_closed_time)
-                self.state.save()
+            last_closed_time = full_bars.index[-2]
+            
+            logger.info(f"\n>>> CHAMPION DECISION FOR BAR: {last_closed_time} <<<")
+            logger.info(f"[DIAG] Bars: {len(full_bars)} | Total Snaps: {self.data.total_snapshots} | Sentiment: {self.health.check_sentiment()}")
+            
+            self._reconcile()
+            df_feat = self.fe.calculate_features(full_bars)
+            self._execute_champion(df_feat.iloc[-2])
+            
+            self.state.state["last_processed_bar"] = str(last_closed_time)
+            self.state.save()
+            self.data.save_history()
 
-    def _log_dashboard(self, row, equity, latency):
-        pos_size = self.exchange.get_position() if not self.config.live.dry_run else 0
+    def _execute_champion(self, row):
+        c = self.champion
+        feature_names = c['features']
         
-        logger.info(f"--- SYSTEM HEALTH ---")
-        logger.info(f"Latency: {latency:.1f}ms | Balance: ${equity:.2f} | Position: {pos_size}")
+        # Log Feature Inputs (Transparency)
+        if logger.isEnabledFor(logging.INFO):
+            msg = f"\n[FEATURES] Input Vector ({len(feature_names)} features):\n"
+            # Format in columns of 3
+            for i in range(0, len(feature_names), 3):
+                chunk = feature_names[i:i+3]
+                line = " | ".join([f"{name}: {row[name]:.4f}" for name in chunk])
+                msg += f"  {line}\n"
+            logger.info(msg)
+
+        X = row[feature_names].values.reshape(1, -1)
+        pred_l, pred_s = c['ml'].predict(X)[0], c['ms'].predict(X)[0]
+        thresh = c['params']['model_threshold']
+        self.health.record_prediction(max(pred_l, pred_s))
+        logger.info(f"Verdict: Long {pred_l:.3f} | Short {pred_s:.3f} | Thresh {thresh:.3f}")
         
-        logger.info(f"--- MARKET STATE ---")
-        logger.info(f"Price: {row['close']:.4f} | ATR: {row['atr']:.4f} | Spread: {row['ob_spread_mean']:.5f}")
-        logger.info(f"Imbalance Z: {row.get('ob_imbalance_z', 0):.2f} | MicroDev: {row.get('ob_micro_dev_mean', 0):.4f}")
-        
-        logger.info(f"--- MODEL BRAIN ---")
-        logger.info(f"Long Pred:  {row['pred_long']:.3f} (Thresh: {self.config.model.model_threshold:.3f})")
-        logger.info(f"Short Pred: {row['pred_short']:.3f}")
-        
-        if row['pred_long'] > self.config.model.model_threshold:
-            logger.info(">>> SIGNAL: BULLISH")
-        elif row['pred_short'] > self.config.model.model_threshold:
-            logger.info(">>> SIGNAL: BEARISH")
-        else:
-            logger.info(">>> SIGNAL: NEUTRAL")
-        logger.info(f"{ '='*50}\n")
+        if pred_l > thresh: self._place_trade(row, "Buy", c['params'])
+        elif pred_s > thresh: self._place_trade(row, "Sell", c['params'])
+
+    def _place_trade(self, row, side, p):
+        if self.exchange.get_position() != 0 or self.state.state["active_orders"]: return
+        price = row['close'] - (row['atr'] * p['limit_offset_atr']) if side == "Buy" else row['close'] + (row['atr'] * p['limit_offset_atr'])
+        tick = self.instr_info.get('tick_size', 0.0001)
+        price = round(round(price / tick) * tick, 5)
+        bal = self.exchange.get_wallet_balance() if not self.config.live.dry_run else {'equity':10000}
+        risk_d = bal['equity'] * self.config.strategy.risk_per_trade
+        qty = risk_d / (row['atr'] * p['stop_loss_atr'])
+        qty_n = 6.0 / price
+        final_qty = max(qty, self.instr_info.get('min_qty', 1.0), qty_n)
+        max_lev_qty = (bal['equity'] * 5.0) / price
+        final_qty = min(final_qty, max_lev_qty)
+        step = self.instr_info.get('qty_step', 0.1)
+        final_qty = round(int(final_qty/step)*step, 5)
+        tp_p = price + (row['atr'] * p['take_profit_atr']) if side == "Buy" else price - (row['atr'] * p['take_profit_atr'])
+        sl_p = price - (row['atr'] * p['stop_loss_atr']) if side == "Buy" else price + (row['atr'] * p['stop_loss_atr'])
+        tp_p = round(round(tp_p / tick) * tick, 5); sl_p = round(round(sl_p / tick) * tick, 5)
+        logger.info(f"!!! TRADING: {side} @ {price} [TP: {tp_p} | SL: {sl_p}] Notional: ${final_qty*price:.2f} !!!")
+        if not self.config.live.dry_run:
+            resp = self.exchange.place_limit_order(side, price, final_qty, tp=tp_p, sl=sl_p)
+            # Use trade_bars length for indexing
+            if resp: self.state.state["active_orders"][resp['result']['orderId']] = {'idx': len(self.data.trade_bars), 'side': side}
 
     def _reconcile(self):
         if self.config.live.dry_run: return
-        open_orders = self.exchange.get_open_orders()
-        active_ids = [o['orderId'] for o in open_orders]
-        pos_size = self.exchange.get_position()
-        
+        orders = self.exchange.get_open_orders()
+        ids = [o['orderId'] for o in orders]
+        pos = self.exchange.get_position()
         tracked = list(self.state.state["active_orders"].keys())
         for oid in tracked:
-            if oid not in active_ids:
-                if abs(pos_size) > 0:
-                    logger.info(f"Order {oid} filled.")
-                    if self.state.state["position_entry_bar"] is None:
-                        self.state.state["position_entry_bar"] = self.state.state["active_orders"][oid]['idx']
-                else:
-                    logger.info(f"Order {oid} gone.")
+            if oid not in ids:
+                if abs(pos) > 0 and self.state.state["position_entry_bar"] is None:
+                    self.state.state["position_entry_bar"] = self.state.state["active_orders"][oid]['idx']
                 del self.state.state["active_orders"][oid]
-        
-        if pos_size == 0:
+        if pos == 0 and self.state.state["position_entry_bar"] is not None:
+            try:
+                closed = self.exchange.fetch_closed_pnl(limit=1)
+                if closed:
+                    pnl = float(closed[0]['closedPnl'])
+                    self.health.record_trade(pnl)
+                    self.state.update_pnl(pnl)
+                    logger.info(f"Trade Closed. PnL: {pnl:.4f} USDT | Health: {self.health.check_health()}")
+            except: pass
             self.state.state["position_entry_bar"] = None
         self.state.save()
 
-    def _execute_logic(self, row):
-        current_idx = len(self.data.bars)
-        
-        # 1. Position Timeout
-        pos_size = self.exchange.get_position() if not self.config.live.dry_run else 0
-        entry_bar = self.state.state["position_entry_bar"]
-        
-        if abs(pos_size) > 0 and entry_bar is not None:
-            elapsed = current_idx - entry_bar
-            if elapsed >= self.config.strategy.max_holding_bars:
-                logger.warning(f"POSITION TIMEOUT. Closing.")
-                side = "Buy" if pos_size > 0 else "Sell"
-                if not self.config.live.dry_run:
-                    self.exchange.market_close(side, abs(pos_size))
-                return
-
-        # 2. Order Timeout
-        to_cancel = []
-        for oid, info in self.state.state["active_orders"].items():
-            if (current_idx - info['idx']) > self.config.strategy.time_limit_bars:
-                logger.info(f"Order {oid} timed out. Canceling.")
-                to_cancel.append(oid)
-        
-        if to_cancel and not self.config.live.dry_run:
-            self.exchange.cancel_all_orders() 
-            self.state.state["active_orders"] = {}
-            
-        # 3. Place New
-        has_orders = len(self.state.state["active_orders"]) > 0
-        
-        if pos_size == 0 and not has_orders:
-            threshold = self.config.model.model_threshold
-            if row['pred_long'] > threshold:
-                self._place_order(row, "Buy", current_idx)
-
-    def _place_order(self, row, side, idx):
-        price = float(row['close']) - (float(row['atr']) * self.config.strategy.base_limit_offset_atr)
-        
-        # Tick Rounding
-        tick_size = self.instr_info.get('tick_size', 0.0001)
-        price = round(price / tick_size) * tick_size
-        price = round(price, 5) 
-        
-        # Get Equity for Sizing
-        equity = 10000.0 # Default for Dry Run
-        if not self.config.live.dry_run:
-            bal = self.exchange.get_wallet_balance()
-            equity = bal.get('equity', 0.0)
-            
-        # Calc Size: Risk % of Equity
-        # Position Size = (Equity * Risk%) / StopDist%
-        stop_atr = self.config.strategy.stop_loss_atr
-        risk_pct = self.config.strategy.risk_per_trade
-        
-        # Stop Distance in Price
-        stop_dist_price = float(row['atr']) * stop_atr
-        
-        if stop_dist_price <= 0 or equity <= 0: return
-        
-        # Max Dollar Risk (e.g. $10 * 0.01 = $0.10 risk)
-        risk_dollars = equity * risk_pct
-        
-        # Qty = Risk$ / StopDist$
-        qty = risk_dollars / stop_dist_price
-        
-        # Leverage Check (Safety Cap)
-        # Don't exceed 5x leverage even if stop is tight
-        max_qty_lev = (equity * 5.0) / price
-        qty = min(qty, max_qty_lev)
-        
-        # Step Rounding
-        qty_step = self.instr_info.get('qty_step', 0.1)
-        qty = int(qty / qty_step) * qty_step
-        qty = round(qty, 5)
-        
-        # Min Qty Check
-        min_qty = self.instr_info.get('min_qty', 0.0)
-        if qty < min_qty:
-            if min_qty > 0:
-                logger.info(f"Calculated Qty {qty} < Min {min_qty}. Flooring to Min Qty to enable execution.")
-                qty = min_qty
-            else:
-                logger.warning(f"Could not determine Min Qty. Skipping.")
-                return
-            
-        logger.info(f"SIGNAL: {side} Limit @ {price} (Qty: {qty}) [Eq: ${equity:.2f} Risk: ${risk_dollars:.2f}]")
-        
-        if not self.config.live.dry_run:
-            resp = self.exchange.place_limit_order(side, price, qty)
-            if resp:
-                oid = resp.get('result', {}).get('orderId')
-                if oid:
-                    self.state.state["active_orders"][oid] = {'idx': idx, 'side': side}
-                    self.state.save()
-
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Liquidity Provision Live Trader")
-    default_model = f"models_v2/{CONF.data.symbol}/rank_1"
-    parser.add_argument("--model-dir", type=str, default=default_model, help=f"Path to model (default: {default_model})")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-root", type=str, default="models_v4/RAVEUSDT")
     args = parser.parse_args()
-    
-    logger.info(f"Starting Live Trader for {CONF.data.symbol}")
-    bot = ProductionBot(args.model_dir)
-    bot.run()
+    ChampionBot(args.model_root).run()

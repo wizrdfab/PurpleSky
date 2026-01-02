@@ -21,17 +21,50 @@ class ExchangeClient:
         )
         print(f"Connected to Bybit {'Testnet' if testnet else 'Mainnet'} for {symbol}")
 
+    def check_time_sync(self) -> float:
+        """
+        Check NTP drift between local machine and Bybit.
+        Returns drift in ms.
+        """
+        try:
+            t0 = time.time()
+            resp = self.session.get_server_time()
+            t1 = time.time()
+            
+            # Latency adjustment (RTT / 2)
+            rtt = (t1 - t0) * 1000
+            server_time = int(resp.get('result', {}).get('timeSecond', 0)) * 1000
+            # If server sends nanoseconds, adjust. Bybit usually sends string seconds or ms.
+            # V5 get_server_time returns 'timeSecond' (str) and 'timeNano' (str)
+            # Let's use timeNano for precision if available
+            nano = resp.get('result', {}).get('timeNano')
+            if nano:
+                server_time = int(nano) / 1_000_000 # Convert to ms
+            
+            local_time = t1 * 1000
+            drift = abs(local_time - (server_time + rtt/2))
+            
+            if drift > 1000:
+                logger.warning(f"High Clock Drift detected: {drift:.1f}ms. Please sync Windows Time.")
+            
+            return drift
+        except Exception as e:
+            logger.error(f"Time Sync Check failed: {e}")
+            return 0.0
+
     def fetch_recent_trades(self, limit: int = 1000) -> pd.DataFrame:
         """
         Fetch recent trades to build bars.
         """
         try:
+            logger.debug(f"Fetching trades limit={limit}...")
             resp = self.session.get_public_trade_history(
                 category="linear",
                 symbol=self.symbol,
                 limit=limit
             )
             data = resp.get('result', {}).get('list', [])
+            logger.debug(f"Fetched {len(data)} trades.")
             if not data:
                 return pd.DataFrame()
             
@@ -55,6 +88,7 @@ class ExchangeClient:
         Interval: '1', '3', '5', '15', '30', '60', '120', '240', '360', '720', 'D', 'M', 'W'
         """
         try:
+            logger.debug(f"Fetching kline int={interval} lim={limit}...")
             resp = self.session.get_kline(
                 category="linear",
                 symbol=self.symbol,
@@ -62,6 +96,7 @@ class ExchangeClient:
                 limit=limit
             )
             data = resp.get('result', {}).get('list', [])
+            logger.debug(f"Fetched {len(data)} klines.")
             # Bybit returns list of lists: [startTime, open, high, low, close, volume, turnover]
             # And it returns them in REVERSE order (newest first).
             if not data:
@@ -85,18 +120,55 @@ class ExchangeClient:
             logger.error(f"Error fetching klines: {e}")
             return pd.DataFrame()
 
-    def fetch_orderbook(self, limit: int = 50) -> Dict:
+    def set_leverage(self, leverage: int = 10):
+        """
+        Set Buy/Sell leverage for the symbol.
+        """
+        try:
+            self.session.set_leverage(
+                category="linear",
+                symbol=self.symbol,
+                buyLeverage=str(leverage),
+                sellLeverage=str(leverage)
+            )
+            logger.info(f"Leverage set to {leverage}x.")
+        except Exception as e:
+            # Common error: "leverage not modified" (already set). We ignore it.
+            msg = str(e)
+            if "not modified" not in msg and "110043" not in msg:
+                logger.warning(f"Could not set leverage: {msg}")
+
+    def fetch_closed_pnl(self, limit: int = 50) -> List[Dict]:
+        """
+        Fetch closed Profit/Loss history.
+        """
+        try:
+            resp = self.session.get_closed_pnl(
+                category="linear",
+                symbol=self.symbol,
+                limit=limit
+            )
+            return resp.get('result', {}).get('list', [])
+        except Exception as e:
+            logger.error(f"Error fetching closed PnL: {e}")
+            return []
+
+    def fetch_orderbook(self, limit: int = 200) -> Dict:
         """
         Fetch current L2 Orderbook snapshot.
         """
         try:
+            # Too noisy to log every request, but useful for deep debug
+            # logger.debug(f"Fetching OB limit={limit}...") 
             resp = self.session.get_orderbook(
                 category="linear",
                 symbol=self.symbol,
                 limit=limit
             )
             # Returns {'s': symbol, 'b': [[p, s], ...], 'a': [[p, s], ...], 'ts': timestamp}
-            return resp.get('result', {})
+            res = resp.get('result', {})
+            # logger.debug(f"OB Fetched. TS: {res.get('ts')}")
+            return res
         except Exception as e:
             logger.error(f"Error fetching orderbook: {e}")
             return {}
@@ -130,6 +202,38 @@ class ExchangeClient:
         except Exception as e:
             logger.error(f"Error getting position: {e}")
             return 0.0
+
+    def close_all_positions(self):
+        """
+        Safety: Close ALL positions for this symbol (Long and Short).
+        Handles Hedge Mode by iterating through the full list.
+        """
+        try:
+            resp = self.session.get_positions(
+                category="linear",
+                symbol=self.symbol
+            )
+            positions = resp.get('result', {}).get('list', [])
+            
+            for p in positions:
+                size = self._safe_float(p.get('size'))
+                if size > 0:
+                    side = p.get('side') # 'Buy' or 'Sell'
+                    # To close Buy, we Sell. To close Sell, we Buy.
+                    close_side = "Sell" if side == "Buy" else "Buy"
+                    
+                    logger.info(f"Closing {side} position of {size}...")
+                    self.session.place_order(
+                        category="linear",
+                        symbol=self.symbol,
+                        side=close_side,
+                        orderType="Market",
+                        qty=str(size),
+                        reduceOnly=True,
+                        positionIdx=p.get('positionIdx', 0) # Important for Hedge Mode
+                    )
+        except Exception as e:
+            logger.error(f"Error in close_all_positions: {e}")
 
     def get_wallet_balance(self) -> Dict[str, float]:
         """Get Unified Account Balance with Fallback."""
@@ -217,19 +321,23 @@ class ExchangeClient:
             logger.error(f"Error fetching instrument info: {e}")
             return {}
 
-    def place_limit_order(self, side: str, price: float, qty: float, reduce_only: bool = False):
-        """Place a Limit order."""
+    def place_limit_order(self, side: str, price: float, qty: float, tp: float = 0, sl: float = 0, reduce_only: bool = False):
+        """Place a Limit order with attached TP/SL."""
         try:
-            resp = self.session.place_order(
-                category="linear",
-                symbol=self.symbol,
-                side=side, # "Buy" or "Sell"
-                orderType="Limit",
-                qty=str(qty),
-                price=str(price),
-                timeInForce="PostOnly", # Maker only
-                reduceOnly=reduce_only
-            )
+            params = {
+                "category": "linear",
+                "symbol": self.symbol,
+                "side": side, # "Buy" or "Sell"
+                "orderType": "Limit",
+                "qty": str(qty),
+                "price": str(price),
+                "timeInForce": "PostOnly", # Maker only
+                "reduceOnly": reduce_only
+            }
+            if tp > 0: params["takeProfit"] = str(tp)
+            if sl > 0: params["stopLoss"] = str(sl)
+            
+            resp = self.session.place_order(**params)
             return resp
         except Exception as e:
             # Sanitize error message for Windows consoles

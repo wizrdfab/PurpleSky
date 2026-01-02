@@ -37,7 +37,7 @@ class ModelManager:
             'learning_rate': self.config.learning_rate,
             'num_leaves': self.config.num_leaves,
             'max_depth': self.config.max_depth,
-            'min_child_samples': self.config.min_child_samples,
+            'min_child_samples': 100, # Increased for robustness
             'subsample': self.config.subsample,
             'colsample_bytree': self.config.colsample_bytree,
             'rate_drop': self.config.rate_drop,

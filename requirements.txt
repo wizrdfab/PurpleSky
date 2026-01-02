@@ -10,5 +10,5 @@ lightgbm>=4.0.0
 scikit-learn>=1.3.0
 optuna>=3.5.0
 
-# Optional: live trading (pybit is bundled in pybit-master/)
-# pybit>=5.0.0
+# Pybit for interface with Bybit
+pybit>=5.0.0

@@ -17,7 +17,7 @@ class DataConfig:
     price_col: str = "price"
     size_col: str = "size"
     side_col: str = "side"
-    ob_levels: int = 50 
+    ob_levels: int = 50
 
 @dataclass
 class StrategyConfig:
@@ -27,8 +27,8 @@ class StrategyConfig:
     stop_loss_atr: float = 3.9       
     take_profit_atr: float = 0.8     
     maker_fee: float = 0.0002
-    taker_fee: float = 0.0005
-    risk_per_trade: float = 0.05    
+    taker_fee: float = 0.0006
+    risk_per_trade: float = 0.04    
     max_positions: int = 1
 
 @dataclass
@@ -52,12 +52,12 @@ class FeatureConfig:
 @dataclass
 class ModelConfig:
     model_type: str = "lightgbm_dart"
-    model_dir: Path = Path("models_v2")
+    model_dir: Path = Path("models_v3")
     n_estimators: int = 1500
     learning_rate: float = 0.05
     max_depth: int = 5           
     num_leaves: int = 32         
-    min_child_samples: int = 50  
+    min_child_samples: int = 20  # Relaxed from 50
     subsample: float = 0.7
     colsample_bytree: float = 0.6
     rate_drop: float = 0.1       

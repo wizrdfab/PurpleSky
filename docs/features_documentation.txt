@@ -1,0 +1,25 @@
+Models v4
+
+Technicals & Flow (11)
+   1. `vol_buy`: Aggressive buying volume.
+   2. `taker_buy_ratio`: Percentage of volume that was market-buy.
+   3. `atr`: Volatility measurement.
+   4. `ema_9` / `dist_ema_9`: Short-term trend & distance from mean.
+   5. `ema_21` / `dist_ema_21`: Medium-term trend & distance from mean.
+   6. `ema_50` / `dist_ema_50`: Long-term trend & distance from mean.
+   7. `rsi`: Momentum/Overbought-Oversold.
+   8. `taker_buy_z`: Z-score of market-buy pressure (Toxic flow detector).
+   9. `vol_z`: Volume anomaly detector.
+
+  Orderbook Microstructure (12)
+   10. `ob_imb_trend`: Rolling average of book imbalance.
+   11. `micro_pressure`: Price gravity (Micro-Price deviation).
+   12. `bid_depth_chg`: Speed of change in bid liquidity.
+   13. `ask_depth_chg`: Speed of change in ask liquidity.
+   14. `spread_z`: Is the spread unusually wide or tight?
+   15. `ob_spread_bps`: The cost of execution in basis points.
+   16. `ob_depth_log_ratio`: Symmetric pressure ratio.
+   17. `ob_imbalance_z`: Orderbook shock detector.
+   18. `price_liq_div`: Divergence between price movement and book pressure.
+   19. `liq_dominance`: Depth-to-Volume ratio (Wall strength).
+   20. `micro_dev_vol`: Maker jitter/uncertainty.

@@ -153,18 +153,18 @@ class Backtester:
         drawdown = (equity_curve - peak) / peak
         max_dd = abs(np.min(drawdown))
         
-        # Sortino (Risk adjusted)
-        # Calculate per-trade returns
-        pnls = [x['pnl'] for x in self.history]
-        downside = [p for p in pnls if p < 0]
+        # Sortino (Professional Downside Deviation)
+        pnls = np.array([x['pnl'] for x in self.history])
+        avg_ret = np.mean(pnls)
         
-        if not downside or np.std(downside) == 0:
-            sortino = 10.0 # Perfect score if no losses
+        # Downside Deviation: RMS of negative returns only
+        downside_pnls = pnls[pnls < 0]
+        if len(downside_pnls) == 0:
+            sortino = 10.0 if avg_ret > 0 else -10.0
         else:
-            # Sortino = Mean Return / Downside Deviation
-            avg_ret = np.mean(pnls)
-            down_std = np.std(downside)
-            sortino = avg_ret / down_std
+            # Standard Sortino uses 0 as target return
+            downside_dev = np.sqrt(np.mean(downside_pnls**2))
+            sortino = avg_ret / downside_dev if downside_dev > 0 else 0
             
         return {
             'total_return': ret,

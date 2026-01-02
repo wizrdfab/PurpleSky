@@ -643,6 +643,22 @@ class SafeExchange:
             self.logger.error(f"API error in {name}: {exc}")
             return None
 
+    def place_limit_order(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        tp: float = 0.0,
+        sl: float = 0.0,
+        reduce_only: bool = False,
+    ) -> Dict:
+        return self._call(
+            "place_limit_order",
+            self.exchange.place_limit_order,
+            side, price, qty, tp, sl, reduce_only
+        )
+
+
     def fetch_recent_trades(self, limit: int) -> pd.DataFrame:
         return self._call("fetch_recent_trades", self.exchange.fetch_recent_trades, limit)
 
@@ -691,9 +707,6 @@ class SafeExchange:
 
     def get_instrument_info(self) -> Dict:
         return self._call("fetch_instrument_info", self.exchange.fetch_instrument_info)
-
-    def place_limit_order(self, side: str, price: float, qty: float) -> Dict:
-        return self._call("place_limit_order", self.exchange.place_limit_order, side, price, qty)
 
     def cancel_order(self, order_id: str) -> bool:
         def _cancel():
@@ -1058,34 +1071,90 @@ class LiveTradingV2:
         max_qty = (equity * self.max_leverage) / price if price > 0 else qty
         qty = min(qty, max_qty)
 
-        qty = round_down(qty, self.instrument.qty_step)
-        qty = round(qty, 5)
-	
+        qty_step = self.instrument.qty_step
+        min_qty = self.instrument.min_qty  # you do have this available :contentReference[oaicite:3]{index=3}
+        min_notional = 5.0  # your current hardcoded constraint
+        
+        # 1) Enforce minimum constraints in "continuous" space
+        qty = max(qty, min_notional / price)
+        if min_qty and min_qty > 0:
+            qty = max(qty, min_qty)
+
+        # 2) Quantize to step
+        qty = round_down(qty, qty_step)
+
+        # 3) Rounding down can violate min-notional/min-qty again; fix and re-quantize
+        if qty * price < min_notional:
+            qty = round_down(min_notional / price, qty_step)
+        if min_qty and min_qty > 0 and qty < min_qty:
+            qty = round_down(min_qty, qty_step)
+
+        # 4) Final guard
         if qty <= 0:
-            self.logger.warning(f"Qty size for entry <=0. Skipping order.")
-            return None
-        if qty < 5 / price:
-            qty = 5 / price
-            self.logger.warning(f"Qty < min order value for the instrument. Setting Qty to the minimum value.")		
+            self.logger.warning("Qty quantized to 0; skipping order.")
+            return None      	
         
         self.logger.info(f"Placing {side} limit: price={price:.6f} qty={qty:.6f}")
         if self.dry_run:
             return "dry_run"
 
-        resp = self.api.place_limit_order(side, price, qty)
-        if not resp:
+        #Attaching TP and SL to the limit position right away
+        tp_atr = self.config.strategy.take_profit_atr
+        sl_atr = self.config.strategy.stop_loss_atr
+        tick = self.instrument.tick_size
+
+        def round_to_tick(x: float, tick: float, mode: str) -> float:
+            if tick <= 0:
+                return x
+            if mode == "up":
+                return math.ceil(x / tick) * tick
+            return math.floor(x / tick) * tick
+
+        if side == "Buy":
+            tp = price + (atr * tp_atr)
+            sl = price - (atr * sl_atr)
+            # “widen” slightly to reduce rejection risk from min-distance rules:
+            tp = round_to_tick(tp, tick, "up")    # further away (higher)
+            sl = round_to_tick(sl, tick, "down")  # further away (lower)
+        else:
+            tp = price - (atr * tp_atr)
+            sl = price + (atr * sl_atr)
+            tp = round_to_tick(tp, tick, "down")  # further away (lower)
+            sl = round_to_tick(sl, tick, "up")    # further away (higher)
+
+        resp = self.api.place_limit_order(side, price, qty, tp=tp, sl=sl, reduce_only=False)
+        
+        if resp is None:
+            # Transport/exception path (ExchangeClient caught exception and returned None)
+            self.logger.error("place_limit_order returned None (exception / transport failure).")
             return None
+        
+        ret_code = resp.get("retCode")
+        if ret_code != 0:
+            self.logger.error(f"Bybit rejected order: retCode={ret_code} retMsg={resp.get('retMsg')}")
+            return None
+
+        order_id = (resp.get("result") or {}).get("orderId")
+        if not order_id:
+            self.logger.error(f"Bybit response missing orderId: {resp}")
+            return None
+        
         order_id = resp.get("result", {}).get("orderId")
+        
         if order_id:
             self.state.state["active_orders"][order_id] = {
-                "side": side,
-                "price": price,
-                "qty": qty,
-                "created_bar_time": self.state.state.get("last_bar_time"),
-                "created_ts": utc_now_str(),
-                "external": False,
-            }
-            self.state.save()
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "tp": tp,
+            "sl": sl,
+            "created_bar_time": self.state.state.get("last_bar_time"),
+            "created_ts": utc_now_str(),
+            "external": False,
+        }
+        self.state.save()
+
+            
         return order_id
 
     def _check_feature_coverage(self, df_feat: pd.DataFrame) -> Tuple[bool, List[str]]:
