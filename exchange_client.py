@@ -21,6 +21,66 @@ class ExchangeClient:
         )
         print(f"Connected to Bybit {'Testnet' if testnet else 'Mainnet'} for {symbol}")
 
+    def startup_check(self) -> bool:
+        """
+        Perform critical safety checks before trading.
+        1. Time Sync
+        2. Account Mode (One-Way)
+        3. Instrument Status
+        """
+        logger.info("Performing Startup Safety Checks...")
+        
+        # 1. Time Sync
+        drift = self.check_time_sync()
+        if drift > 3000:
+            logger.critical(f"Time Drift too high ({drift}ms). Abort.")
+            return False
+            
+        # 2. Enforce One-Way Mode (Safety against Hedge Mode confusion)
+        if not self.enforce_oneway_mode():
+            logger.critical("Failed to enforce One-Way Mode. Abort.")
+            return False
+            
+        # 3. Check Symbol Status
+        info = self.fetch_instrument_info()
+        if not info:
+            logger.critical(f"Symbol {self.symbol} not found or inactive.")
+            return False
+            
+        logger.info("Startup Checks PASSED. System Ready.")
+        return True
+
+    def enforce_oneway_mode(self) -> bool:
+        """
+        Ensure the account is in One-Way Mode (idx=0).
+        Hedge Mode (idx=3) causes ambiguous position reporting.
+        """
+        try:
+            # Check current mode first (optimization to avoid error 110043)
+            # However, Bybit API doesn't easily give "current mode" without querying positions 
+            # or just trying to switch. We try to switch.
+            resp = self.session.switch_position_mode(
+                category="linear",
+                symbol=self.symbol,
+                mode=0, # 0: One-Way, 3: Hedge
+                coin="USDT" 
+            )
+            logger.info("Enforced One-Way Mode.")
+            return True
+        except Exception as e:
+            msg = str(e)
+            # 110043: Position mode not modified (already correct) -> Success
+            # 110025, 110029: Position mode cannot be changed while holding position -> Warning
+            if "110043" in msg:
+                logger.info("Already in One-Way Mode.")
+                return True
+            elif "110025" in msg or "110029" in msg:
+                logger.warning("Could not switch mode (Positions exist). ASSUMING One-Way. Please verify manually!")
+                return True # We proceed, but warn.
+            
+            logger.error(f"Error enforcing One-Way Mode: {e}")
+            return False
+
     def check_time_sync(self) -> float:
         """
         Check NTP drift between local machine and Bybit.

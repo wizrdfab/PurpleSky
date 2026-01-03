@@ -150,6 +150,22 @@ class FeatureEngine:
         vol_30d = df['volume'].rolling(8640, min_periods=288).mean()
         df['vol_macro'] = vol_24h / vol_30d.replace(0, 1)
 
+        # 8. Volatility Regimes (Expansion/Compression)
+        # Volatility Z-Score (Shock detection)
+        df['atr_z'] = (df['atr'] - df['atr'].rolling(24).mean()) / df['atr'].rolling(24).std().replace(0, 1)
+        
+        # Volatility Regime (Intraday vs Daily)
+        # Ratio > 1.0 = Expanding/High Vol -> Trend Risk
+        # Ratio < 1.0 = Compressing/Low Vol -> Breakout Risk or Mean Reversion
+        atr_1h = df['atr'].rolling(12).mean()
+        atr_24h = df['atr'].rolling(288).mean()
+        df['atr_regime'] = atr_1h / atr_24h.replace(0, 1)
+        
+        # Macro Volatility (Secular Trend)
+        # Is the market waking up from a long slumber?
+        atr_30d = df['atr'].rolling(8640, min_periods=288).mean()
+        df['atr_macro'] = atr_24h / atr_30d.replace(0, 1)
+
         cols_to_drop = ['tr0', 'tr1', 'tr2', 'tr', 'up_move', 'down_move', 'plus_dm', 'minus_dm', 'price_chg', 'imb_chg', 'vol_buy', 'vol_sell', 'volume', 'vwap_4h', 'vwap_24h', 'dollar_val']
         df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
         

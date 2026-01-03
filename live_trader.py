@@ -7,6 +7,7 @@ import time
 import json
 import joblib
 import logging
+import signal
 import traceback
 import pandas as pd
 import numpy as np
@@ -18,6 +19,7 @@ from config import CONF, GlobalConfig
 from exchange_client import ExchangeClient
 from feature_engine import FeatureEngine
 from models import ModelManager
+from notifier import Notifier
 
 # --- Setup Logging ---
 log_dir = Path("logs")
@@ -107,9 +109,22 @@ class StateManager:
             except: pass
 
     def save(self):
+        """
+        Atomic Save to prevent corruption during crash/power loss.
+        Works on Linux (POSIX) and Windows.
+        """
+        tmp_path = self.file_path.with_suffix('.tmp')
         try:
-            with open(self.file_path, 'w') as f: json.dump(self.state, f, indent=4)
-        except: pass
+            with open(tmp_path, 'w') as f: 
+                json.dump(self.state, f, indent=4)
+                # Ensure data is physically on disk before renaming
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Atomic replacement
+            os.replace(tmp_path, self.file_path)
+        except Exception as e: 
+            logger.error(f"Failed to save state: {e}")
         
     def update_pnl(self, pnl):
         self.state["total_pnl"] += pnl
@@ -121,8 +136,8 @@ class StateManager:
             self.save()
 
 class RiskManager:
-    def __init__(self, config: GlobalConfig, state: StateManager):
-        self.config, self.state = config, state
+    def __init__(self, config: GlobalConfig, state: StateManager, notifier: Notifier):
+        self.config, self.state, self.notifier = config, state, notifier
         
     def check_drawdown(self, equity: float) -> bool:
         self.state.update_hwm(equity)
@@ -130,7 +145,9 @@ class RiskManager:
         if hwm > 0:
             dd_pct = (equity - hwm) / hwm
             if dd_pct < -0.10:
-                logger.critical(f"!!! KILL SWITCH TRIGGERED !!! Drawdown: {dd_pct:.2%}. Peak: ${hwm}.")
+                msg = f"!!! KILL SWITCH TRIGGERED !!! Drawdown: {dd_pct:.2%}. Peak: ${hwm}."
+                self.notifier.send(msg, "CRITICAL")
+                logger.critical(msg)
                 return False
         return True
 
@@ -376,18 +393,37 @@ class ChampionBot:
         else: self.config.live.dry_run = False
             
         self.exchange = ExchangeClient(key, secret, self.config.data.symbol)
-        if not self.config.live.dry_run: self.exchange.set_leverage(10)
+        if not self.config.live.dry_run:
+            if not self.exchange.startup_check():
+                logger.critical("Startup Checks Failed. Exiting...")
+                exit(1)
+            self.exchange.set_leverage(10)
             
         self.instr_info = self.exchange.fetch_instrument_info() if not self.config.live.dry_run else {'min_qty':1.0,'qty_step':0.1,'tick_size':0.0001}
         self.state = StateManager(self.config.data.symbol)
-        self.risk = RiskManager(self.config, self.state)
+        self.notifier = Notifier(prefix=f"[{self.config.data.symbol}]")
+        self.risk = RiskManager(self.config, self.state, self.notifier)
         self.health = HealthMonitor()
         self.data = LiveDataManager(self.config, self.exchange)
         self.fe = FeatureEngine(self.config.features)
         
         # Load Lone Champion
         self._load_champion(model_root)
+        self._register_signals()
         self._print_manifest(model_root)
+        self.notifier.send("Champion Bot Started", "INFO")
+
+    def _register_signals(self):
+        """Register signal handlers for graceful shutdown on Linux/Docker."""
+        signal.signal(signal.SIGINT, self._handle_exit_signal)
+        try:
+            signal.signal(signal.SIGTERM, self._handle_exit_signal)
+        except AttributeError:
+            pass # SIGTERM not available on Windows
+
+    def _handle_exit_signal(self, signum, frame):
+        logger.warning(f"Received Termination Signal ({signum}). Exiting safely...")
+        raise KeyboardInterrupt
 
     def _load_champion(self, root):
         root_path = Path(root)
@@ -434,9 +470,13 @@ class ChampionBot:
                     last_reconcile = now
                 self._check_bar_close()
                 time.sleep(0.1)
-            except KeyboardInterrupt: break
+            except KeyboardInterrupt: 
+                self.notifier.send("Bot Stopped by User", "WARNING")
+                break
             except Exception as e:
-                logger.error(f"Loop Error: {e}\n{traceback.format_exc()}")
+                err_msg = f"Loop Error: {e}"
+                logger.error(f"{err_msg}\n{traceback.format_exc()}")
+                self.notifier.send(err_msg, "CRITICAL")
                 time.sleep(5)
 
     def _monitor_risk(self) -> bool:
@@ -453,7 +493,9 @@ class ChampionBot:
             return True
 
     def _emergency_shutdown(self):
-        logger.critical("!!! EMERGENCY SHUTDOWN PROTOCOL !!!")
+        msg = "!!! EMERGENCY SHUTDOWN PROTOCOL INITIATED !!!"
+        self.notifier.send(msg, "CRITICAL")
+        logger.critical(msg)
         for i in range(1, 11):
             try:
                 self.exchange.cancel_all_orders()
@@ -544,14 +586,19 @@ class ChampionBot:
         tp_p = price + (row['atr'] * p['take_profit_atr']) if side == "Buy" else price - (row['atr'] * p['take_profit_atr'])
         sl_p = price - (row['atr'] * p['stop_loss_atr']) if side == "Buy" else price + (row['atr'] * p['stop_loss_atr'])
         tp_p = round(round(tp_p / tick) * tick, 5); sl_p = round(round(sl_p / tick) * tick, 5)
-        logger.info(f"!!! TRADING: {side} @ {price} [TP: {tp_p} | SL: {sl_p}] Notional: ${final_qty*price:.2f} !!!")
+        
+        msg = f"!!! TRADING: {side} @ {price} [TP: {tp_p} | SL: {sl_p}] Notional: ${final_qty*price:.2f} !!!"
+        logger.info(msg)
+        
         if not self.config.live.dry_run:
             resp = self.exchange.place_limit_order(side, price, final_qty, tp=tp_p, sl=sl_p)
             if resp: 
+                self.notifier.send(msg, "SUCCESS")
                 # Store timestamp (ISO format) for robust time tracking
                 ts = row.name.isoformat() if hasattr(row.name, 'isoformat') else datetime.utcnow().isoformat()
                 self.state.state["active_orders"][resp['result']['orderId']] = {'created_at': ts, 'side': side}
                 self.state.save()
+
 
     def _reconcile(self):
         if self.config.live.dry_run: return
