@@ -204,7 +204,9 @@ class AutoML:
         for train_idx, val_idx in tscv.split(df_dev):
             X_t, y_l, y_s = df_dev.iloc[train_idx][feats], df_dev.iloc[train_idx]['target_long'], df_dev.iloc[train_idx]['target_short']
             p = {'objective':'binary','metric':'auc','verbosity':-1,'n_jobs':-1,
-                 'learning_rate':lr,'max_depth':depth,'num_leaves':leaves,'min_child_samples':min_child,'boosting_type':'gbdt'}
+                 'learning_rate':lr,'max_depth':depth,'num_leaves':leaves,
+                 'min_child_samples':min_child,'boosting_type':'gbdt',
+                 'colsample_bytree': CONF.model.colsample_bytree}
             m_l = lgb.train(p, lgb.Dataset(X_t, label=y_l), num_boost_round=100)
             m_s = lgb.train(p, lgb.Dataset(X_t, label=y_s), num_boost_round=100)
             val_f = df_dev.iloc[val_idx].copy()

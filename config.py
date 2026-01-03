@@ -59,7 +59,7 @@ class ModelConfig:
     num_leaves: int = 32         
     min_child_samples: int = 20  # Relaxed from 50
     subsample: float = 0.7
-    colsample_bytree: float = 0.6
+    colsample_bytree: float = 0.2
     rate_drop: float = 0.1       
     train_ratio: float = 0.70
     val_ratio: float = 0.15

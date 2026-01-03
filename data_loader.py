@@ -7,6 +7,7 @@ import numpy as np
 import glob
 import json
 import os
+from pathlib import Path
 from config import DataConfig
 
 class DataLoader:
@@ -153,9 +154,32 @@ class DataLoader:
         tf_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h'}
         rule = tf_map.get(timeframe, '15min')
         
+        # Setup Cache Directory
+        cache_dir = self.config.data_dir / "Orderbook_reconstruction"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
         aggs = []
         
         for f in files:
+            source_file = Path(f)
+            # Unique cache name including timeframe (so 5m and 1h don't conflict)
+            cache_name = f"{source_file.stem}_{timeframe}.pkl"
+            cache_path = cache_dir / cache_name
+            
+            # --- CACHE CHECK ---
+            try:
+                if cache_path.exists():
+                    source_mtime = source_file.stat().st_mtime
+                    cache_mtime = cache_path.stat().st_mtime
+                    if cache_mtime > source_mtime:
+                        print(f"  [CACHE] Loading {cache_name}...")
+                        chunk_agg = pd.read_pickle(cache_path)
+                        aggs.append(chunk_agg)
+                        continue
+            except Exception as e:
+                print(f"  [CACHE] Check failed for {f}: {e}")
+
+            # --- RECONSTRUCTION (Cache Miss) ---
             try:
                 buffer = []
                 # Local Orderbook State: Dict[Price(str), Size(float)]
@@ -289,8 +313,15 @@ class DataLoader:
                 })
                 
                 chunk_agg.columns = ['_'.join(col).strip() for col in chunk_agg.columns.values]
+                
+                # --- SAVE TO CACHE ---
+                try:
+                    chunk_agg.to_pickle(cache_path)
+                    print(f"  [SAVE] Reconstructed & Cached {cache_name}")
+                except Exception as e:
+                    print(f"  [WARN] Failed to cache {cache_name}: {e}")
+                
                 aggs.append(chunk_agg)
-                print(f"  Processed {os.path.basename(f)} ({line_counter} msgs)")
                 
             except Exception as e:
                 print(f"  Error {f}: {e}")
