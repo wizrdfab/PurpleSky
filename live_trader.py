@@ -55,6 +55,30 @@ class HealthMonitor:
         elif avg_conf < 0.25: state = "PINNED BEARISH (Trend Risk)"
         return f"{state} | 1H Avg: {avg_conf:.3f}"
 
+    def check_regime(self, df: pd.DataFrame):
+        """Detects if Orderbook Structure has drifted from the 24h baseline."""
+        if len(df) < 50: return "CALIBRATING"
+        try:
+            # Monitor Bid Slope (Elasticity) for structural drift
+            col = 'ob_bid_slope_mean'
+            if col not in df.columns: return "DATA MISSING"
+            
+            valid_df = df[df[col] > 0]
+            if len(valid_df) < 24: return "COLLECTING BASELINE"
+            
+            baseline_mean = valid_df[col].tail(288).mean()
+            baseline_std = valid_df[col].tail(288).std()
+            current_mean = valid_df[col].tail(12).mean()
+            
+            if baseline_std == 0: return "STABLE (Zero Vol)"
+            z_drift = (current_mean - baseline_mean) / (baseline_std + 1e-9)
+            
+            status = "STABLE"
+            if abs(z_drift) > 3.0: status = "CRITICAL DRIFT"
+            elif abs(z_drift) > 2.0: status = "WARNING (Regime Shift)"
+            return f"{status} | Drift Z: {z_drift:.2f}"
+        except Exception as e: return f"ERROR: {str(e)[:20]}"
+
     def check_health(self):
         if len(self.outcomes) < 5: return "CALIBRATING"
         wr = sum(self.outcomes) / len(self.outcomes)
@@ -120,6 +144,9 @@ class LiveDataManager:
         self.new_bar_event = False
         self.history_file = Path(f"data_history_{config.data.symbol}.csv")
         
+        # Continuity Tracker: Bars collected WITHOUT a gap
+        self.continuous_bars = 0
+        
         # New Microstructure columns
         self.micro_cols = [
             'ob_spread_mean', 'ob_imbalance_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean', 
@@ -149,16 +176,17 @@ class LiveDataManager:
                 df = pd.read_csv(self.history_file, index_col='datetime', parse_dates=True)
                 if df.empty: return
 
-                # Check for "Stale Data": If the last bar is older than 1 hour, discard it.
-                # Microstructure features (Z-scores) break across large time gaps.
+                # Check for "Gap": If last bar > 10m old, reset continuity but keep data for baseline
                 last_ts = df.index[-1]
-                time_diff = (datetime.utcnow() - last_ts).total_seconds() / 3600.0
+                time_diff_min = (datetime.utcnow() - last_ts).total_seconds() / 60.0
                 
-                if time_diff > 1.0:
-                    logger.warning(f"History file {self.history_file.name} is stale ({time_diff:.1f}h old). Starting fresh for accuracy.")
-                    return
+                if time_diff_min > 10.0:
+                    logger.warning(f"History gap detected ({time_diff_min:.1f}m). Keeping baseline, but resetting warmup.")
+                    self.continuous_bars = 0
+                else:
+                    self.continuous_bars = len(df)
 
-                # Filter for only existing columns to avoid crash
+                # Filter for only existing columns
                 ob_present = [c for c in self.micro_cols if c in df.columns]
                 trade_cols = [c for c in df.columns if c not in self.micro_cols]
                 
@@ -171,7 +199,7 @@ class LiveDataManager:
                         self.ob_bars[col] = 0.0
                 
                 if not self.trade_bars.empty: self.current_bar_idx = self.trade_bars.index[-1]
-                logger.info(f"Loaded {len(df)} bars from history for {self.config.data.symbol}.")
+                logger.info(f"Loaded {len(df)} bars from history for {self.config.data.symbol}. Continuous: {self.continuous_bars}")
             except Exception as e: logger.error(f"Failed to load history: {e}")
 
     def save_history(self):
@@ -215,6 +243,7 @@ class LiveDataManager:
             self.new_bar_event = True
             self.ob_buffer = []
             self.current_bar_idx = last_idx
+            self.continuous_bars += 1
             
         if ob_snapshot: 
             self._buffer_snapshot(ob_snapshot, last_idx)
@@ -455,16 +484,17 @@ class ChampionBot:
                 return
 
             # 2. Microstructure Gate (Z-Score Stability)
-            # We need ~24 bars (2 hours) for rolling Z-scores to stabilize.
-            # If we don't have this, we risk trading on "Cold Start" noise.
-            if len(self.data.ob_bars) < 24:
-                logger.info(f"Microstructure Warmup: {len(self.data.ob_bars)}/24 bars collected. Trading Paused.")
+            # We need ~24 bars (2 hours) of CONTINUOUS data for rolling Z-scores to stabilize.
+            # If we have a gap, we must wait for new warmup.
+            if self.data.continuous_bars < 24:
+                logger.info(f"Microstructure Warmup: {self.data.continuous_bars}/24 continuous bars collected. Trading Paused.")
                 return
                 
             last_closed_time = full_bars.index[-2]
             
             logger.info(f"\n>>> CHAMPION DECISION FOR BAR: {last_closed_time} <<<")
-            logger.info(f"[DIAG] Bars: {len(full_bars)} | Total Snaps: {self.data.total_snapshots} | Sentiment: {self.health.check_sentiment()}")
+            regime = self.health.check_regime(full_bars)
+            logger.info(f"[DIAG] Bars: {len(full_bars)} | Continuous: {self.data.continuous_bars} | Regime: {regime} | Sentiment: {self.health.check_sentiment()}")
             
             self._reconcile()
             df_feat = self.fe.calculate_features(full_bars)
@@ -535,6 +565,26 @@ class ChampionBot:
         current_time = datetime.utcnow()
         tf_seconds = 300 # Assuming 5m timeframe
         
+        # 0. ADOPT ORPHAN ORDERS
+        # If we find an order on exchange not in our state, adopt it.
+        # This handles restarts (lost state) or manual interventions.
+        for o in orders:
+            oid = o.get('orderId')
+            if oid not in self.state.state["active_orders"]:
+                try:
+                    # Bybit returns 'createdTime' in ms
+                    c_time = int(o.get('createdTime', 0))
+                    if c_time > 0:
+                        ts_iso = datetime.utcfromtimestamp(c_time / 1000.0).isoformat()
+                        logger.info(f"Adopting orphan order {oid} (Created: {ts_iso})")
+                        self.state.state["active_orders"][oid] = {
+                            'created_at': ts_iso,
+                            'side': o.get('side'),
+                            'adopted': True
+                        }
+                except Exception as e:
+                    logger.error(f"Failed to adopt order {oid}: {e}")
+
         # 1. Manage Orders (Cancellation & Cleanup)
         tracked = list(self.state.state["active_orders"].keys())
         for oid in tracked:

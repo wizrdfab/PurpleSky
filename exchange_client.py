@@ -211,6 +211,13 @@ class ExchangeClient:
                 symbol=self.symbol
             )
             positions = resp.get('result', {}).get('list', [])
+            
+            # DEBUG: Print raw positions if found
+            if positions:
+                logger.debug(f"[DEBUG] Raw Position Data: {positions}")
+            else:
+                logger.debug("[DEBUG] No positions found in API response.")
+
             for p in positions:
                 if p['symbol'] == self.symbol:
                     size = self._safe_float(p.get('size'))
