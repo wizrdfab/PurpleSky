@@ -551,6 +551,7 @@ class ChampionBot:
                 # Store timestamp (ISO format) for robust time tracking
                 ts = row.name.isoformat() if hasattr(row.name, 'isoformat') else datetime.utcnow().isoformat()
                 self.state.state["active_orders"][resp['result']['orderId']] = {'created_at': ts, 'side': side}
+                self.state.save()
 
     def _reconcile(self):
         if self.config.live.dry_run: return
@@ -611,29 +612,52 @@ class ChampionBot:
                 del self.state.state["active_orders"][oid]
         
         # 2. Manage Position (Max Holding Time)
-        # Use authoritative 'created_time' from exchange (ms timestamp)
+        # Prioritize LOCAL entry time to avoid Bybit 'sticky timestamp' bugs
         if abs_size > 0:
             try:
-                created_ms = pos_details.get('created_time', 0)
-                if created_ms > 0:
-                    # Convert exchange timestamp (ms) to datetime
-                    entry_time = datetime.utcfromtimestamp(created_ms / 1000.0)
+                # A. Detect New Entry (or Re-Entry)
+                if self.state.state.get("last_pos_size", 0) == 0:
+                    logger.info("Position Detected. initializing Entry Time tracker.")
+                    self.state.state["position_entry_time"] = datetime.utcnow().isoformat()
+                    self.state.save()
+                
+                # B. Determine Authoritative Entry Time
+                entry_time = None
+                source = "LOCAL"
+                
+                if self.state.state.get("position_entry_time"):
+                    entry_time = pd.to_datetime(self.state.state["position_entry_time"])
+                else:
+                    # Fallback to Exchange if local state missing (e.g. fresh install)
+                    created_ms = pos_details.get('created_time', 0)
+                    if created_ms > 0:
+                        entry_time = datetime.utcfromtimestamp(created_ms / 1000.0)
+                        source = "EXCHANGE"
+                        # Bootstrap local state to prevent future drift
+                        self.state.state["position_entry_time"] = entry_time.isoformat()
+                        self.state.save()
+                
+                # C. Check Timeout
+                if entry_time:
                     hold_seconds = (current_time - entry_time).total_seconds()
                     max_hold_seconds = self.config.strategy.max_holding_bars * tf_seconds
                     
                     if hold_seconds > max_hold_seconds:
-                        logger.warning(f"Max Holding Time Exceeded ({hold_seconds:.0f}s). Force Closing Position.")
-                        # If pos > 0 (Long), side is 'Buy', we need to sell.
+                        logger.warning(f"Max Holding Time Exceeded ({hold_seconds:.0f}s > {max_hold_seconds}s | Source: {source}). Force Closing.")
                         side = "Buy" if pos_size > 0 else "Sell"
                         self.exchange.market_close(side, abs_size)
+                    elif hold_seconds < 0:
+                         logger.warning(f"Negative Hold Time ({hold_seconds}s). Clock Drift? Resetting tracker.")
+                         self.state.state["position_entry_time"] = datetime.utcnow().isoformat()
+                         self.state.save()
+                         
             except Exception as e:
                 logger.error(f"Position timer error: {e}")
 
         # 3. Detect Closed Position (PnL & Reset)
-        # If we previously had a position (tracked in state) and now don't, fetch PnL
-        # (This part is tricky without persistent previous state, but 'get_position' == 0 is the trigger)
-        # Simplified: We rely on periodic PnL fetching or just the fact that it's 0 now.
         if abs_size == 0 and self.state.state.get("last_pos_size", 0) != 0:
+             # Clear Entry Time
+             self.state.state["position_entry_time"] = None
              try:
                 closed = self.exchange.fetch_closed_pnl(limit=1)
                 if closed:

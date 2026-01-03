@@ -122,7 +122,35 @@ class FeatureEngine:
                 df['bid_integrity_chg'] = df['ob_bid_integrity_mean'].diff()
                 df['ask_integrity_chg'] = df['ob_ask_integrity_mean'].diff()
 
-        cols_to_drop = ['tr0', 'tr1', 'tr2', 'tr', 'up_move', 'down_move', 'plus_dm', 'minus_dm', 'price_chg', 'imb_chg']
+        # 6. Inventory Context (VWAP Deviations)
+        # Using 'dollar_val' for VWAP. 4h = 48 bars, 24h = 288 bars (for 5m timeframe)
+        if 'dollar_val' not in df.columns:
+            df['dollar_val'] = df['close'] * df['volume']
+            
+        # 4-Hour VWAP
+        v_4h = df['dollar_val'].rolling(48, min_periods=12).sum()
+        q_4h = df['volume'].rolling(48, min_periods=12).sum()
+        df['vwap_4h'] = v_4h / q_4h.replace(0, 1)
+        df['vwap_4h_dist'] = (df['close'] - df['vwap_4h']) / df['atr'].replace(0, 1)
+        
+        # 24-Hour VWAP (The "Cost Basis" Proxy)
+        v_24h = df['dollar_val'].rolling(288, min_periods=24).sum()
+        q_24h = df['volume'].rolling(288, min_periods=24).sum()
+        df['vwap_24h'] = v_24h / q_24h.replace(0, 1)
+        df['vwap_24h_dist'] = (df['close'] - df['vwap_24h']) / df['atr'].replace(0, 1)
+        
+        # 7. Volume Regimes (Context)
+        # Intraday Regime: Is today active relative to yesterday?
+        vol_1h = df['volume'].rolling(12, min_periods=3).mean()
+        vol_24h = df['volume'].rolling(288, min_periods=24).mean()
+        df['vol_intraday'] = vol_1h / vol_24h.replace(0, 1)
+        
+        # Macro Regime: Is this week/month active relative to the last 30 days?
+        # 30 days * 24h * 12 bars/h = 8640 bars
+        vol_30d = df['volume'].rolling(8640, min_periods=288).mean()
+        df['vol_macro'] = vol_24h / vol_30d.replace(0, 1)
+
+        cols_to_drop = ['tr0', 'tr1', 'tr2', 'tr', 'up_move', 'down_move', 'plus_dm', 'minus_dm', 'price_chg', 'imb_chg', 'vol_buy', 'vol_sell', 'volume', 'vwap_4h', 'vwap_24h', 'dollar_val']
         df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
         
         return df.fillna(0)

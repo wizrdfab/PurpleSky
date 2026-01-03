@@ -176,7 +176,16 @@ class AutoML:
                     'ob_imbalance_last', 'ob_spread_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean',
                     'ob_micro_dev_std', 'ob_micro_dev_last', 'ob_micro_dev_mean', 'ob_imbalance_mean']
         ob_whitelist = ['ob_imbalance_z', 'ob_spread_ratio', 'ob_bid_impulse', 'ob_ask_impulse', 'ob_depth_ratio', 'ob_spread_bps', 'ob_depth_log_ratio', 'price_liq_div', 'liq_dominance', 'micro_dev_vol', 'ob_imb_trend', 'micro_pressure', 'bid_depth_chg', 'ask_depth_chg', 'spread_z', 'ob_slope_ratio', 'bid_slope_z', 'ob_bid_elasticity', 'ob_ask_elasticity', 'ob_bid_integrity_mean', 'ob_ask_integrity_mean', 'ob_integrity_skew', 'bid_integrity_chg', 'ask_integrity_chg']
-        return [c for c in df.columns if (c not in excludes and not c.startswith('ob_')) or c in ob_whitelist]
+        
+        all_features = [c for c in df.columns if (c not in excludes and not c.startswith('ob_')) or c in ob_whitelist]
+        
+        if self.args.microstructure_only:
+            tech_blacklist = ['ema_', 'dist_ema_', 'rsi', 'atr']
+            filtered = [f for f in all_features if not any(b in f for b in tech_blacklist)]
+            print(f"[Research] Microstructure Only: Reduced features from {len(all_features)} to {len(filtered)}")
+            return filtered
+            
+        return all_features
 
     def objective(self, trial):
         offset, tp, sl = trial.suggest_float('limit_offset_atr', 0.5, 1.5), trial.suggest_float('take_profit_atr', 0.5, 2.5), trial.suggest_float('stop_loss_atr', 1.0, 4.0)
@@ -265,5 +274,6 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=str, default="data/RAVEUSDT")
     parser.add_argument("--symbol", type=str, default="RAVEUSDT")
     parser.add_argument("--model-dir", type=str, default="models_v4")
+    parser.add_argument("--microstructure-only", action="store_true", help="Blacklist technical indicators")
     args = parser.parse_args()
     AutoML(args).run()
