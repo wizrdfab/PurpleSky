@@ -119,6 +119,15 @@ class LiveDataManager:
         self.total_snapshots = 0
         self.new_bar_event = False
         self.history_file = Path(f"data_history_{config.data.symbol}.csv")
+        
+        # New Microstructure columns
+        self.micro_cols = [
+            'ob_spread_mean', 'ob_imbalance_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean', 
+            'ob_micro_dev_mean', 'ob_micro_dev_std',
+            'ob_bid_slope_mean', 'ob_ask_slope_mean',
+            'ob_bid_integrity_mean', 'ob_ask_integrity_mean'
+        ]
+        
         self.load_history()
         self.bootstrap()
 
@@ -138,15 +147,31 @@ class LiveDataManager:
         if self.history_file.exists():
             try:
                 df = pd.read_csv(self.history_file, index_col='datetime', parse_dates=True)
-                # Split back into components
-                ob_cols = ['ob_spread_mean', 'ob_imbalance_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean', 'ob_micro_dev_mean', 'ob_micro_dev_std']
-                trade_cols = [c for c in df.columns if c not in ob_cols]
+                if df.empty: return
+
+                # Check for "Stale Data": If the last bar is older than 1 hour, discard it.
+                # Microstructure features (Z-scores) break across large time gaps.
+                last_ts = df.index[-1]
+                time_diff = (datetime.utcnow() - last_ts).total_seconds() / 3600.0
+                
+                if time_diff > 1.0:
+                    logger.warning(f"History file {self.history_file.name} is stale ({time_diff:.1f}h old). Starting fresh for accuracy.")
+                    return
+
+                # Filter for only existing columns to avoid crash
+                ob_present = [c for c in self.micro_cols if c in df.columns]
+                trade_cols = [c for c in df.columns if c not in self.micro_cols]
                 
                 self.trade_bars = df[trade_cols].copy()
-                self.ob_bars = df[ob_cols].copy()
+                self.ob_bars = df[ob_present].copy()
+                
+                # Schema Migration: Fill missing micro columns with 0
+                for col in self.micro_cols:
+                    if col not in self.ob_bars.columns:
+                        self.ob_bars[col] = 0.0
                 
                 if not self.trade_bars.empty: self.current_bar_idx = self.trade_bars.index[-1]
-                logger.info(f"Loaded {len(df)} bars from history.")
+                logger.info(f"Loaded {len(df)} bars from history for {self.config.data.symbol}.")
             except Exception as e: logger.error(f"Failed to load history: {e}")
 
     def save_history(self):
@@ -159,7 +184,7 @@ class LiveDataManager:
 
     def bootstrap(self):
         if len(self.trade_bars) >= self.window_size: return
-        logger.info("Bootstrapping history...")
+        logger.info(f"Bootstrapping {self.config.data.symbol} history...")
         klines = self.exchange.fetch_kline(interval="5", limit=200)
         if klines.empty: return
         df = pd.DataFrame()
@@ -233,27 +258,82 @@ class LiveDataManager:
     def _buffer_snapshot(self, ob, idx):
         bids, asks = ob.get('b', []), ob.get('a', [])
         if not bids or not asks: return
-        bid_depth = sum([float(b[1]) for b in bids[:self.config.data.ob_levels]])
-        ask_depth = sum([float(a[1]) for a in asks[:self.config.data.ob_levels]])
+        
+        # Consistent depth levels
+        depth_lvls = self.config.data.ob_levels
+        bids_slice = bids[:depth_lvls]
+        asks_slice = asks[:depth_lvls]
+        
+        bid_depth = sum([float(b[1]) for b in bids_slice])
+        ask_depth = sum([float(a[1]) for a in asks_slice])
+        
         bb, ba = float(bids[0][0]), float(asks[0][0])
         bb_s, ba_s = float(bids[0][1]), float(asks[0][1])
-        micro = (ba * bb_s + bb * ba_s) / (bb_s + ba_s + 1e-9)
+        
+        # 1. Spread & Micro-Price
+        spread = ba - bb
         mid = (ba + bb) / 2
-        self.ob_buffer.append({'spread':ba-bb,'imbalance':(bid_depth-ask_depth)/(bid_depth+ask_depth+1e-9),'bid_depth':bid_depth,'ask_depth':ask_depth,'micro_dev':micro-mid})
+        micro = (ba * bb_s + bb * ba_s) / (bb_s + ba_s + 1e-9)
+        micro_dev = micro - mid
+        
+        # 2. Imbalance
+        imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-9)
+        
+        # 3. Slope (Gradient)
+        bid_slope = 0.0
+        if bid_depth > 0 and len(bids_slice) > 1:
+            bid_slope = (bb - float(bids_slice[-1][0])) / bid_depth
+            
+        ask_slope = 0.0
+        if ask_depth > 0 and len(asks_slice) > 1:
+            ask_slope = (float(asks_slice[-1][0]) - ba) / ask_depth
+            
+        # 4. Integrity (Intention)
+        bid_integrity = bb_s / bid_depth if bid_depth > 0 else 0
+        ask_integrity = ba_s / ask_depth if ask_depth > 0 else 0
+
+        self.ob_buffer.append({
+            'spread': spread,
+            'imbalance': imbalance,
+            'bid_depth': bid_depth,
+            'ask_depth': ask_depth,
+            'micro_dev': micro_dev,
+            'bid_slope': bid_slope,
+            'ask_slope': ask_slope,
+            'bid_integrity': bid_integrity,
+            'ask_integrity': ask_integrity
+        })
+        
         df_buf = pd.DataFrame(self.ob_buffer)
         
-        # Update Separate OB DataFrame
-        # If row exists, update. If not, create.
-        vals = [df_buf['spread'].mean(), df_buf['imbalance'].mean(), df_buf['bid_depth'].mean(), df_buf['ask_depth'].mean(), df_buf['micro_dev'].mean()]
-        cols = ['ob_spread_mean','ob_imbalance_mean','ob_bid_depth_mean','ob_ask_depth_mean','ob_micro_dev_mean']
+        # Map to DataFrame columns
+        vals = [
+            df_buf['spread'].mean(), 
+            df_buf['imbalance'].mean(), 
+            df_buf['bid_depth'].mean(), 
+            df_buf['ask_depth'].mean(), 
+            df_buf['micro_dev'].mean(),
+            df_buf['bid_slope'].mean(),
+            df_buf['ask_slope'].mean(),
+            df_buf['bid_integrity'].mean(),
+            df_buf['ask_integrity'].mean()
+        ]
+        
+        # The target columns in self.ob_bars
+        target_cols = [
+            'ob_spread_mean', 'ob_imbalance_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean', 
+            'ob_micro_dev_mean', 'ob_bid_slope_mean', 'ob_ask_slope_mean', 
+            'ob_bid_integrity_mean', 'ob_ask_integrity_mean'
+        ]
         
         if idx not in self.ob_bars.index:
-            # Create new row
-            new_row = pd.DataFrame([vals + [0.0]], columns=cols+['ob_micro_dev_std'], index=[idx])
+            # Create new row (initialized with zeros)
+            new_row = pd.DataFrame(0.0, columns=self.micro_cols, index=[idx])
             self.ob_bars = pd.concat([self.ob_bars, new_row])
-        else:
-            self.ob_bars.loc[idx, cols] = vals
-            self.ob_bars.loc[idx, 'ob_micro_dev_std'] = df_buf['micro_dev'].std() if len(df_buf) > 1 else 0.0
+        
+        # Update row
+        self.ob_bars.loc[idx, target_cols] = vals
+        self.ob_bars.loc[idx, 'ob_micro_dev_std'] = df_buf['micro_dev'].std() if len(df_buf) > 1 else 0.0
             
         if len(self.ob_bars) > self.window_size: self.ob_bars = self.ob_bars.iloc[-self.window_size:]
 
@@ -369,8 +449,16 @@ class ChampionBot:
             # Use get_bars() for the full picture
             full_bars = self.data.get_bars()
             
+            # 1. Price History Gate (Technical Indicators)
             if len(full_bars) < 60:
-                logger.warning(f"History too short ({len(full_bars)} bars). Waiting for 60.")
+                logger.warning(f"Price History too short ({len(full_bars)} bars). Waiting for 60.")
+                return
+
+            # 2. Microstructure Gate (Z-Score Stability)
+            # We need ~24 bars (2 hours) for rolling Z-scores to stabilize.
+            # If we don't have this, we risk trading on "Cold Start" noise.
+            if len(self.data.ob_bars) < 24:
+                logger.info(f"Microstructure Warmup: {len(self.data.ob_bars)}/24 bars collected. Trading Paused.")
                 return
                 
             last_closed_time = full_bars.index[-2]
@@ -512,6 +600,15 @@ class ChampionBot:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-root", type=str, default="models_v4/RAVEUSDT")
+    parser.add_argument("--symbol", type=str, default="RAVEUSDT", help="Trading Pair (e.g., RAVEUSDT, MONUSDT)")
+    parser.add_argument("--model-root", type=str, default="models_v4/RAVEUSDT", help="Path to model directory")
     args = parser.parse_args()
+    
+    # OVERRIDE GLOBAL CONFIG
+    CONF.data.symbol = args.symbol
+    # Also update model root if it looks like a default pattern, 
+    # but respect user input if they point to a specific folder.
+    # We leave model-root as is, assuming the user points to the right model for the symbol.
+    
+    logger.info(f"Starting ChampionBot for {CONF.data.symbol}...")
     ChampionBot(args.model_root).run()

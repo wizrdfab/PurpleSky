@@ -28,7 +28,9 @@ if "%BYBIT_API_KEY%"=="" (
 echo.
 
 :: Run the Python Bot
-python -W "ignore" .\live_trading_v2.py --symbol RAVEUSDT --data-dir ./data/RAVEUSDT --model-dir "./models_v5/RAVEUSDT/rank_1" --max-leverage 5
+
+python -W "ignore" live_trader.py --symbol MONUSDT --model-root models_v7/MONUSDT
+
 
 :: If we get here, the bot crashed or closed.
 color 4F
