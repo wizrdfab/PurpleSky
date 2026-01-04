@@ -29,7 +29,7 @@ echo.
 
 :: Run the Python Bot
 
-python -W "ignore" live_trader.py --symbol MONUSDT --model-root models_v7/MONUSDT
+python -W "ignore" live_trader.py --symbol MONUSDT --model-root models_v8/MONUSDT
 
 
 :: If we get here, the bot crashed or closed.

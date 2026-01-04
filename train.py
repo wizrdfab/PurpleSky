@@ -53,10 +53,10 @@ class AutoML:
         study = optuna.create_study(direction='maximize', sampler=sampler)
         study.optimize(self.objective, n_trials=self.args.trials)
         
-        # 2. Select Top 10 for OOS-1
+        # 2. Select Top 100 for OOS-1
         valid_trials = [t for t in study.trials if t.value is not None and t.value > -1.0]
         valid_trials.sort(key=lambda x: x.value, reverse=True)
-        candidates = valid_trials[:10]
+        candidates = valid_trials[:100]
         
         # 3. Individual Tournament (OOS-1)
         print("\n=== Phase 2: OOS-1 Qualification (10% slice) ===")
@@ -68,22 +68,54 @@ class AutoML:
             
         results.sort(key=lambda x: x['oos_score'], reverse=True)
         
-        # 4. Pick THE Best
+        # 4. Pick Top 3
         champion = results[0]
-        print(f"\n🏆 LONE CHAMPION SELECTED: Trial {champion['trial_number']}")
-        self.save_champion(champion, rank=1)
+        print(f"\n🏆 SAVING TOP 3 CHAMPIONS:")
+        for i in range(min(3, len(results))):
+            c = results[i]
+            print(f"  -> Rank {i+1}: Trial {c['trial_number']} (OOS-1 Score: {c['oos_score']:.3f})")
+            self.save_champion(c, rank=i+1)
         
         # 5. Final Verification (Super-OOS)
         print("\n=== Phase 3: SUPER-OOS VERIFICATION (Final 5%) ===")
+        # We now show the OOS-2 scores for the best 10 of OOS-1
+        top_10 = results[:10]
+        
+        print("\n" + "="*135)
+        print(f"{'RANK':<5} | {'TRIAL':<6} | {'OOS1-SCR':<10} | {'OOS1-RET':<10} | {'OOS1-DD':<10} | {'OOS2-SCR':<10} | {'OOS2-RET':<10} | {'OOS2-DD':<10} | {'WR-2':<8}")
+        print("-" * 135)
+        
+        for i, res in enumerate(top_10):
+            oos2_metrics = self.get_super_oos_metrics(res)
+            print(f"#{i+1:<4} | {res['trial_number']:<6} | {res['oos_score']:<10.3f} | {res['oos_return']:<10.2%} | {res['max_drawdown']:<10.2%} | {oos2_metrics['score']:<10.3f} | {oos2_metrics['total_return']:<10.2%} | {oos2_metrics['max_drawdown']:<10.2%} | {oos2_metrics['win_rate']:<8.1%}")
+        print("="*135)
+
+        # Run detailed final test for the absolute winner (Rank 1)
         self.run_final_test(champion)
 
-        # Report
-        print("\n" + "="*90)
-        print(f"{ 'RANK':<5} | {'TRIAL':<6} | {'OOS-1 SCORE':<12} | {'OOS-1 RET':<10} | {'WINRATE':<8} | {'MAXDD'}")
-        print("-" * 90)
-        for i, res in enumerate(results):
-            print(f"#{i+1:<4} | {res['trial_number']:<6} | {res['oos_score']:<12.3f} | {res['oos_return']:<10.2%} | {res['win_rate']:<8.1%} | {res['max_drawdown']:<8.2%}")
-        print("="*90)
+    def get_super_oos_metrics(self, champ):
+        df = self.raw_df.copy()
+        start_idx = int(len(df) * 0.95)
+        test_df = df.iloc[start_idx:].copy()
+        
+        mm = ModelManager(CONF.model)
+        mm.model_long, mm.model_short, mm.feature_cols = champ['model_long'], champ['model_short'], champ['features']
+        df_pred = mm.predict(test_df)
+        
+        # Backtest with Champ's specific params
+        conf = copy.deepcopy(CONF)
+        conf.strategy.base_limit_offset_atr = champ['params']['limit_offset_atr']
+        conf.strategy.take_profit_atr = champ['params']['take_profit_atr']
+        conf.strategy.stop_loss_atr = champ['params']['stop_loss_atr']
+        
+        bt = Backtester(conf)
+        res = bt.run(df_pred, threshold=champ['params']['model_threshold'])
+        
+        score = -1.0
+        if res['trades'] >= 2: score = res['sortino'] * np.log(res['trades'])
+        
+        res['score'] = score
+        return res
 
     def run_final_test(self, champ):
         df = self.raw_df.copy()
@@ -263,7 +295,7 @@ class AutoML:
         with open(save_path / "metrics.json", "w") as f:
             m = {k: v for k,v in res.items() if k not in ['model_long', 'model_short', 'features', 'params']}
             json.dump(m, f, indent=4)
-        print(f"  -> Champion Saved to rank_1/")
+        print(f"  -> Champion Saved to rank_{rank}/")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

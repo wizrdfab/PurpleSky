@@ -18,6 +18,8 @@ class ExchangeClient:
             testnet=testnet,
             api_key=api_key,
             api_secret=api_secret,
+            force_retry=True,
+            max_retries=5,
         )
         print(f"Connected to Bybit {'Testnet' if testnet else 'Mainnet'} for {symbol}")
 
@@ -26,7 +28,8 @@ class ExchangeClient:
         Perform critical safety checks before trading.
         1. Time Sync
         2. Account Mode (One-Way)
-        3. Instrument Status
+        3. Margin Mode (Isolated/Cross)
+        4. Instrument Status
         """
         logger.info("Performing Startup Safety Checks...")
         
@@ -36,12 +39,17 @@ class ExchangeClient:
             logger.critical(f"Time Drift too high ({drift}ms). Abort.")
             return False
             
-        # 2. Enforce One-Way Mode (Safety against Hedge Mode confusion)
+        # 2. Enforce One-Way Mode
         if not self.enforce_oneway_mode():
             logger.critical("Failed to enforce One-Way Mode. Abort.")
             return False
             
-        # 3. Check Symbol Status
+        # 3. Check Margin Mode
+        if not self.check_margin_mode():
+            # We don't abort, just warn, as Cross Margin might be intentional
+            logger.warning("Margin Mode Check Flagged (See logs).")
+            
+        # 4. Check Symbol Status
         info = self.fetch_instrument_info()
         if not info:
             logger.critical(f"Symbol {self.symbol} not found or inactive.")
@@ -49,6 +57,31 @@ class ExchangeClient:
             
         logger.info("Startup Checks PASSED. System Ready.")
         return True
+
+    def check_margin_mode(self) -> bool:
+        """
+        Check and Log the Account Margin Mode.
+        UTA (Unified) accounts have different modes than Classic.
+        """
+        try:
+            # For Unified Account: get_account_info -> marginMode
+            # REGULAR_MARGIN (Cross), PORTFOLIO_MARGIN, ISOLATED_MARGIN (Classic only?)
+            # Actually UTA merges Spot/Contract. 
+            # We just want to know what we are running.
+            resp = self.session.get_account_info()
+            info = resp.get('result', {})
+            
+            m_mode = info.get('marginMode', 'Unknown')
+            u_mode = info.get('unifiedMarginStatus', 'Unknown') # 3=Unified, 4=Pro?
+            
+            logger.info(f"Account Margin Mode: {m_mode} | Unified Status: {u_mode}")
+            
+            # Note: In UTA, 'Cross' is default. 'Isolated' is set per-position usually.
+            # So this check is mostly informational unless we enforce it per position.
+            return True
+        except Exception as e:
+            logger.error(f"Failed to check Margin Mode: {e}")
+            return False
 
     def enforce_oneway_mode(self) -> bool:
         """
@@ -70,11 +103,13 @@ class ExchangeClient:
         except Exception as e:
             msg = str(e)
             # 110043: Position mode not modified (already correct) -> Success
-            # 110025, 110029: Position mode cannot be changed while holding position -> Warning
-            if "110043" in msg:
-                logger.info("Already in One-Way Mode.")
+            # 110025: Position mode not modified (already correct) -> Success
+            if "110043" in msg or "110025" in msg:
+                logger.info("Already in One-Way Mode (Verified).")
                 return True
-            elif "110025" in msg or "110029" in msg:
+            
+            # 110029: Position mode cannot be changed while holding position -> Warning
+            if "110029" in msg:
                 logger.warning("Could not switch mode (Positions exist). ASSUMING One-Way. Please verify manually!")
                 return True # We proceed, but warn.
             
@@ -142,18 +177,20 @@ class ExchangeClient:
             logger.error(f"Error fetching trades: {e}")
             return pd.DataFrame()
 
-    def fetch_kline(self, interval: str = "15", limit: int = 200) -> pd.DataFrame:
+    def fetch_kline(self, interval: str = "15", limit: int = 200, **kwargs) -> pd.DataFrame:
         """
         Fetch historical OHLCV klines for bootstrapping.
         Interval: '1', '3', '5', '15', '30', '60', '120', '240', '360', '720', 'D', 'M', 'W'
+        kwargs: Pass 'end' (timestamp ms) for pagination.
         """
         try:
-            logger.debug(f"Fetching kline int={interval} lim={limit}...")
+            # logger.debug(f"Fetching kline int={interval} lim={limit} kwargs={kwargs}...")
             resp = self.session.get_kline(
                 category="linear",
                 symbol=self.symbol,
                 interval=interval,
-                limit=limit
+                limit=limit,
+                **kwargs
             )
             data = resp.get('result', {}).get('list', [])
             logger.debug(f"Fetched {len(data)} klines.")

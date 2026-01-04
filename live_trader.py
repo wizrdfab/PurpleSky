@@ -172,6 +172,10 @@ class LiveDataManager:
             'ob_bid_integrity_mean', 'ob_ask_integrity_mean'
         ]
         
+        # Transient columns (needed for runtime updates but often dropped in history)
+        self.transient_cols = ['vol_buy', 'vol_sell', 'vol_delta', 'taker_buy_ratio']
+        self.has_medium_term_gap = False
+        
         self.load_history()
         self.bootstrap()
 
@@ -193,15 +197,26 @@ class LiveDataManager:
                 df = pd.read_csv(self.history_file, index_col='datetime', parse_dates=True)
                 if df.empty: return
 
-                # Check for "Gap": If last bar > 10m old, reset continuity but keep data for baseline
+                # Check for "Gap": If last bar > 60m old, reset continuity but keep data for baseline
                 last_ts = df.index[-1]
                 time_diff_min = (datetime.utcnow() - last_ts).total_seconds() / 60.0
                 
-                if time_diff_min > 10.0:
+                if time_diff_min > 60.0:
                     logger.warning(f"History gap detected ({time_diff_min:.1f}m). Keeping baseline, but resetting warmup.")
                     self.continuous_bars = 0
                 else:
+                    logger.info(f"Minor history gap ({time_diff_min:.1f}m). Resuming with existing warmup state.")
                     self.continuous_bars = len(df)
+                    if self.continuous_bars < 12:
+                        logger.warning(f"Resuming with SHORT history ({self.continuous_bars} bars < 1h). Data may be fragmented.")
+                    
+                    # Check for gap in the 1h-2h window
+                    two_h_ago = datetime.utcnow() - timedelta(hours=2)
+                    one_h_ago = datetime.utcnow() - timedelta(hours=1)
+                    mid_history = df.loc[two_h_ago:one_h_ago]
+                    if mid_history.empty and len(df) > 0:
+                         logger.warning("History Gap Detected: No data found in the 1h-2h window. Medium-term features may be unstable.")
+                         self.has_medium_term_gap = True
 
                 # Filter for only existing columns
                 ob_present = [c for c in self.micro_cols if c in df.columns]
@@ -214,6 +229,12 @@ class LiveDataManager:
                 for col in self.micro_cols:
                     if col not in self.ob_bars.columns:
                         self.ob_bars[col] = 0.0
+                        
+                # Schema Migration: Fill missing transient columns (vol_buy, etc.)
+                if not self.trade_bars.empty:
+                    for col in self.transient_cols:
+                        if col not in self.trade_bars.columns:
+                            self.trade_bars[col] = 0.0
                 
                 if not self.trade_bars.empty: self.current_bar_idx = self.trade_bars.index[-1]
                 logger.info(f"Loaded {len(df)} bars from history for {self.config.data.symbol}. Continuous: {self.continuous_bars}")
@@ -228,28 +249,146 @@ class LiveDataManager:
         except Exception as e: logger.error(f"Failed to save history: {e}")
 
     def bootstrap(self):
-        if len(self.trade_bars) >= self.window_size: return
-        logger.info(f"Bootstrapping {self.config.data.symbol} history...")
-        klines = self.exchange.fetch_kline(interval="5", limit=200)
-        if klines.empty: return
-        df = pd.DataFrame()
-        df['datetime'] = pd.to_datetime(klines['timestamp'], unit='s')
-        df.set_index('datetime', inplace=True)
-        df['open'], df['high'], df['low'], df['close'], df['volume'] = klines['open'], klines['high'], klines['low'], klines['close'], klines['volume']
-        df['vol_delta'], df['vol_buy'], df['vol_sell'], df['sell_vol'], df['trade_count'] = 0.0, df['volume']/2, df['volume']/2, df['volume']/2, 100
-        df['total_val'], df['vwap'], df['taker_buy_ratio'] = klines['turnover'], df['close'], 0.5
+        """
+        Deep Bootstrap: Fetch ~30 days of history for Macro Features using pagination.
+        """
+        # 30 days * 24h * 12 bars = 8640. We target ~10,000 bars.
+        target_bars = 10000
         
-        # Combine with existing
+        # Increase window size to hold this history
+        if self.window_size < target_bars:
+            self.window_size = target_bars
+            
+        if len(self.trade_bars) >= target_bars: 
+            return
+
+        logger.info(f"Bootstrapping {self.config.data.symbol} history (Target: 30 days / {target_bars} bars)...")
+        
+        fetched_dfs = []
+        limit = 200 # Safer limit
+        current_end = None # Start from Now
+        
+        for i in range(60): # 60 * 200 = 12000 bars
+            try:
+                # Prepare kwargs
+                kwargs = {}
+                if current_end is not None:
+                    kwargs['end'] = int(current_end) # Bybit expects ms timestamp
+                
+                # logger.info(f"Fetching batch {i} (End: {current_end})...")
+                klines = self.exchange.fetch_kline(interval="5", limit=limit, **kwargs)
+                if klines.empty: 
+                    logger.warning(f"Batch {i} returned empty. Stopping bootstrap.")
+                    break
+                
+                df = pd.DataFrame()
+                df['datetime'] = pd.to_datetime(klines['timestamp'], unit='s')
+                # Fix: Use .values to avoid index alignment mismatch (DatetimeIndex vs RangeIndex)
+                df['open'] = klines['open'].values
+                df['high'] = klines['high'].values
+                df['low'] = klines['low'].values
+                df['close'] = klines['close'].values
+                df['volume'] = klines['volume'].values
+                
+                df.set_index('datetime', inplace=True)
+                
+                # Fill missing/synthetic columns
+                df['vol_delta'], df['vol_buy'], df['vol_sell'], df['sell_vol'], df['trade_count'] = 0.0, df['volume'].values/2, df['volume'].values/2, df['volume'].values/2, 100
+                df['total_val'], df['taker_buy_ratio'] = klines['turnover'].values, 0.5
+                df['vwap'] = (klines['turnover'].values / klines['volume'].values.clip(min=1e-9))
+                
+                # Fix: Explicitly set dollar_val (Turnover) so FeatureEngine doesn't see 0.0s
+                df['dollar_val'] = klines['turnover'].values
+                
+                # DEBUG: Log shape before filter
+                rows_before = len(df)
+                
+                # Filter out zero-price bars (Bybit sometimes returns empty/zero klines)
+                df = df[df['close'] > 0].copy()
+                rows_after = len(df)
+                
+                if rows_after < rows_before:
+                    logger.warning(f"Batch {i}: Dropped {rows_before - rows_after} zero-price rows.")
+
+                if df.empty: 
+                    logger.warning(f"Batch {i}: Data became empty after filtering!")
+                    pass 
+                else:
+                    fetched_dfs.append(df)
+                
+                # Update cursor: Oldest timestamp in this batch becomes the END for the next batch
+                # timestamp is in seconds, convert to ms
+                oldest_ts = klines['timestamp'].min()
+                current_end = oldest_ts * 1000
+                
+                # Safety: If we reached back far enough (e.g. 35 days), stop
+                # But loop limit 12 is safe enough.
+                time.sleep(0.1) # Rate limit kindness
+
+            except Exception as e:
+                logger.error(f"Bootstrap batch {i} failed: {e}")
+                break
+        
+        if not fetched_dfs: 
+            logger.warning("Bootstrap complete but NO data was fetched/kept.")
+            return
+        
+        # Concatenate all batches (they are chronological segments)
+        full_history = pd.concat(fetched_dfs)
+        full_history.sort_index(inplace=True)
+        # Remove duplicates just in case pagination overlapped
+        full_history = full_history[~full_history.index.duplicated(keep='last')]
+        
+        logger.info(f"Bootstrap complete. Fetched {len(full_history)} bars.")
+
+        # Merge with existing local history
         if not self.trade_bars.empty:
-            self.trade_bars = self.trade_bars.combine_first(df)
-            self.trade_bars.sort_index(inplace=True)
-            self.trade_bars = self.trade_bars.iloc[-self.window_size:]
-        else: self.trade_bars = df
+            # combine_first prefers self.trade_bars (local) over full_history (remote)
+            self.trade_bars = self.trade_bars.combine_first(full_history)
+        else:
+            self.trade_bars = full_history
+            
+        self.trade_bars.sort_index(inplace=True)
+        # Ensure we keep the full window
+        self.trade_bars = self.trade_bars.iloc[-self.window_size:]
         
         if not self.trade_bars.empty: self.current_bar_idx = self.trade_bars.index[-1]
 
+    def get_quality_report(self) -> str:
+        """
+        Diagnostic: Check data health for feature calculation.
+        """
+        if self.trade_bars.empty: return "Data: EMPTY"
+        
+        n = len(self.trade_bars)
+        
+        # 1. Macro Readiness (Target: 30 days = 8640 bars)
+        macro_target = 8640
+        macro_pct = min(100.0, (n / macro_target) * 100)
+        
+        # 2. Orderbook Density (Last 2h = 24 bars)
+        target_window = 24
+        if self.ob_bars.empty:
+            ob_density = 0.0
+        else:
+            # Focus on the 2-hour window
+            recent_ob = self.ob_bars.tail(target_window)
+            
+            # Robust Check: Real OB data always has a Spread > 0.
+            if 'ob_spread_mean' in recent_ob.columns:
+                valid_count = (recent_ob['ob_spread_mean'] > 0.0).sum()
+                # Denominator is the TARGET window, not the current length
+                ob_density = (valid_count / target_window * 100)
+            else:
+                ob_density = 0.0
+        
+        # Cap at 100%
+        ob_density = min(100.0, ob_density)
+        
+        return f"Data Health: [Bars: {n} | Macro: {macro_pct:.0f}% | OB-Density(2h): {ob_density:.0f}%]"
+
     def update(self, ob_snapshot: dict) -> pd.DataFrame:
-        trades = self.exchange.fetch_recent_trades(limit=200)
+        trades = self.exchange.fetch_recent_trades(limit=1000)
         self._process_trades(trades)
         
         if self.trade_bars.empty: return pd.DataFrame()
@@ -383,6 +522,40 @@ class LiveDataManager:
             
         if len(self.ob_bars) > self.window_size: self.ob_bars = self.ob_bars.iloc[-self.window_size:]
 
+class SanityCheck:
+    """
+    Data Scientist Guardrails.
+    Checks for statistical anomalies that indicate data corruption.
+    """
+    def check(self, row: pd.Series) -> List[str]:
+        warnings = []
+        
+        # 1. Z-Score Explosion Check (Variance Collapse)
+        z_cols = [c for c in row.index if c.endswith('_z')]
+        for c in z_cols:
+            val = row[c]
+            if abs(val) > 10.0:
+                warnings.append(f"EXTREME Z-SCORE: {c} = {val:.2f} (Likely Zero Variance in History)")
+
+        # 2. VWAP Dislocation Check (Missing Price/Turnover)
+        vwap_cols = [c for c in row.index if 'vwap' in c and 'dist' in c]
+        for c in vwap_cols:
+            val = row[c]
+            if abs(val) > 20.0:
+                warnings.append(f"VWAP DISLOCATION: {c} = {val:.2f} ATRs (Possible Missing DollarVal)")
+
+        # 3. Synthetic Data Leak (The "0.5" Ratio)
+        if 'taker_buy_ratio' in row.index:
+            if row['taker_buy_ratio'] == 0.5:
+                warnings.append("SYNTHETIC DATA: Taker Buy Ratio is exactly 0.5 (Bootstrap Artifact)")
+                
+        # 4. Missing Microstructure (Zero Elasticity)
+        if 'ob_bid_elasticity' in row.index:
+            if row['ob_bid_elasticity'] == 0.0:
+                 warnings.append("MISSING ORDERBOOK: Elasticity is 0.0 (No Depth Data)")
+
+        return warnings
+
 class ChampionBot:
     def __init__(self, model_root: str):
         self.config = CONF
@@ -404,14 +577,33 @@ class ChampionBot:
         self.notifier = Notifier(prefix=f"[{self.config.data.symbol}]")
         self.risk = RiskManager(self.config, self.state, self.notifier)
         self.health = HealthMonitor()
+        self.sanity = SanityCheck()
         self.data = LiveDataManager(self.config, self.exchange)
         self.fe = FeatureEngine(self.config.features)
         
         # Load Lone Champion
         self._load_champion(model_root)
         self._register_signals()
+        
+        # --- Reality Reconciliation ---
+        if not self.config.live.dry_run:
+            bal = self.exchange.get_wallet_balance()
+            self.start_equity = bal.get('equity', 0.0)
+            self.start_pnl = self.state.state.get("total_pnl", 0.0)
+            logger.info(f"Reality Baseline: Start Equity: ${self.start_equity:.2f} | Start PnL: ${self.start_pnl:.2f}")
+        else:
+            self.start_equity = 10000.0
+            self.start_pnl = 0.0
+
         self._print_manifest(model_root)
-        self.notifier.send("Champion Bot Started", "INFO")
+        
+        # Initial Notification
+        status = "WARMING UP" if self.data.continuous_bars < 24 else "ACTIVE"
+        gap_msg = " | !! MEDIUM-TERM GAP DETECTED !!" if self.data.has_medium_term_gap else ""
+        msg = f"Champion Bot Started [{status}: {self.data.continuous_bars}/24 bars]{gap_msg}"
+        
+        level = "WARNING" if (status == "WARMING UP" or self.data.has_medium_term_gap) else "INFO"
+        self.notifier.send(msg, level)
 
     def _register_signals(self):
         """Register signal handlers for graceful shutdown on Linux/Docker."""
@@ -463,9 +655,21 @@ class ChampionBot:
                     # Use trade_bars for quick stats (faster than get_bars merge)
                     curr_p = self.data.trade_bars['close'].iloc[-1] if not self.data.trade_bars.empty else 0.0
                     pos_s = self.exchange.get_position() if not self.config.live.dry_run else 0.0
-                    logger.info(f"[HEARTBEAT] Price: {curr_p:.4f} | Pos: {pos_s} | Bars: {len(self.data.trade_bars)} | Snaps: {len(self.data.ob_buffer)} | Health: {self.health.check_health()}")
+                    
+                    # Reality Check
+                    pnl_str = ""
+                    if not self.config.live.dry_run:
+                        curr_equity = self.exchange.get_wallet_balance().get('equity', 0.0)
+                        curr_total_pnl = self.state.state.get("total_pnl", 0.0)
+                        
+                        expected = self.start_equity + (curr_total_pnl - self.start_pnl)
+                        friction = curr_equity - expected # Negative means fees/funding
+                        pnl_str = f"| Eq: ${curr_equity:.2f} (Friction: {friction:.2f})"
+                    
+                    data_health = self.data.get_quality_report()
+                    logger.info(f"[HEARTBEAT] Price: {curr_p:.4f} | Pos: {pos_s} {pnl_str} | {data_health} | Health: {self.health.check_health()}")
                     last_status = now
-                if now - last_reconcile >= 60.0:
+                if now - last_reconcile >= 10.0:
                     self._reconcile()
                     last_reconcile = now
                 self._check_bar_close()
@@ -516,6 +720,7 @@ class ChampionBot:
     def _check_bar_close(self):
         if self.data.new_bar_event:
             self.data.new_bar_event = False
+            self.data.save_history() # Save immediately to persist warmup progress
             
             # Use get_bars() for the full picture
             full_bars = self.data.get_bars()
@@ -544,7 +749,6 @@ class ChampionBot:
             
             self.state.state["last_processed_bar"] = str(last_closed_time)
             self.state.save()
-            self.data.save_history()
 
     def _execute_champion(self, row):
         c = self.champion
@@ -556,9 +760,14 @@ class ChampionBot:
             # Format in columns of 3
             for i in range(0, len(feature_names), 3):
                 chunk = feature_names[i:i+3]
-                line = " | ".join([f"{name}: {row[name]:.4f}" for name in chunk])
+                line = " | ".join([f"{name}: {row[name]:.6f}" for name in chunk])
                 msg += f"  {line}\n"
             logger.info(msg)
+            
+        # Data Scientist Guardrails
+        sanity_warnings = self.sanity.check(row)
+        for w in sanity_warnings:
+            logger.warning(f"[DATA INTEGRITY] {w}")
 
         X = row[feature_names].values.reshape(1, -1)
         pred_l, pred_s = c['ml'].predict(X)[0], c['ms'].predict(X)[0]
@@ -596,123 +805,166 @@ class ChampionBot:
                 self.notifier.send(msg, "SUCCESS")
                 # Store timestamp (ISO format) for robust time tracking
                 ts = row.name.isoformat() if hasattr(row.name, 'isoformat') else datetime.utcnow().isoformat()
-                self.state.state["active_orders"][resp['result']['orderId']] = {'created_at': ts, 'side': side}
+                self.state.state["active_orders"][resp['result']['orderId']] = {
+                    'created_at': ts, 
+                    'side': side,
+                    'price': price,
+                    'qty': final_qty
+                }
                 self.state.save()
 
-
     def _reconcile(self):
+        """
+        Expert Reconciliation:
+        1. Syncs Local Orders <-> Exchange Orders (Strict Mode)
+        2. Manages Position Timeouts (Local Time Authority)
+        3. Detects PnL
+        """
         if self.config.live.dry_run: return
-        orders = self.exchange.get_open_orders()
-        ids = [o['orderId'] for o in orders]
         
-        # Pull authoritative position details from Exchange
+        # A. Fetch State
+        remote_orders_list = self.exchange.get_open_orders()
         pos_details = self.exchange.get_position_details()
         pos_size = pos_details.get('size', 0.0)
         abs_size = pos_details.get('abs_size', 0.0)
         
+        # Build Remote Map for O(1) Access
+        # Key: orderId -> Value: Order Dict
+        remote_orders = {o['orderId']: o for o in remote_orders_list}
+        local_orders = self.state.state["active_orders"]
+        
         current_time = datetime.utcnow()
-        tf_seconds = 300 # Assuming 5m timeframe
+        tf_seconds = 300 # 5m
         
-        # 0. ADOPT ORPHAN ORDERS
-        # If we find an order on exchange not in our state, adopt it.
-        # This handles restarts (lost state) or manual interventions.
-        for o in orders:
-            oid = o.get('orderId')
-            if oid not in self.state.state["active_orders"]:
-                try:
-                    # Bybit returns 'createdTime' in ms
-                    c_time = int(o.get('createdTime', 0))
-                    if c_time > 0:
-                        ts_iso = datetime.utcfromtimestamp(c_time / 1000.0).isoformat()
-                        logger.info(f"Adopting orphan order {oid} (Created: {ts_iso})")
-                        self.state.state["active_orders"][oid] = {
-                            'created_at': ts_iso,
-                            'side': o.get('side'),
-                            'adopted': True
-                        }
-                except Exception as e:
-                    logger.error(f"Failed to adopt order {oid}: {e}")
-
-        # 1. Manage Orders (Cancellation & Cleanup)
-        tracked = list(self.state.state["active_orders"].keys())
-        for oid in tracked:
-            info = self.state.state["active_orders"][oid]
+        # B. SYNC LOCAL -> REMOTE (Clean Zombies & Update Drift)
+        # We iterate a COPY of keys to allow deletion
+        for oid in list(local_orders.keys()):
+            local_info = local_orders[oid]
             
-            # Check for Expiry
-            if 'created_at' in info:
-                try:
-                    created_at = pd.to_datetime(info['created_at'])
-                    age_seconds = (current_time - created_at).total_seconds()
-                    limit_seconds = self.config.strategy.time_limit_bars * tf_seconds
-                    
-                    if oid in ids and age_seconds > limit_seconds:
-                        logger.info(f"Order {oid} expired ({age_seconds:.0f}s > {limit_seconds}s). Cancelling.")
-                        self.exchange.cancel_order(order_id=oid)
-                        del self.state.state["active_orders"][oid]
-                        continue
-                except Exception as e:
-                    logger.error(f"Date parse error for order {oid}: {e}")
+            # Case 1: Order exists on Exchange
+            if oid in remote_orders:
+                remote_info = remote_orders[oid]
+                
+                # Check for "Drift" (External Modification)
+                # Note: API returns strings, we compare as floats
+                rem_price = float(remote_info.get('price', 0))
+                loc_price = float(local_info.get('price', 0))
+                
+                if loc_price > 0 and abs(rem_price - loc_price) > self.instr_info['tick_size']:
+                    logger.warning(f"Order {oid} drift detected! Local: {loc_price} -> Remote: {rem_price}. Syncing.")
+                    local_orders[oid]['price'] = rem_price
+                    # We could also check Qty here
+                
+                # Check Expiry (Time Limit)
+                if 'created_at' in local_info:
+                    try:
+                        created_at = pd.to_datetime(local_info['created_at'])
+                        age_seconds = (current_time - created_at).total_seconds()
+                        limit_seconds = self.config.strategy.time_limit_bars * tf_seconds
+                        
+                        if age_seconds > limit_seconds:
+                            logger.info(f"Order {oid} expired ({age_seconds:.0f}s). Cancelling.")
+                            self.exchange.cancel_order(order_id=oid)
+                            # Will be removed from local state in next pass or below
+                            # For now, we can optimistically remove it or wait for next sync
+                    except Exception: pass
 
-            # Check for Fill/External Cancel
-            if oid not in ids:
-                # Order is gone from exchange. Just remove from tracking.
-                del self.state.state["active_orders"][oid]
+            # Case 2: Order MISSING on Exchange (Zombie / Filled / Cancelled)
+            else:
+                # If we have a position now, it likely filled.
+                # If not, it was cancelled or rejected.
+                # Either way, it's no longer "Active"
+                logger.info(f"Order {oid} missing on exchange. Removing from local state.")
+                del local_orders[oid]
+
+        # C. SYNC REMOTE -> LOCAL (Adopt Orphans)
+        for oid, rem_info in remote_orders.items():
+            if oid not in local_orders:
+                try:
+                    c_time = int(rem_info.get('createdTime', 0))
+                    ts_iso = datetime.utcfromtimestamp(c_time / 1000.0).isoformat() if c_time > 0 else datetime.utcnow().isoformat()
+                    
+                    logger.info(f"Adopting Orphan Order {oid} @ {rem_info.get('price')}")
+                    local_orders[oid] = {
+                        'created_at': ts_iso,
+                        'side': rem_info.get('side'),
+                        'price': float(rem_info.get('price', 0)),
+                        'qty': float(rem_info.get('qty', 0)),
+                        'adopted': True
+                    }
+                except Exception as e:
+                    logger.error(f"Failed to adopt {oid}: {e}")
         
-        # 2. Manage Position (Max Holding Time)
-        # Prioritize LOCAL entry time to avoid Bybit 'sticky timestamp' bugs
+        # D. MANAGE POSITION (Timeouts)
         if abs_size > 0:
             try:
-                # A. Detect New Entry (or Re-Entry)
+                # Detect New Entry
                 if self.state.state.get("last_pos_size", 0) == 0:
                     logger.info("Position Detected. initializing Entry Time tracker.")
                     self.state.state["position_entry_time"] = datetime.utcnow().isoformat()
                     self.state.save()
                 
-                # B. Determine Authoritative Entry Time
+                # Determine Entry Time
                 entry_time = None
-                source = "LOCAL"
-                
                 if self.state.state.get("position_entry_time"):
                     entry_time = pd.to_datetime(self.state.state["position_entry_time"])
                 else:
-                    # Fallback to Exchange if local state missing (e.g. fresh install)
+                    # Fallback
                     created_ms = pos_details.get('created_time', 0)
                     if created_ms > 0:
                         entry_time = datetime.utcfromtimestamp(created_ms / 1000.0)
-                        source = "EXCHANGE"
-                        # Bootstrap local state to prevent future drift
                         self.state.state["position_entry_time"] = entry_time.isoformat()
                         self.state.save()
                 
-                # C. Check Timeout
+                # Check Timeout
                 if entry_time:
                     hold_seconds = (current_time - entry_time).total_seconds()
                     max_hold_seconds = self.config.strategy.max_holding_bars * tf_seconds
                     
                     if hold_seconds > max_hold_seconds:
-                        logger.warning(f"Max Holding Time Exceeded ({hold_seconds:.0f}s > {max_hold_seconds}s | Source: {source}). Force Closing.")
+                        logger.warning(f"Max Holding Time Exceeded ({hold_seconds:.0f}s). Force Closing.")
                         side = "Buy" if pos_size > 0 else "Sell"
                         self.exchange.market_close(side, abs_size)
-                    elif hold_seconds < 0:
-                         logger.warning(f"Negative Hold Time ({hold_seconds}s). Clock Drift? Resetting tracker.")
-                         self.state.state["position_entry_time"] = datetime.utcnow().isoformat()
-                         self.state.save()
                          
             except Exception as e:
                 logger.error(f"Position timer error: {e}")
 
-        # 3. Detect Closed Position (PnL & Reset)
+        # E. DETECT CLOSE (PnL)
         if abs_size == 0 and self.state.state.get("last_pos_size", 0) != 0:
-             # Clear Entry Time
-             self.state.state["position_entry_time"] = None
              try:
-                closed = self.exchange.fetch_closed_pnl(limit=1)
-                if closed:
-                    pnl = float(closed[0]['closedPnl'])
-                    self.health.record_trade(pnl)
-                    self.state.update_pnl(pnl)
-                    logger.info(f"Trade Closed. PnL: {pnl:.4f} USDT | Health: {self.health.check_health()}")
-             except: pass
+                # Expert PnL: Aggregate ALL fills since entry
+                entry_ts_iso = self.state.state.get("position_entry_time")
+                # Convert ISO to ms timestamp
+                entry_ms = 0
+                if entry_ts_iso:
+                    dt_entry = pd.to_datetime(entry_ts_iso)
+                    entry_ms = dt_entry.timestamp() * 1000.0
+                
+                # Fetch last 20 records (buffer for fragmentation)
+                closed_records = self.exchange.fetch_closed_pnl(limit=20)
+                
+                cycle_pnl = 0.0
+                trade_count = 0
+                
+                for r in closed_records:
+                    # Filter: Only include PnL generated AFTER we entered this position
+                    r_time = int(r.get('createdTime', 0))
+                    if r_time > entry_ms:
+                        cycle_pnl += float(r.get('closedPnl', 0))
+                        trade_count += 1
+                
+                if trade_count > 0:
+                    self.health.record_trade(cycle_pnl)
+                    self.state.update_pnl(cycle_pnl)
+                    logger.info(f"Trade Cycle Closed. Aggregated PnL: {cycle_pnl:.4f} USDT ({trade_count} fills) | Health: {self.health.check_health()}")
+                else:
+                    logger.warning("Position closed but no recent PnL records found! (Timing mismatch?)")
+                    
+             except Exception as e:
+                logger.error(f"PnL Calculation Error: {e}")
+             
+             # Clear Entry Time AFTER processing
+             self.state.state["position_entry_time"] = None
         
         # Update local state tracker for next loop
         self.state.state["last_pos_size"] = abs_size

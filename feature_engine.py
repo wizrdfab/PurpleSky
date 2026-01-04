@@ -169,4 +169,8 @@ class FeatureEngine:
         cols_to_drop = ['tr0', 'tr1', 'tr2', 'tr', 'up_move', 'down_move', 'plus_dm', 'minus_dm', 'price_chg', 'imb_chg', 'vol_buy', 'vol_sell', 'volume', 'vwap_4h', 'vwap_24h', 'dollar_val']
         df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
         
+        # FINAL SAFETY: Drop any rows that have 0.0 or NaN in 'close' 
+        # (prevents bootstrap holes or empty history from corrupting features)
+        df = df[df['close'] > 0].copy()
+        
         return df.fillna(0)
