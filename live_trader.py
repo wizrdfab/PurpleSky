@@ -11,7 +11,7 @@ import signal
 import traceback
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -197,10 +197,10 @@ class LiveDataManager:
                 df = pd.read_csv(self.history_file, index_col='datetime', parse_dates=True)
                 if df.empty: return
 
-                # Check for "Gap": If last bar > 60m old, reset continuity but keep data for baseline
+                # Check for "Gap": If last bar > 60m old, reset continuity but keep data for baseline     
                 last_ts = df.index[-1]
-                time_diff_min = (datetime.utcnow() - last_ts).total_seconds() / 60.0
-                
+                time_diff_min = (datetime.now(timezone.utc).replace(tzinfo=None) - last_ts).total_seconds() / 60.0
+
                 if time_diff_min > 60.0:
                     logger.warning(f"History gap detected ({time_diff_min:.1f}m). Keeping baseline, but resetting warmup.")
                     self.continuous_bars = 0
@@ -209,10 +209,10 @@ class LiveDataManager:
                     self.continuous_bars = len(df)
                     if self.continuous_bars < 12:
                         logger.warning(f"Resuming with SHORT history ({self.continuous_bars} bars < 1h). Data may be fragmented.")
-                    
+
                     # Check for gap in the 1h-2h window
-                    two_h_ago = datetime.utcnow() - timedelta(hours=2)
-                    one_h_ago = datetime.utcnow() - timedelta(hours=1)
+                    two_h_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+                    one_h_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
                     mid_history = df.loc[two_h_ago:one_h_ago]
                     if mid_history.empty and len(df) > 0:
                          logger.warning("History Gap Detected: No data found in the 1h-2h window. Medium-term features may be unstable.")
@@ -559,6 +559,8 @@ class SanityCheck:
 class ChampionBot:
     def __init__(self, model_root: str):
         self.config = CONF
+        self.is_placing_order = False
+        self.last_order_ts = 0
         key, secret = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
         if not key or not secret:
             self.config.live.dry_run = True
@@ -634,6 +636,10 @@ class ChampionBot:
         logger.info("\n" + "="*60 + f"\nLONE CHAMPION STARTUP MANIFEST\n" + "="*60)
         logger.info(f"Symbol: {self.config.data.symbol} | Model Root: {root}")
         logger.info(f"Clock Drift: {self.exchange.check_time_sync():.1f}ms")
+        
+        active_orders = self.state.state.get("active_orders", {})
+        logger.info(f"State: {len(active_orders)} Active Orders Restored")
+        
         if not self.config.live.dry_run:
             bal = self.exchange.get_wallet_balance()
             logger.info(f"Account: ${bal['equity']:.2f} Equity | ${bal['available']:.2f} Available")
@@ -641,10 +647,16 @@ class ChampionBot:
         logger.info("="*60 + "\n")
 
     def run(self):
-        last_poll, last_reconcile, last_status, last_risk_check = 0, 0, 0, 0
+        last_poll, last_reconcile, last_status, last_risk_check, last_sync = 0, 0, 0, 0, time.time()
         while True:
             try:
                 now = time.time()
+                # 1. Periodic Time Sync (Every 1 Hour)
+                if now - last_sync >= 3600.0:
+                    drift = self.exchange.check_time_sync()
+                    logger.info(f"Periodic Time Sync: Current Drift: {drift:.1f}ms")
+                    last_sync = now
+
                 if now - last_risk_check >= 5.0:
                     if not self._monitor_risk(): break
                     last_risk_check = now
@@ -659,12 +671,22 @@ class ChampionBot:
                     # Reality Check
                     pnl_str = ""
                     if not self.config.live.dry_run:
-                        curr_equity = self.exchange.get_wallet_balance().get('equity', 0.0)
+                        bal = self.exchange.get_wallet_balance()
+                        curr_equity = bal.get('equity', 0.0)
+                        curr_cash = bal.get('total_balance', 0.0)
                         curr_total_pnl = self.state.state.get("total_pnl", 0.0)
                         
-                        expected = self.start_equity + (curr_total_pnl - self.start_pnl)
-                        friction = curr_equity - expected # Negative means fees/funding
-                        pnl_str = f"| Eq: ${curr_equity:.2f} (Friction: {friction:.2f})"
+                        # Friction = Cash - (StartEquity + RealizedPnLDelta)
+                        # This stays stable even when a trade is open
+                        expected_cash = self.start_equity + (curr_total_pnl - self.start_pnl)
+                        friction = curr_cash - expected_cash
+                        
+                        # Get Unrealized PnL for the heartbeat
+                        pos_details = self.exchange.get_position_details()
+                        unreal = pos_details.get('unrealized_pnl', 0.0)
+                        order_count = len(self.state.state.get("active_orders", {}))
+                        
+                        pnl_str = f"| Eq: ${curr_equity:.2f} | Unreal: ${unreal:.2f} | Friction: {friction:.2f} | Orders: {order_count}"
                     
                     data_health = self.data.get_quality_report()
                     logger.info(f"[HEARTBEAT] Price: {curr_p:.4f} | Pos: {pos_s} {pnl_str} | {data_health} | Health: {self.health.check_health()}")
@@ -780,38 +802,46 @@ class ChampionBot:
 
     def _place_trade(self, row, side, p):
         if self.exchange.get_position() != 0 or self.state.state["active_orders"]: return
-        price = row['close'] - (row['atr'] * p['limit_offset_atr']) if side == "Buy" else row['close'] + (row['atr'] * p['limit_offset_atr'])
-        tick = self.instr_info.get('tick_size', 0.0001)
-        price = round(round(price / tick) * tick, 5)
-        bal = self.exchange.get_wallet_balance() if not self.config.live.dry_run else {'equity':10000}
-        risk_d = bal['equity'] * self.config.strategy.risk_per_trade
-        qty = risk_d / (row['atr'] * p['stop_loss_atr'])
-        qty_n = 6.0 / price
-        final_qty = max(qty, self.instr_info.get('min_qty', 1.0), qty_n)
-        max_lev_qty = (bal['equity'] * 5.0) / price
-        final_qty = min(final_qty, max_lev_qty)
-        step = self.instr_info.get('qty_step', 0.1)
-        final_qty = round(int(final_qty/step)*step, 5)
-        tp_p = price + (row['atr'] * p['take_profit_atr']) if side == "Buy" else price - (row['atr'] * p['take_profit_atr'])
-        sl_p = price - (row['atr'] * p['stop_loss_atr']) if side == "Buy" else price + (row['atr'] * p['stop_loss_atr'])
-        tp_p = round(round(tp_p / tick) * tick, 5); sl_p = round(round(sl_p / tick) * tick, 5)
+        if self.is_placing_order: return
+        if time.time() - self.last_order_ts < 2.0: return
         
-        msg = f"!!! TRADING: {side} @ {price} [TP: {tp_p} | SL: {sl_p}] Notional: ${final_qty*price:.2f} !!!"
-        logger.info(msg)
-        
-        if not self.config.live.dry_run:
-            resp = self.exchange.place_limit_order(side, price, final_qty, tp=tp_p, sl=sl_p)
-            if resp: 
-                self.notifier.send(msg, "SUCCESS")
-                # Store timestamp (ISO format) for robust time tracking
-                ts = row.name.isoformat() if hasattr(row.name, 'isoformat') else datetime.utcnow().isoformat()
-                self.state.state["active_orders"][resp['result']['orderId']] = {
-                    'created_at': ts, 
-                    'side': side,
-                    'price': price,
-                    'qty': final_qty
-                }
-                self.state.save()
+        self.is_placing_order = True
+        try:
+            price = row['close'] - (row['atr'] * p['limit_offset_atr']) if side == "Buy" else row['close'] + (row['atr'] * p['limit_offset_atr'])
+            tick = self.instr_info.get('tick_size', 0.0001)
+            price = round(round(price / tick) * tick, 5)
+            bal = self.exchange.get_wallet_balance() if not self.config.live.dry_run else {'equity':10000}
+            risk_d = bal['equity'] * self.config.strategy.risk_per_trade
+            qty = risk_d / (row['atr'] * p['stop_loss_atr'])
+            qty_n = 6.0 / price
+            final_qty = max(qty, self.instr_info.get('min_qty', 1.0), qty_n)
+            max_lev_qty = (bal['equity'] * 5.0) / price
+            final_qty = min(final_qty, max_lev_qty)
+            step = self.instr_info.get('qty_step', 0.1)
+            final_qty = round(int(final_qty/step)*step, 5)
+            tp_p = price + (row['atr'] * p['take_profit_atr']) if side == "Buy" else price - (row['atr'] * p['take_profit_atr'])
+            sl_p = price - (row['atr'] * p['stop_loss_atr']) if side == "Buy" else price + (row['atr'] * p['stop_loss_atr'])
+            tp_p = round(round(tp_p / tick) * tick, 5); sl_p = round(round(sl_p / tick) * tick, 5)
+            
+            msg = f"!!! TRADING: {side} @ {price} [TP: {tp_p} | SL: {sl_p}] Notional: ${final_qty*price:.2f} !!!"
+            logger.info(msg)
+            
+            if not self.config.live.dry_run:
+                resp = self.exchange.place_limit_order(side, price, final_qty, tp=tp_p, sl=sl_p)
+                if resp: 
+                    self.last_order_ts = time.time()
+                    self.notifier.send(msg, "SUCCESS")
+                    # Store timestamp (ISO format) for robust time tracking
+                    ts = row.name.isoformat() if hasattr(row.name, 'isoformat') else datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                    self.state.state["active_orders"][resp['result']['orderId']] = {
+                        'created_at': ts, 
+                        'side': side,
+                        'price': price,
+                        'qty': final_qty
+                    }
+                    self.state.save()
+        finally:
+            self.is_placing_order = False
 
     def _reconcile(self):
         """
@@ -833,7 +863,8 @@ class ChampionBot:
         remote_orders = {o['orderId']: o for o in remote_orders_list}
         local_orders = self.state.state["active_orders"]
         
-        current_time = datetime.utcnow()
+        # authoritative current time synced to Bybit
+        current_time = self.exchange.get_exchange_now()
         tf_seconds = 300 # 5m
         
         # B. SYNC LOCAL -> REMOTE (Clean Zombies & Update Drift)
@@ -882,7 +913,8 @@ class ChampionBot:
             if oid not in local_orders:
                 try:
                     c_time = int(rem_info.get('createdTime', 0))
-                    ts_iso = datetime.utcfromtimestamp(c_time / 1000.0).isoformat() if c_time > 0 else datetime.utcnow().isoformat()
+                    # Fallback to current synced time if createdTime is missing
+                    ts_iso = datetime.fromtimestamp(c_time / 1000.0, tz=timezone.utc).replace(tzinfo=None).isoformat() if c_time > 0 else self.exchange.get_exchange_now().isoformat()
                     
                     logger.info(f"Adopting Orphan Order {oid} @ {rem_info.get('price')}")
                     local_orders[oid] = {
@@ -901,7 +933,7 @@ class ChampionBot:
                 # Detect New Entry
                 if self.state.state.get("last_pos_size", 0) == 0:
                     logger.info("Position Detected. initializing Entry Time tracker.")
-                    self.state.state["position_entry_time"] = datetime.utcnow().isoformat()
+                    self.state.state["position_entry_time"] = self.exchange.get_exchange_now().isoformat()
                     self.state.save()
                 
                 # Determine Entry Time
@@ -912,7 +944,7 @@ class ChampionBot:
                     # Fallback
                     created_ms = pos_details.get('created_time', 0)
                     if created_ms > 0:
-                        entry_time = datetime.utcfromtimestamp(created_ms / 1000.0)
+                        entry_time = datetime.fromtimestamp(created_ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
                         self.state.state["position_entry_time"] = entry_time.isoformat()
                         self.state.save()
                 
@@ -948,8 +980,10 @@ class ChampionBot:
                 
                 for r in closed_records:
                     # Filter: Only include PnL generated AFTER we entered this position
+                    # We add a 30-second "drift buffer" (30000ms) to ensure we don't miss records
+                    # due to exchange/local timestamp misalignments.
                     r_time = int(r.get('createdTime', 0))
-                    if r_time > entry_ms:
+                    if r_time > (entry_ms - 30000):
                         cycle_pnl += float(r.get('closedPnl', 0))
                         trade_count += 1
                 

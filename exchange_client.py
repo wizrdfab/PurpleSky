@@ -7,6 +7,7 @@ from pybit.exceptions import InvalidRequestError
 import pandas as pd
 import time
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ExchangeClient")
@@ -21,7 +22,12 @@ class ExchangeClient:
             force_retry=True,
             max_retries=5,
         )
+        self.time_offset_ms = 0.0
         print(f"Connected to Bybit {'Testnet' if testnet else 'Mainnet'} for {symbol}")
+
+    def get_exchange_now(self) -> datetime:
+        """Returns current datetime synced to Bybit Server Time."""
+        return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(milliseconds=self.time_offset_ms)
 
     def startup_check(self) -> bool:
         """
@@ -137,7 +143,10 @@ class ExchangeClient:
                 server_time = int(nano) / 1_000_000 # Convert to ms
             
             local_time = t1 * 1000
-            drift = abs(local_time - (server_time + rtt/2))
+            # Offset: How much LOCAL is ahead of SERVER
+            # Positive = Local is ahead. Negative = Local is behind.
+            self.time_offset_ms = local_time - (server_time + rtt/2)
+            drift = abs(self.time_offset_ms)
             
             if drift > 1000:
                 logger.warning(f"High Clock Drift detected: {drift:.1f}ms. Please sync Windows Time.")
@@ -330,6 +339,7 @@ class ExchangeClient:
                         'side': side,
                         'entry_price': self._safe_float(p.get('avgPrice')),
                         'mark_price': self._safe_float(p.get('markPrice')),
+                        'unrealized_pnl': self._safe_float(p.get('unrealisedPnl')),
                         'created_time': created_time,
                         'updated_time': updated_time
                     }
