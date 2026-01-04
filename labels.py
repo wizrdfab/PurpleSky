@@ -40,10 +40,23 @@ class Labeler:
         # Short Target
         y_short = np.zeros(n)
         
+        # Meta-Labeling Direction Targets
+        df['target_dir_long'] = 0.0
+        df['target_dir_short'] = 0.0
+        
         for i in range(n - max_hold - 1):
             if atrs[i] == 0: continue
             
-            # --- LONG ---
+            # --- Directional Target (Meta-Labeling Model A) ---
+            # Simply: Is the price higher/lower in the future?
+            # We check the horizon equal to time_limit_bars (the window we are willing to wait)
+            horizon = min(i + time_limit, n - 1)
+            if closes[horizon] > closes[i] + (atrs[i] * 0.5): # Significant move required
+                df.at[i, 'target_dir_long'] = 1
+            if closes[horizon] < closes[i] - (atrs[i] * 0.5):
+                df.at[i, 'target_dir_short'] = 1
+
+            # --- LONG EXECUTION ---
             limit = closes[i] - (atrs[i] * offset)
             filled = False
             fill_price = 0.0

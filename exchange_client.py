@@ -175,6 +175,10 @@ class ExchangeClient:
             df = pd.DataFrame(data)
             # Standardize columns to match DataConfig
             # Bybit returns: id, symbol, price, size, side, time, isBlockTrade
+            if "execId" in df.columns and "id" not in df.columns:
+                df["id"] = df["execId"].astype(str)
+            elif "id" in df.columns:
+                df["id"] = df["id"].astype(str)
             df['timestamp'] = df['time'].astype(float) / 1000.0 # Convert ms to seconds
             df['price'] = df['price'].astype(float)
             df['size'] = df['size'].astype(float)
@@ -458,9 +462,14 @@ class ExchangeClient:
             price_filter = info.get('priceFilter', {})
             
             return {
-                'min_qty': float(lot_filter.get('minOrderQty', 0.0)),
-                'qty_step': float(lot_filter.get('qtyStep', 0.0)),
-                'tick_size': float(price_filter.get('tickSize', 0.0))
+                'min_qty': self._safe_float(lot_filter.get('minOrderQty', 0.0)),
+                'qty_step': self._safe_float(lot_filter.get('qtyStep', 0.0)),
+                'tick_size': self._safe_float(price_filter.get('tickSize', 0.0)),
+                'min_notional': self._safe_float(
+                    lot_filter.get('minNotionalValue', 0.0)
+                    or lot_filter.get('minOrderValue', 0.0)
+                    or lot_filter.get('minNotional', 0.0)
+                )
             }
         except Exception as e:
             logger.error(f"Error fetching instrument info: {e}")

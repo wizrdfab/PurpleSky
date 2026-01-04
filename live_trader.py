@@ -584,7 +584,7 @@ class ChampionBot:
         self.fe = FeatureEngine(self.config.features)
         
         # Load Lone Champion
-        self._load_champion(model_root)
+        self._load_council(model_root)
         self._register_signals()
         
         # --- Reality Reconciliation ---
@@ -602,7 +602,7 @@ class ChampionBot:
         # Initial Notification
         status = "WARMING UP" if self.data.continuous_bars < 24 else "ACTIVE"
         gap_msg = " | !! MEDIUM-TERM GAP DETECTED !!" if self.data.has_medium_term_gap else ""
-        msg = f"Champion Bot Started [{status}: {self.data.continuous_bars}/24 bars]{gap_msg}"
+        msg = f"Council Bot Started [{status}: {self.data.continuous_bars}/24 bars]{gap_msg} | Members: {len(self.council)}"
         
         level = "WARNING" if (status == "WARMING UP" or self.data.has_medium_term_gap) else "INFO"
         self.notifier.send(msg, level)
@@ -619,22 +619,40 @@ class ChampionBot:
         logger.warning(f"Received Termination Signal ({signum}). Exiting safely...")
         raise KeyboardInterrupt
 
-    def _load_champion(self, root):
+    def _load_council(self, root):
         root_path = Path(root)
-        rank_path = root_path / "rank_1"
-        if not rank_path.exists(): raise Exception("No champion found in rank_1!")
-        logger.info(f"Loading Champion from {rank_path}...")
-        with open(rank_path / "params.json") as f: p = json.load(f)
-        self.champion = {
-            'ml': joblib.load(rank_path / "model_long.pkl"),
-            'ms': joblib.load(rank_path / "model_short.pkl"),
-            'features': joblib.load(rank_path / "features.pkl"),
-            'params': p
-        }
+        self.council = []
+        
+        # Try loading Rank 1 to N
+        for i in range(1, self.config.model.ensemble_size + 1):
+            rank_path = root_path / f"rank_{i}"
+            if not rank_path.exists():
+                if i == 1: raise Exception("No champion found in rank_1!")
+                logger.warning(f"Rank {i} not found. Council size will be {i-1}.")
+                break
+            
+            logger.info(f"Loading Council Member #{i} from {rank_path}...")
+            try:
+                with open(rank_path / "params.json") as f: p = json.load(f)
+                member = {
+                    'ml': joblib.load(rank_path / "model_long.pkl"),
+                    'ms': joblib.load(rank_path / "model_short.pkl"),
+                    'features': joblib.load(rank_path / "features.pkl"),
+                    'params': p,
+                    'dir_l': None, 'dir_s': None
+                }
+                # Load Direction Models if they exist (Meta-Labeling)
+                if (rank_path / "dir_model_long.pkl").exists():
+                    member['dir_l'] = joblib.load(rank_path / "dir_model_long.pkl")
+                    member['dir_s'] = joblib.load(rank_path / "dir_model_short.pkl")
+                    
+                self.council.append(member)
+            except Exception as e:
+                logger.error(f"Failed to load Rank {i}: {e}")
 
     def _print_manifest(self, root):
-        logger.info("\n" + "="*60 + f"\nLONE CHAMPION STARTUP MANIFEST\n" + "="*60)
-        logger.info(f"Symbol: {self.config.data.symbol} | Model Root: {root}")
+        logger.info("\n" + "="*60 + f"\nCOUNCIL BOT STARTUP MANIFEST\n" + "="*60)
+        logger.info(f"Symbol: {self.config.data.symbol} | Model Root: {root} | Members: {len(self.council)}")
         logger.info(f"Clock Drift: {self.exchange.check_time_sync():.1f}ms")
         
         active_orders = self.state.state.get("active_orders", {})
@@ -645,163 +663,71 @@ class ChampionBot:
             logger.info(f"Account: ${bal['equity']:.2f} Equity | ${bal['available']:.2f} Available")
         else: logger.info("MODE: DRY RUN")
         logger.info("="*60 + "\n")
-
-    def run(self):
-        last_poll, last_reconcile, last_status, last_risk_check, last_sync = 0, 0, 0, 0, time.time()
-        while True:
-            try:
-                now = time.time()
-                # 1. Periodic Time Sync (Every 1 Hour)
-                if now - last_sync >= 3600.0:
-                    drift = self.exchange.check_time_sync()
-                    logger.info(f"Periodic Time Sync: Current Drift: {drift:.1f}ms")
-                    last_sync = now
-
-                if now - last_risk_check >= 5.0:
-                    if not self._monitor_risk(): break
-                    last_risk_check = now
-                if now - last_poll >= 1.0:
-                    self.data.update(self.exchange.fetch_orderbook())
-                    last_poll = now
-                if now - last_status >= 30.0:
-                    # Use trade_bars for quick stats (faster than get_bars merge)
-                    curr_p = self.data.trade_bars['close'].iloc[-1] if not self.data.trade_bars.empty else 0.0
-                    pos_s = self.exchange.get_position() if not self.config.live.dry_run else 0.0
-                    
-                    # Reality Check
-                    pnl_str = ""
-                    if not self.config.live.dry_run:
-                        bal = self.exchange.get_wallet_balance()
-                        curr_equity = bal.get('equity', 0.0)
-                        curr_cash = bal.get('total_balance', 0.0)
-                        curr_total_pnl = self.state.state.get("total_pnl", 0.0)
-                        
-                        # Friction = Cash - (StartEquity + RealizedPnLDelta)
-                        # This stays stable even when a trade is open
-                        expected_cash = self.start_equity + (curr_total_pnl - self.start_pnl)
-                        friction = curr_cash - expected_cash
-                        
-                        # Get Unrealized PnL for the heartbeat
-                        pos_details = self.exchange.get_position_details()
-                        unreal = pos_details.get('unrealized_pnl', 0.0)
-                        order_count = len(self.state.state.get("active_orders", {}))
-                        
-                        pnl_str = f"| Eq: ${curr_equity:.2f} | Unreal: ${unreal:.2f} | Friction: {friction:.2f} | Orders: {order_count}"
-                    
-                    data_health = self.data.get_quality_report()
-                    logger.info(f"[HEARTBEAT] Price: {curr_p:.4f} | Pos: {pos_s} {pnl_str} | {data_health} | Health: {self.health.check_health()}")
-                    last_status = now
-                if now - last_reconcile >= 10.0:
-                    self._reconcile()
-                    last_reconcile = now
-                self._check_bar_close()
-                time.sleep(0.1)
-            except KeyboardInterrupt: 
-                self.notifier.send("Bot Stopped by User", "WARNING")
-                break
-            except Exception as e:
-                err_msg = f"Loop Error: {e}"
-                logger.error(f"{err_msg}\n{traceback.format_exc()}")
-                self.notifier.send(err_msg, "CRITICAL")
-                time.sleep(5)
-
-    def _monitor_risk(self) -> bool:
-        if self.config.live.dry_run: return True
-        try:
-            bal = self.exchange.get_wallet_balance()
-            equity = bal.get('equity', 0.0)
-            if not self.risk.check_drawdown(equity):
-                self._emergency_shutdown()
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"Risk Monitor Error: {e}")
-            return True
-
-    def _emergency_shutdown(self):
-        msg = "!!! EMERGENCY SHUTDOWN PROTOCOL INITIATED !!!"
-        self.notifier.send(msg, "CRITICAL")
-        logger.critical(msg)
-        for i in range(1, 11):
-            try:
-                self.exchange.cancel_all_orders()
-                self.exchange.close_all_positions()
-                time.sleep(2.0)
-                if self.exchange.get_position() == 0:
-                    logger.info("SUCCESS: Account Flat. Exiting.")
-                    os._exit(0)
-            except Exception as e: logger.error(f"Retry {i} failed: {e}")
-        while True:
-            try:
-                import winsound
-                winsound.Beep(1000, 500); winsound.Beep(500, 500)
-            except: print('\a')
-            self.exchange.close_all_positions()
-            time.sleep(5)
-
-    def _check_bar_close(self):
-        if self.data.new_bar_event:
-            self.data.new_bar_event = False
-            self.data.save_history() # Save immediately to persist warmup progress
-            
-            # Use get_bars() for the full picture
-            full_bars = self.data.get_bars()
-            
-            # 1. Price History Gate (Technical Indicators)
-            if len(full_bars) < 60:
-                logger.warning(f"Price History too short ({len(full_bars)} bars). Waiting for 60.")
-                return
-
-            # 2. Microstructure Gate (Z-Score Stability)
-            # We need ~24 bars (2 hours) of CONTINUOUS data for rolling Z-scores to stabilize.
-            # If we have a gap, we must wait for new warmup.
-            if self.data.continuous_bars < 24:
-                logger.info(f"Microstructure Warmup: {self.data.continuous_bars}/24 continuous bars collected. Trading Paused.")
-                return
-                
-            last_closed_time = full_bars.index[-2]
-            
-            logger.info(f"\n>>> CHAMPION DECISION FOR BAR: {last_closed_time} <<<")
-            regime = self.health.check_regime(full_bars)
-            logger.info(f"[DIAG] Bars: {len(full_bars)} | Continuous: {self.data.continuous_bars} | Regime: {regime} | Sentiment: {self.health.check_sentiment()}")
-            
-            self._reconcile()
-            df_feat = self.fe.calculate_features(full_bars)
-            self._execute_champion(df_feat.iloc[-2])
-            
-            self.state.state["last_processed_bar"] = str(last_closed_time)
-            self.state.save()
-
+        
     def _execute_champion(self, row):
-        c = self.champion
-        feature_names = c['features']
+        # Now executes The Council
+        votes_long = 0
+        votes_short = 0
+        confidences_l = []
+        confidences_s = []
         
-        # Log Feature Inputs (Transparency)
-        if logger.isEnabledFor(logging.INFO):
-            msg = f"\n[FEATURES] Input Vector ({len(feature_names)} features):\n"
-            # Format in columns of 3
-            for i in range(0, len(feature_names), 3):
-                chunk = feature_names[i:i+3]
-                line = " | ".join([f"{name}: {row[name]:.6f}" for name in chunk])
-                msg += f"  {line}\n"
-            logger.info(msg)
+        for i, member in enumerate(self.council):
+            feature_names = member['features']
+            X = row[feature_names].values.reshape(1, -1)
             
-        # Data Scientist Guardrails
-        sanity_warnings = self.sanity.check(row)
-        for w in sanity_warnings:
-            logger.warning(f"[DATA INTEGRITY] {w}")
+            # 1. Meta-Labeling Check (Direction)
+            # If Direction Model exists and says "No", we veto this member immediately
+            if member['dir_l']:
+                dir_l = member['dir_l'].predict(X)[0]
+                dir_s = member['dir_s'].predict(X)[0]
+                # If Direction prediction is weak (<0.5), we skip execution check
+                # Or we use it as a gate. Let's use it as a gate.
+                if dir_l < 0.5 and dir_s < 0.5:
+                    continue 
+                    
+            # 2. Execution Check
+            p_l = member['ml'].predict(X)[0]
+            p_s = member['ms'].predict(X)[0]
+            thresh = member['params']['model_threshold']
+            
+            if p_l > thresh:
+                if not member['dir_l'] or member['dir_l'].predict(X)[0] > 0.5: # Double confirm
+                    votes_long += 1
+                    confidences_l.append(p_l)
+            elif p_s > thresh:
+                 if not member['dir_s'] or member['dir_s'].predict(X)[0] > 0.5:
+                    votes_short += 1
+                    confidences_s.append(p_s)
 
-        X = row[feature_names].values.reshape(1, -1)
-        pred_l, pred_s = c['ml'].predict(X)[0], c['ms'].predict(X)[0]
-        thresh = c['params']['model_threshold']
-        self.health.record_prediction(max(pred_l, pred_s))
-        logger.info(f"Verdict: Long {pred_l:.3f} | Short {pred_s:.3f} | Thresh {thresh:.3f}")
+        # Consensus Logic
+        min_votes = self.config.model.voting_threshold
+        logger.info(f"Council Vote: Long {votes_long}/{len(self.council)} | Short {votes_short}/{len(self.council)}")
         
-        if pred_l > thresh: self._place_trade(row, "Buy", c['params'])
-        elif pred_s > thresh: self._place_trade(row, "Sell", c['params'])
+        # Dual-Sided Execution (Market Making / Pyramiding Support)
+        # We check both sides independently.
+        
+        if votes_long >= min_votes:
+            # Use the member with highest confidence for params
+            best_idx = np.argmax(confidences_l) if confidences_l else 0
+            final_member = self.council[0] # Default to rank 1 for stability
+            
+            self.health.record_prediction(1.0)
+            self._place_trade(row, "Buy", final_member['params'])
+
+        if votes_short >= min_votes:
+            # Use the member with highest confidence for params
+            best_idx = np.argmax(confidences_s) if confidences_s else 0
+            final_member = self.council[0] 
+            
+            self.health.record_prediction(1.0)
+            self._place_trade(row, "Sell", final_member['params'])
 
     def _place_trade(self, row, side, p):
-        if self.exchange.get_position() != 0 or self.state.state["active_orders"]: return
+        # 1. Capacity Check: Don't exceed Max Positions (Active Orders limit)
+        if len(self.state.state["active_orders"]) >= self.config.strategy.max_positions:
+            return
+
+        # 2. Frequency limit (debounce)
         if self.is_placing_order: return
         if time.time() - self.last_order_ts < 2.0: return
         

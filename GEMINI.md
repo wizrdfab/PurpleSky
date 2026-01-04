@@ -1,83 +1,74 @@
-# PurpleSky - Quantitative Trading System
+# Sofia / PurpleSky Trading System
 
 ## Project Overview
-**PurpleSky** (formerly Sofia Brox) is a high-frequency, limit-order based quantitative trading system designed for **Bybit Linear Perpetuals** (USDT). It employs a **Mean Reversion** strategy reinforced by **LightGBM DART** models and advanced **Orderbook Microstructure** features.
 
-The system is designed to act as a "Directional Liquidity Provider," placing maker-only limit orders to capture spreads and rebates while using ML models to avoid toxic flow (adverse selection).
+**Sofia (aka PurpleSky)** is a sophisticated, AI-powered algorithmic trading system designed for the **Bybit** cryptocurrency exchange. It focuses on **Liquidity Provision** and **Directional Trading** using a "Council" of Machine Learning models (LightGBM) driven by granular **Orderbook Microstructure** features.
 
-## Core Architecture
+The system is engineered for:
+*   **High-Fidelity Execution:** Uses Limit Orders with dynamic offsets based on volatility (ATR).
+*   **Robustness:** Features a `HealthMonitor` to detect concept drift and a `RiskManager` with a hard drawdown kill-switch.
+*   **Ensemble Logic:** "The Council" architecture allows multiple optimized models to vote on trade execution, increasing confidence and reducing variance.
 
-### 1. Alpha & Features (`feature_engine.py`)
-The system generates ~40 features per 5-minute bar, focusing on two categories:
-*   **Technicals:** ATR, EMAs (9, 21, 50), RSI, Volume Z-Scores.
-*   **Microstructure (The "Secret Sauce"):**
-    *   `ob_imbalance_z`: Z-Score of Orderbook Imbalance (Shock detection).
-    *   `micro_pressure`: Deviation of Volume-Weighted Micro-Price from Mid-Price.
-    *   `taker_buy_z`: Detection of aggressive market buying (Toxic Flow).
-    *   `liq_dominance`: Ratio of Book Depth to Trade Volume.
+## Architecture & Core Components
 
-### 2. Training Pipeline "Lone Champion" (`train.py`)
-A strict AutoML pipeline designed to prevent overfitting:
-1.  **Optimization:** Uses Optuna (`TPESampler`) to tune Strategy Params (Offsets, TP/SL) and Model Params simultaneously.
-2.  **OOS-1 Qualification:** Top 10 candidates are tested on a 10% Out-Of-Sample slice.
-3.  **Super-OOS Verification:** The winner is validated on a final 5% holdout ("Champion Final Exam").
-4.  **Artifacts:** Best models are saved to `models_vX/<SYMBOL>/rank_1/`.
+### 1. Live Execution (`live_trader.py`)
+The `ChampionBot` class orchestrates the production lifecycle:
+*   **`LiveDataManager`:** Manages real-time data ingestion (Trades & Orderbook snapshots), bootstrapping history, and maintaining data continuity.
+*   **`FeatureEngine`:** Calculates complex features on-the-fly, including Orderbook Imbalance, Depth Slope, Spread Integrity, and Micro-Price deviations.
+*   **`The Council`:** A collection of top-performing ML models (loaded from `models_v*`) that vote on `Buy` or `Sell` signals.
+*   **`RiskManager` & `HealthMonitor`:** Real-time safety guards against regime shifts and account drawdowns.
+*   **`ExchangeClient`:** Wrapper around `pybit` for API interaction.
 
-### 3. Execution Engines
-*   **`live_trader.py` (Active):** The "Champion" runner. Loads the specific `rank_1` model and features. Focuses on high-fidelity execution of the trained strategy.
-*   **`live_trading_v2.py` (Robust):** A highly defensive execution engine with drift monitoring, state reconciliation, and strict safety checks.
+### 2. Training Pipeline (`train.py`)
+An AutoML pipeline powered by **Optuna**:
+*   **Objective:** Optimizes Strategy parameters (TP/SL/Offsets) and Model hyperparameters (LightGBM) simultaneously.
+*   **Validation:** Uses **Combinatorial Purged K-Fold** cross-validation to prevent overfitting and leakage.
+*   **Output:** Generates a ranked list of models. The top N models form "The Council" stored in `models_v*/rank_N`.
 
-### 4. Backtesting (`backtest.py`)
-An event-driven backtester that simulates:
-*   **Maker/Taker Fees:** Critical for this low-margin strategy.
-*   **Order Timeouts:** Cancels orders if not filled within `time_limit_bars`.
-*   **Position Timeouts:** Force-closes positions after `max_holding_bars`.
+### 3. Configuration (`config.py`)
+Centralized configuration using Python `dataclasses`:
+*   **`GlobalConfig`:** Master config object.
+*   **`StrategyConfig`:** Risk settings, fees, and trade parameters.
+*   **`ModelConfig`:** Hyperparameters for LightGBM and Council settings.
+*   **`DataConfig`:** Paths and symbols.
 
-## Key Commands
+## Key Files
 
-### Live Trading
-Run the watchdog batch script (Windows):
-```batch
-.\RAVEUSDT_Trader_MAIN.bat
-```
-Or directly via Python:
+*   `live_trader.py`: **Main Entry Point** for live trading.
+*   `train.py`: Script for training and selecting model councils.
+*   `config.py`: System-wide configuration.
+*   `requirements.txt`: Python dependencies (`pybit`, `lightgbm`, `optuna`, `pandas`).
+*   `Manual_live_trader.txt` / `MONUSDT_Trader_MAIN.bat`: Launch scripts/notes.
+
+## Usage
+
+### 1. Setup
+Ensure Python 3.10+ is installed.
 ```bash
-python live_trader.py --model-root "models_v5/RAVEUSDT"
+pip install -r requirements.txt
 ```
 
-### Training
-Train a new champion:
+### 2. Training a New Council
+To train a new ensemble for a symbol (e.g., `RAVEUSDT`):
 ```bash
-python train.py --symbol RAVEUSDT --trials 50 --timeframe 5m
+python train.py --symbol RAVEUSDT --trials 50 --timeframe 5m --ob-levels 200
 ```
+*   Outputs models to `models_v*/RAVEUSDT/rank_*`.
 
-### Backtesting
-Run a simulation:
+### 3. Running Live
+To start the bot in production mode, you must provide your API keys.
+*   **Environment Variables:** Set `BYBIT_API_KEY`, `BYBIT_API_SECRET`, and optionally `DISCORD_WEBHOOK_URL`.
+*   **Windows Helper:** You can create a `secrets.bat` file (ignored by git) to set these variables automatically when using the provided batch scripts.
+
 ```bash
-python backtest.py --config "models_v5/RAVEUSDT/rank_1/params.json"
+python live_trader.py --symbol RAVEUSDT --model-root models_v4/RAVEUSDT
 ```
+*   **Dry Run:** Defaults to `True` in `config.py` unless API keys are present and valid.
+*   **State:** Persists active orders and PnL to `bot_state_{symbol}_champion.json`.
 
-## Configuration (`config.py`)
-All settings are centralized in dataclasses:
-*   **`StrategyConfig`:** `base_limit_offset_atr`, `tp_atr`, `sl_atr`.
-*   **`ModelConfig`:** LightGBM params (`num_leaves`, `learning_rate`).
-*   **`LiveSettings`:** `max_daily_drawdown_pct` (3%), `max_api_errors`.
+## Development Conventions
 
-## Development Guidelines
-*   **AGENTS.md:** strictly follow instructions in this file for logging changes.
-*   **Maker Only:** The strategy strictly uses `PostOnly` orders. Never use Market orders for entry.
-*   **State Management:** Local state is persisted in `bot_state_*.json`. Do not manually edit these while the bot is running.
-*   **Safety:** The `secrets.bat` file contains API keys and must **NEVER** be committed to version control.
-
-## Directory Structure
-```
-├── data/                   # Historical CSV data (Ignored)
-├── models_v*/              # Model artifacts (rank_1/, etc.)
-├── logs/                   # Runtime logs
-├── pybit-master/           # Vendored Bybit V5 API wrapper
-├── train.py                # AutoML Training Entry Point
-├── live_trader.py          # Primary Live Execution Script
-├── feature_engine.py       # Feature Engineering Logic
-├── exchange_client.py      # Bybit API Client
-└── config.py               # Central Configuration
-```
+*   **Code Style:** Pythonic, using `dataclasses` for configuration and type hinting for function signatures.
+*   **Logging:** extensive logging to `logs/lone_champion.log` and stdout.
+*   **Safety:** rigorous "Sanity Checks" (`SanityCheck` class) on data before inference to prevent GIGO (Garbage In, Garbage Out).
+*   **Persistence:** Atomic state saving to prevent corruption during crashes.

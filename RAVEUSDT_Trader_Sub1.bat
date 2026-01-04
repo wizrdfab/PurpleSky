@@ -1,11 +1,11 @@
 @echo off
-title PurpleSky LIQUIDITY BOT - WATCHDOG
+title PurpleSky LIQUIDITY BOT - WATCHDOG (RAVEUSDT)
 color 0A
 
 :: Load API Keys safely
-if exist secrets.bat call secrets2.bat
+if exist secrets.bat call secrets.bat
 
-if "%BYBIT_API_KEY_SUB"=="" (
+if "%BYBIT_API_KEY%"=="" (
     echo [WARNING] API Key NOT found. Bot will run in DRY MODE.
 ) else (
     echo [INFO] API Key detected. Live Trading Authorized.
@@ -14,7 +14,7 @@ if "%BYBIT_API_KEY_SUB"=="" (
 :loop
 cls
 echo ========================================================
-echo        STARTING SOFIA LIVE TRADER - WATCHDOG MODE
+echo        STARTING SOFIA LIVE TRADER - RAVEUSDT
 echo ========================================================
 echo Timestamp: %date% %time%
 echo.
@@ -26,8 +26,8 @@ if "%BYBIT_API_KEY%"=="" (
 )
 echo.
 
-:: Run the Python Bot
-python -W "ignore" live_trader.py --symbol RAVEUSDT --model-root models_v5/RAVEUSDT
+:: Run the Python Bot using the newly trained v4 model
+python -W "ignore" live_trader.py --symbol RAVEUSDT --model-root models_v4/RAVEUSDT
 
 :: If we get here, the bot crashed or closed.
 color 4F

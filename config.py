@@ -29,7 +29,7 @@ class StrategyConfig:
     maker_fee: float = 0.0002
     taker_fee: float = 0.0006
     risk_per_trade: float = 0.04    
-    max_positions: int = 1
+    max_positions: int = 3
 
 @dataclass
 class LiveSettings:
@@ -66,6 +66,12 @@ class ModelConfig:
     test_ratio: float = 0.15
     model_threshold: float = 0.60
     early_stopping_rounds: int = 50
+    extra_trees: bool = False
+    
+    # --- Council & Meta-Labeling ---
+    ensemble_size: int = 5       # Size of the Council
+    voting_threshold: int = 1    # Min votes to execute
+    use_meta_labeling: bool = True
 
 @dataclass
 class GlobalConfig:
