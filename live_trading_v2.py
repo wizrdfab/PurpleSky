@@ -49,7 +49,7 @@ DEFAULT_DRIFT_WINDOW = 200
 DEFAULT_DRIFT_Z = 3.0
 DEFAULT_MAX_LEVERAGE = 5.0
 DEFAULT_MIN_OB_DENSITY_PCT = 50.0
-DEFAULT_MIN_TRADE_BARS = 24
+DEFAULT_MIN_TRADE_BARS = 0
 DEFAULT_WS_TRADE_QUEUE_MAX = 5000
 DEFAULT_WS_OB_QUEUE_MAX = 200
 DEFAULT_WS_PRIVATE_QUEUE_MAX = 1000
@@ -59,6 +59,11 @@ DEFAULT_FEATURE_Z_WINDOW = 200
 DEFAULT_FEATURE_Z_THRESHOLD = 3.0
 DEFAULT_MODEL_DIR = f"models_v9/{CONF.data.symbol}/{CONF.data.symbol}/rank_1"
 DEFAULT_BOOTSTRAP_KLINES_DAYS = 0.0
+DEFAULT_METRICS_LOG_PATH = ""
+DEFAULT_CONTINUITY_BARS = 24
+DEFAULT_MAX_LAST_BAR_AGE_SEC = 0.0
+DEFAULT_FAST_BOOTSTRAP = False
+DEFAULT_POSITION_MODE = "oneway"
 
 BAR_COLUMNS = [
     "bar_time",
@@ -227,6 +232,10 @@ class StateStore:
             "last_processed_bar_time": None,
             "active_orders": {},
             "position": {},
+            "positions": {
+                "long": {},
+                "short": {},
+            },
             "daily": {
                 "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                 "realized_pnl": 0.0,
@@ -833,6 +842,9 @@ class SafeExchange:
         self.exchange = exchange
         self.logger = logger
         self.latency = LatencyTracker()
+        self.error_count = 0
+        self.last_error: Optional[str] = None
+        self.last_error_ts: float = 0.0
 
     def _call(self, name: str, func, *args, **kwargs):
         start = time.time()
@@ -849,6 +861,9 @@ class SafeExchange:
             if name == "cancel_order" and status_code == 110001:
                 self.logger.info(f"Cancel order not found: {message}")
                 return None
+            self.error_count += 1
+            self.last_error = message
+            self.last_error_ts = time.time()
             self.logger.error(f"API error in {name}: {message}")
             return None
 
@@ -860,11 +875,12 @@ class SafeExchange:
         tp: float = 0.0,
         sl: float = 0.0,
         reduce_only: bool = False,
+        position_idx: Optional[int] = None,
     ) -> Dict:
         return self._call(
             "place_limit_order",
             self.exchange.place_limit_order,
-            side, price, qty, tp, sl, reduce_only
+            side, price, qty, tp, sl, reduce_only, position_idx
         )
 
 
@@ -924,6 +940,45 @@ class SafeExchange:
             }
         return {}
 
+    def get_positions_details(self) -> List[Dict]:
+        def _call_positions():
+            return self.exchange.session.get_positions(category="linear", symbol=self.exchange.symbol)
+        resp = self._call("get_positions", _call_positions)
+        if not resp:
+            return []
+        positions = resp.get("result", {}).get("list", [])
+        results: List[Dict] = []
+        for pos in positions:
+            if pos.get("symbol") != self.exchange.symbol:
+                continue
+            size = safe_float(pos.get("size"))
+            side = pos.get("side")
+            avg_price = safe_float(pos.get("avgPrice") or pos.get("entryPrice"))
+            mark_price = safe_float(pos.get("markPrice"))
+            unreal_pnl = safe_float(pos.get("unrealisedPnl"))
+            cum_realized = safe_float(pos.get("cumRealisedPnl"))
+            stop_loss = safe_float(pos.get("stopLoss"))
+            take_profit = safe_float(pos.get("takeProfit"))
+            tpsl_mode = pos.get("tpslMode") or pos.get("tpSlMode")
+            created_time = safe_int(pos.get("createdTime"))
+            updated_time = safe_int(pos.get("updatedTime"))
+            position_idx = safe_int(pos.get("positionIdx"))
+            results.append({
+                "size": size,
+                "side": side,
+                "avg_price": avg_price,
+                "mark_price": mark_price,
+                "unrealized_pnl": unreal_pnl,
+                "cum_realized_pnl": cum_realized,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "tpsl_mode": tpsl_mode,
+                "created_time": created_time,
+                "updated_time": updated_time,
+                "position_idx": position_idx,
+            })
+        return results
+
     def get_instrument_info(self) -> Dict:
         return self._call("fetch_instrument_info", self.exchange.fetch_instrument_info)
 
@@ -936,11 +991,11 @@ class SafeExchange:
     def cancel_all_orders(self) -> None:
         self._call("cancel_all_orders", self.exchange.cancel_all_orders)
 
-    def market_close(self, side: str, qty: float) -> None:
-        self._call("market_close", self.exchange.market_close, side, qty)
+    def market_close(self, side: str, qty: float, position_idx: Optional[int] = None) -> None:
+        self._call("market_close", self.exchange.market_close, side, qty, position_idx)
 
-    def set_tp_sl(self, side: str, qty: float, tp: float, sl: float) -> None:
-        self._call("place_tp_sl", self.exchange.place_tp_sl, side, qty, tp, sl)
+    def set_tp_sl(self, side: str, qty: float, tp: float, sl: float, position_idx: Optional[int] = None) -> None:
+        self._call("place_tp_sl", self.exchange.place_tp_sl, side, qty, tp, sl, position_idx)
 
     def fetch_closed_pnl(self, limit: int = 50) -> List[Dict]:
         return self._call("fetch_closed_pnl", self.exchange.fetch_closed_pnl, limit)
@@ -958,6 +1013,8 @@ class LiveTradingV2:
         self.config.data.symbol = args.symbol
         self.config.data.ob_levels = args.ob_levels
         self.testnet = args.testnet
+        self.position_mode = (args.position_mode or DEFAULT_POSITION_MODE).lower()
+        self.hedge_mode = self.position_mode == "hedge"
         default_model_dir = f"models_v9/{self.config.data.symbol}/{self.config.data.symbol}/rank_1"
         if args.model_dir == DEFAULT_MODEL_DIR and args.model_dir != default_model_dir:
             self.logger.warning(f"Model dir default adjusted to {default_model_dir} for symbol {self.config.data.symbol}.")
@@ -976,6 +1033,11 @@ class LiveTradingV2:
         self.max_leverage = args.max_leverage
         self.min_ob_density_pct = args.min_ob_density_pct
         self.min_trade_bars = args.min_trade_bars
+        self.continuity_bars = max(1, args.continuity_bars)
+        self.max_last_bar_age_sec = args.max_last_bar_age_sec
+        if self.max_last_bar_age_sec <= 0:
+            self.max_last_bar_age_sec = float(self.tf_seconds)
+        self.fast_bootstrap = args.fast_bootstrap
         self.log_features = args.log_features
         self.log_feature_z = args.log_feature_z
         self.feature_z_threshold = args.feature_z_threshold
@@ -1025,14 +1087,28 @@ class LiveTradingV2:
         self.ws_ob_last_ingest_ts = 0.0
         self.api_key: Optional[str] = None
         self.api_secret: Optional[str] = None
+        self.start_time = time.time()
+        self.start_time_utc = utc_now_str()
+        self.runtime_error_count = 0
+        self.last_runtime_error: Optional[str] = None
+        self.last_runtime_error_ts: float = 0.0
+        self.last_reconcile_info: Dict[str, object] = {}
+        self.last_drift_alerts: List[str] = []
+        self.last_drift_time: Optional[str] = None
+        self.last_regime: Optional[str] = None
+        self.last_sentiment: Optional[str] = None
+        self.last_health: Optional[str] = None
+        self.last_prediction: Dict[str, object] = {}
+        self.last_feature_vector: Optional[Dict[str, object]] = None
 
         self.state = StateStore(Path(f"bot_state_{self.config.data.symbol}_v2.json"), self.config.data.symbol, self.logger)
         self.state.load()
         self.state.reset_daily_if_needed()
+        self._init_position_state()
 
         self.exchange = self._init_exchange()
         if not self.dry_run:
-            if not self.exchange.startup_check():
+            if not self.exchange.startup_check(self.position_mode):
                 raise RuntimeError("Startup checks failed.")
             if self.exchange_leverage:
                 self.exchange.set_leverage(self.exchange_leverage)
@@ -1055,8 +1131,13 @@ class LiveTradingV2:
 
         self.bar_window = BarWindow(self.tf_seconds, self.config.data.ob_levels, self.window_size, self.logger)
         self.history_path = Path(f"data_history_{self.config.data.symbol}.csv")
+        if args.metrics_log_path:
+            self.metrics_path = Path(args.metrics_log_path)
+        else:
+            self.metrics_path = Path(f"live_metrics_{self.config.data.symbol}.jsonl")
         self._bootstrap_bars()
         self._load_history()
+        self._fast_bootstrap_fill_gaps()
 
         self.drift_monitor = DriftMonitor(args.drift_keys, args.drift_window, args.drift_z)
         self.health = HealthMonitor()
@@ -1358,6 +1439,92 @@ class LiveTradingV2:
         )
         return True
 
+    def _fast_bootstrap_fill_gaps(self) -> None:
+        if not self.fast_bootstrap:
+            return
+        bars_df = self.bar_window.bars.copy()
+        if bars_df.empty:
+            self.logger.info("Fast bootstrap: no bars loaded; skipping gap fill.")
+            return
+        bars_df = bars_df.drop_duplicates(subset=["bar_time"]).sort_values("bar_time")
+        end_bar = int(bars_df["bar_time"].max())
+        start_bar = end_bar - (self.continuity_bars - 1) * self.tf_seconds
+        expected_times = set(range(start_bar, end_bar + 1, self.tf_seconds))
+        existing_times = set(bars_df["bar_time"].astype(int).tolist())
+        missing = sorted(expected_times - existing_times)
+        if not missing:
+            self.logger.info("Fast bootstrap: no missing bars in continuity window.")
+            return
+
+        interval_map = {60: "1", 300: "5", 900: "15", 3600: "60", 14400: "240"}
+        interval = interval_map.get(self.tf_seconds, "15")
+        limit = min(200, len(expected_times) + 5)
+        end_ms = int((end_bar + self.tf_seconds) * 1000)
+        klines = self.api.fetch_kline(interval=interval, limit=limit, end=end_ms)
+        if not isinstance(klines, pd.DataFrame) or klines.empty:
+            self.logger.warning("Fast bootstrap: kline fetch empty; skipping gap fill.")
+            return
+
+        rows = []
+        for _, row in klines.iterrows():
+            ts = safe_float(row.get("timestamp"))
+            if ts <= 0:
+                continue
+            bar_time = bar_time_from_ts(ts, self.tf_seconds)
+            if bar_time not in missing:
+                continue
+            volume = safe_float(row.get("volume"))
+            close = safe_float(row.get("close"))
+            open_p = safe_float(row.get("open"))
+            high = safe_float(row.get("high"))
+            low = safe_float(row.get("low"))
+            turnover = safe_float(row.get("turnover"))
+            dollar_val = turnover if turnover > 0 else close * volume
+            trade_count = 1 if volume > 0 else 0
+            vol_buy = volume / 2.0
+            vol_sell = volume / 2.0
+            bar = {
+                "bar_time": bar_time,
+                "datetime": pd.to_datetime(bar_time, unit="s"),
+                "open": open_p,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "trade_count": trade_count,
+                "vol_buy": vol_buy,
+                "vol_sell": vol_sell,
+                "vol_delta": vol_buy - vol_sell,
+                "dollar_val": dollar_val,
+                "total_val": dollar_val,
+                "vwap": (dollar_val / volume) if volume > 0 else close,
+                "taker_buy_ratio": 0.5,
+                "buy_vol": vol_buy,
+                "sell_vol": vol_sell,
+            }
+            for key in self.bar_window.last_ob:
+                bar[key] = 0.0
+            rows.append(bar)
+
+        if not rows:
+            self.logger.warning("Fast bootstrap: no missing bars found in kline data.")
+            return
+
+        fill_df = pd.DataFrame(rows)
+        merged = bars_df.set_index("bar_time").combine_first(fill_df.set_index("bar_time"))
+        merged = merged.reset_index().sort_values("bar_time")
+        if "datetime" not in merged.columns:
+            merged["datetime"] = pd.to_datetime(merged["bar_time"], unit="s")
+        for col in BAR_COLUMNS:
+            if col not in merged.columns:
+                merged[col] = 0.0
+        merged = merged[BAR_COLUMNS]
+        self.bar_window.load_bars(merged)
+        self._save_history()
+        self.logger.info(
+            f"Fast bootstrap filled {len(rows)} missing bars in last {self.continuity_bars}."
+        )
+
     def _load_history(self) -> None:
         if not self.history_path.exists():
             return
@@ -1414,6 +1581,48 @@ class LiveTradingV2:
         except Exception as exc:
             self.logger.error(f"Failed to save history: {exc}")
 
+    def _init_position_state(self) -> None:
+        positions = self.state.state.get("positions")
+        if not isinstance(positions, dict):
+            positions = {}
+        positions.setdefault("long", {})
+        positions.setdefault("short", {})
+        if self.hedge_mode:
+            long_pos = positions.get("long", {})
+            short_pos = positions.get("short", {})
+            if not long_pos and not short_pos:
+                pos = self.state.state.get("position", {})
+                side = pos.get("side")
+                size = safe_float(pos.get("size"))
+                if pos and size > 0 and side in {"Buy", "Sell"}:
+                    key = "long" if side == "Buy" else "short"
+                    positions[key] = pos
+        self.state.state["positions"] = positions
+        self.state.save()
+
+    def _get_positions(self) -> Tuple[Dict, Dict]:
+        if not self.hedge_mode:
+            pos = self.state.state.get("position", {})
+            return pos, {}
+        positions = self.state.state.get("positions", {})
+        if not isinstance(positions, dict):
+            return {}, {}
+        return positions.get("long", {}), positions.get("short", {})
+
+    def _position_size(self, pos: Dict) -> float:
+        return safe_float(pos.get("size")) if pos else 0.0
+
+    def _position_key(self, side: Optional[str], position_idx: int = 0) -> Optional[str]:
+        if position_idx == 1:
+            return "long"
+        if position_idx == 2:
+            return "short"
+        if side == "Buy":
+            return "long"
+        if side == "Sell":
+            return "short"
+        return None
+
     def _data_health(self) -> str:
         bars = self.bar_window.bars
         if bars.empty:
@@ -1429,6 +1638,28 @@ class LiveTradingV2:
             recent = trade_bars.tail(window)
             ob_density = (recent["ob_spread_mean"] > 0).sum() / window * 100
         return f"Bars: {n} | Macro: {macro_pct:.0f}% | OB-Density(2h): {ob_density:.0f}% | TradeCont: {self.continuous_trade_bars}"
+
+    def _history_continuity_ready(self, bars_df: pd.DataFrame) -> Tuple[bool, str]:
+        if bars_df.empty:
+            return False, "no bars loaded"
+        need = max(1, self.continuity_bars)
+        if len(bars_df) < need:
+            return False, f"need {need} bars, have {len(bars_df)}"
+        recent = bars_df.tail(need)
+        times = recent["bar_time"].astype(int).to_numpy()
+        if len(times) < need:
+            return False, f"need {need} bars, have {len(times)}"
+        diffs = np.diff(times)
+        if len(diffs) > 0 and not np.all(diffs == self.tf_seconds):
+            return False, f"non-continuous bars in last {need}"
+        last_bar = int(times[-1])
+        bar_close = last_bar + self.tf_seconds
+        age_sec = time.time() - bar_close
+        if age_sec < 0:
+            age_sec = 0.0
+        if age_sec > self.max_last_bar_age_sec:
+            return False, f"last bar close age {age_sec:.1f}s > {self.max_last_bar_age_sec:.1f}s"
+        return True, "ok"
 
     def _refresh_instrument_info(self, force: bool = False) -> None:
         info = self.api.get_instrument_info()
@@ -1515,6 +1746,8 @@ class LiveTradingV2:
             data = [data]
         if not isinstance(data, list):
             return
+        entries: List[Dict] = []
+        latest_ts = self.ws_trade_last_ts
         for trade in data:
             ts_raw = safe_float(
                 trade.get("T")
@@ -1544,9 +1777,13 @@ class LiveTradingV2:
                 "side": side,
                 "id": trade_id,
             }
+            entries.append(entry)
+            latest_ts = max(latest_ts, ts_sec)
+        if not entries:
+            return
         with self.ws_lock:
-            self.ws_trade_queue.append(entry)
-        self.ws_trade_last_ts = max(self.ws_trade_last_ts, ts_sec)
+            self.ws_trade_queue.extend(entries)
+        self.ws_trade_last_ts = latest_ts
         self.ws_trade_last_ingest_ts = time.time()
 
     def _on_ws_orderbook(self, message: Dict) -> None:
@@ -1756,13 +1993,27 @@ class LiveTradingV2:
         if pos.get("symbol") != self.config.data.symbol:
             return False
         size = safe_float(pos.get("size"))
-        if size <= 0:
-            if self.state.state.get("position"):
-                self.state.state["position"] = {}
-                return True
-            return False
-
         side = pos.get("side")
+        position_idx = safe_int(pos.get("positionIdx"))
+        if self.hedge_mode:
+            key = self._position_key(side, position_idx)
+            if not key:
+                return False
+            positions = self.state.state.get("positions", {})
+            pos_state = positions.get(key, {})
+            if size <= 0:
+                if pos_state:
+                    positions[key] = {}
+                    self.state.state["positions"] = positions
+                    return True
+                return False
+        else:
+            if size <= 0:
+                if self.state.state.get("position"):
+                    self.state.state["position"] = {}
+                    return True
+                return False
+
         entry_price = safe_float(pos.get("entryPrice") or pos.get("avgPrice"))
         mark_price = safe_float(pos.get("markPrice"))
         unreal_pnl = safe_float(pos.get("unrealisedPnl"))
@@ -1771,6 +2022,41 @@ class LiveTradingV2:
         take_profit = safe_float(pos.get("takeProfit"))
         tpsl_mode = pos.get("tpslMode") or pos.get("tpSlMode")
         created_time = safe_int(pos.get("createdTime"))
+
+        if self.hedge_mode:
+            entry_bar_time = self.state.state.get("last_bar_time")
+            if created_time > 0:
+                entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
+            if not pos_state:
+                pos_state = {
+                    "side": side,
+                    "size": size,
+                    "entry_price": entry_price,
+                    "entry_bar_time": entry_bar_time,
+                    "created_ts": utc_now_str(),
+                    "tp_sl_set": False,
+                    "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
+                    "position_idx": position_idx,
+                }
+
+            pos_state.update({
+                "side": side,
+                "size": size,
+                "entry_price": entry_price,
+                "mark_price": mark_price,
+                "unrealized_pnl": unreal_pnl,
+                "cum_realized_pnl": cum_realized,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "tpsl_mode": tpsl_mode,
+                "entry_ts_ms": pos_state.get("entry_ts_ms"),
+                "position_idx": position_idx,
+            })
+            if stop_loss > 0 or take_profit > 0:
+                pos_state["tp_sl_set"] = True
+            positions[key] = pos_state
+            self.state.state["positions"] = positions
+            return True
 
         pos_state = self.state.state.get("position", {})
         if not pos_state:
@@ -1856,6 +2142,7 @@ class LiveTradingV2:
         self.logger.info(f"Timeframe: {self.config.features.base_timeframe}")
         self.logger.info(f"Model Dir: {model_dir}")
         self.logger.info(f"Testnet: {self.testnet}")
+        self.logger.info(f"Position Mode: {self.position_mode}")
         self.logger.info(f"Feature Count: {len(self.model_features)}")
         self.logger.info(f"Window Bars: {self.window_size} | Min Feature Bars: {self.min_feature_bars}")
         self.logger.info(f"Threshold: {self.config.model.model_threshold:.3f}")
@@ -1865,8 +2152,13 @@ class LiveTradingV2:
         self.logger.info(f"Order Timeout Bars: {self.config.strategy.time_limit_bars}")
         self.logger.info(f"Max Holding Bars: {self.config.strategy.max_holding_bars}")
         self.logger.info(f"Risk Per Trade: {self.config.strategy.risk_per_trade:.3f}")
-        self.logger.info(f"OB Levels: {self.config.data.ob_levels} | Min OB Density: {self.min_ob_density_pct:.0f}% | Trade Warmup: {self.min_trade_bars}")
+        self.logger.info(
+            f"OB Levels: {self.config.data.ob_levels} | Min OB Density: {self.min_ob_density_pct:.0f}% | "
+            f"Trade Continuity Target: {self.min_trade_bars} | History Continuity Bars: {self.continuity_bars} | "
+            f"Max Last Bar Age: {self.max_last_bar_age_sec:.0f}s"
+        )
         self.logger.info(f"Bootstrap Klines Days: {self.bootstrap_klines_days}")
+        self.logger.info(f"Fast Bootstrap: {self.fast_bootstrap}")
         self.logger.info(f"Dry Run: {self.dry_run}")
         self.logger.info(f"Exchange Leverage: {self.exchange_leverage if self.exchange_leverage else 'unchanged'}")
         if self.keys_file:
@@ -1875,6 +2167,7 @@ class LiveTradingV2:
             self.logger.info("Keys File: env")
         if self.log_open_orders_raw:
             self.logger.info(f"Open Orders Raw Log: {self.open_orders_log_path}")
+        self.logger.info(f"Metrics Log: {self.metrics_path}")
         self.logger.info(f"WS Trades: {self.use_ws_trades} | WS OB: {self.use_ws_ob}")
         self.logger.info(f"WS Private: {self.use_ws_private} | Topics: {','.join(self.ws_private_topics) or 'none'}")
         if self.use_ws_private:
@@ -1938,11 +2231,22 @@ class LiveTradingV2:
             if ws_fresh and not rest_due:
                 self._update_closed_pnl()
                 self.state.save()
+                self.last_reconcile_info = {
+                    "ts": utc_now_str(),
+                    "reason": reason,
+                    "source": "ws",
+                    "open_orders": len(state_orders),
+                }
                 self.logger.info(f"Reconcile complete ({reason}|ws). Open orders: {len(state_orders)}")
                 return
 
         open_orders = self.api.get_open_orders()
-        position = self.api.get_position_details()
+        position = {}
+        positions = []
+        if self.hedge_mode:
+            positions = self.api.get_positions_details()
+        else:
+            position = self.api.get_position_details()
         state_orders = self.state.state.get("active_orders", {})
 
         if self.log_open_orders_raw and isinstance(open_orders, list):
@@ -1988,53 +2292,118 @@ class LiveTradingV2:
 
         self.state.state["active_orders"] = state_orders
 
-        pos_size = safe_float(position.get("size")) if position else 0.0
-        if pos_size == 0 and self.state.state.get("position"):
-            self.logger.info("Position closed on exchange.")
-            self.state.state["position"] = {}
-        elif pos_size != 0:
-            side = position.get("side")
-            entry_price = safe_float(position.get("avg_price"))
-            mark_price = safe_float(position.get("mark_price"))
-            unreal_pnl = safe_float(position.get("unrealized_pnl"))
-            cum_realized = safe_float(position.get("cum_realized_pnl"))
-            stop_loss = safe_float(position.get("stop_loss"))
-            take_profit = safe_float(position.get("take_profit"))
-            tpsl_mode = position.get("tpsl_mode")
-            created_time = safe_int(position.get("created_time"))
-            pos_state = self.state.state.get("position", {})
-            if not pos_state:
-                self.logger.warning("External position detected. Taking ownership.")
-                entry_bar_time = self.state.state.get("last_bar_time")
-                if created_time > 0:
-                    entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
-                pos_state = {
+        if self.hedge_mode:
+            positions_state = self.state.state.get("positions", {})
+            if not isinstance(positions_state, dict):
+                positions_state = {"long": {}, "short": {}}
+            seen_keys = set()
+            for pos in positions:
+                pos_size = safe_float(pos.get("size"))
+                side = pos.get("side")
+                key = self._position_key(side, safe_int(pos.get("position_idx")))
+                if not key or pos_size == 0:
+                    continue
+                seen_keys.add(key)
+                entry_price = safe_float(pos.get("avg_price"))
+                mark_price = safe_float(pos.get("mark_price"))
+                unreal_pnl = safe_float(pos.get("unrealized_pnl"))
+                cum_realized = safe_float(pos.get("cum_realized_pnl"))
+                stop_loss = safe_float(pos.get("stop_loss"))
+                take_profit = safe_float(pos.get("take_profit"))
+                tpsl_mode = pos.get("tpsl_mode")
+                created_time = safe_int(pos.get("created_time"))
+                pos_state = positions_state.get(key, {})
+                if not pos_state:
+                    self.logger.warning("External position detected. Taking ownership.")
+                    entry_bar_time = self.state.state.get("last_bar_time")
+                    if created_time > 0:
+                        entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
+                    pos_state = {
+                        "side": side,
+                        "size": pos_size,
+                        "entry_price": entry_price,
+                        "entry_bar_time": entry_bar_time,
+                        "created_ts": utc_now_str(),
+                        "tp_sl_set": False,
+                        "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
+                        "position_idx": safe_int(pos.get("position_idx")),
+                    }
+                pos_state.update({
                     "side": side,
                     "size": pos_size,
                     "entry_price": entry_price,
-                    "entry_bar_time": entry_bar_time,
-                    "created_ts": utc_now_str(),
-                    "tp_sl_set": False,
-                    "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
-                }
-            pos_state.update({
-                "side": side,
-                "size": pos_size,
-                "entry_price": entry_price,
-                "mark_price": mark_price,
-                "unrealized_pnl": unreal_pnl,
-                "cum_realized_pnl": cum_realized,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "tpsl_mode": tpsl_mode,
-                "entry_ts_ms": pos_state.get("entry_ts_ms"),
-            })
-            if stop_loss > 0 or take_profit > 0:
-                pos_state["tp_sl_set"] = True
-            self.state.state["position"] = pos_state
+                    "mark_price": mark_price,
+                    "unrealized_pnl": unreal_pnl,
+                    "cum_realized_pnl": cum_realized,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "tpsl_mode": tpsl_mode,
+                    "entry_ts_ms": pos_state.get("entry_ts_ms"),
+                    "position_idx": safe_int(pos.get("position_idx")),
+                })
+                if stop_loss > 0 or take_profit > 0:
+                    pos_state["tp_sl_set"] = True
+                positions_state[key] = pos_state
+
+            for key in ("long", "short"):
+                if key not in seen_keys and positions_state.get(key):
+                    positions_state[key] = {}
+            self.state.state["positions"] = positions_state
+        else:
+            pos_size = safe_float(position.get("size")) if position else 0.0
+            if pos_size == 0 and self.state.state.get("position"):
+                self.logger.info("Position closed on exchange.")
+                self.state.state["position"] = {}
+            elif pos_size != 0:
+                side = position.get("side")
+                entry_price = safe_float(position.get("avg_price"))
+                mark_price = safe_float(position.get("mark_price"))
+                unreal_pnl = safe_float(position.get("unrealized_pnl"))
+                cum_realized = safe_float(position.get("cum_realized_pnl"))
+                stop_loss = safe_float(position.get("stop_loss"))
+                take_profit = safe_float(position.get("take_profit"))
+                tpsl_mode = position.get("tpsl_mode")
+                created_time = safe_int(position.get("created_time"))
+                pos_state = self.state.state.get("position", {})
+                if not pos_state:
+                    self.logger.warning("External position detected. Taking ownership.")
+                    entry_bar_time = self.state.state.get("last_bar_time")
+                    if created_time > 0:
+                        entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
+                    pos_state = {
+                        "side": side,
+                        "size": pos_size,
+                        "entry_price": entry_price,
+                        "entry_bar_time": entry_bar_time,
+                        "created_ts": utc_now_str(),
+                        "tp_sl_set": False,
+                        "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
+                    }
+                pos_state.update({
+                    "side": side,
+                    "size": pos_size,
+                    "entry_price": entry_price,
+                    "mark_price": mark_price,
+                    "unrealized_pnl": unreal_pnl,
+                    "cum_realized_pnl": cum_realized,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "tpsl_mode": tpsl_mode,
+                    "entry_ts_ms": pos_state.get("entry_ts_ms"),
+                })
+                if stop_loss > 0 or take_profit > 0:
+                    pos_state["tp_sl_set"] = True
+                self.state.state["position"] = pos_state
         self._update_closed_pnl()
 
         self.state.save()
+        self.last_reconcile_info = {
+            "ts": utc_now_str(),
+            "reason": reason,
+            "source": "rest",
+            "open_orders": len(state_orders),
+            "protective_orders": protective_count,
+        }
         if protective_count:
             self.logger.info(
                 f"Reconcile complete ({reason}). Open orders: {len(state_orders)} | Protective: {protective_count}"
@@ -2072,10 +2441,18 @@ class LiveTradingV2:
         self.state.state["metrics"] = metrics
         self.logger.info(f"Closed PnL update: {total_pnl:.4f} ({len(new_records)} fills)")
 
-    def _ensure_tp_sl(self, latest_row: pd.Series) -> None:
+    def _ensure_tp_sl(
+        self,
+        latest_row: pd.Series,
+        pos: Optional[Dict] = None,
+        side: Optional[str] = None,
+        position_idx: Optional[int] = None,
+        state_key: Optional[str] = None,
+    ) -> None:
         if self.dry_run:
             return
-        pos = self.state.state.get("position", {})
+        if pos is None:
+            pos = self.state.state.get("position", {})
         if not pos:
             return
         if pos.get("tp_sl_set"):
@@ -2084,7 +2461,7 @@ class LiveTradingV2:
         entry_price = safe_float(pos.get("entry_price"))
         if size <= 0 or entry_price <= 0:
             return
-        side = pos.get("side")
+        side = side or pos.get("side")
         atr = safe_float(latest_row.get("atr"))
         if atr <= 0:
             return
@@ -2098,9 +2475,14 @@ class LiveTradingV2:
             tp = entry_price - (atr * tp_atr)
             sl = entry_price + (atr * sl_atr)
 
-        self.api.set_tp_sl(side, size, tp, sl)
+        self.api.set_tp_sl(side, size, tp, sl, position_idx=position_idx)
         pos["tp_sl_set"] = True
-        self.state.state["position"] = pos
+        if self.hedge_mode and state_key:
+            positions = self.state.state.get("positions", {})
+            positions[state_key] = pos
+            self.state.state["positions"] = positions
+        else:
+            self.state.state["position"] = pos
         self.state.save()
         self.logger.info(f"TP/SL set for position: TP={tp:.6f} SL={sl:.6f}")
 
@@ -2137,6 +2519,25 @@ class LiveTradingV2:
         self.state.state["active_orders"] = orders
         self.state.save()
         self.logger.info(f"Active orders canceled ({reason}).")
+
+    def _cancel_orders_for_sides(self, sides: List[str], reason: str) -> None:
+        if not sides:
+            return
+        orders = self.state.state.get("active_orders", {})
+        if not orders:
+            return
+        sides_set = {s for s in sides if s}
+        canceled = []
+        for oid, info in list(orders.items()):
+            if info.get("side") in sides_set:
+                if not self.dry_run:
+                    self.api.cancel_order(oid)
+                orders.pop(oid, None)
+                canceled.append(oid)
+        if canceled:
+            self.state.state["active_orders"] = orders
+            self.state.save()
+            self.logger.info(f"Active orders canceled ({reason}): {len(canceled)}")
 
     def _is_protective_order(self, order: Dict) -> bool:
         order_type = str(order.get("orderType") or "").lower()
@@ -2188,6 +2589,36 @@ class LiveTradingV2:
         return tuple(sorted(sig))
 
     def _check_position_timeout(self, bar_time: int) -> None:
+        if self.hedge_mode:
+            positions = self.state.state.get("positions", {})
+            if not isinstance(positions, dict):
+                return
+            updated = False
+            for key in ("long", "short"):
+                pos = positions.get(key, {})
+                if not pos:
+                    continue
+                entry_bar = pos.get("entry_bar_time")
+                if entry_bar is None:
+                    continue
+                age_bars = int((bar_time - entry_bar) / self.tf_seconds)
+                if age_bars < self.config.strategy.max_holding_bars:
+                    continue
+                size = safe_float(pos.get("size"))
+                if size <= 0:
+                    continue
+                side = pos.get("side") or ("Buy" if key == "long" else "Sell")
+                position_idx = safe_int(pos.get("position_idx"))
+                self.logger.warning("Position timeout reached. Closing at market.")
+                if not self.dry_run:
+                    self.api.market_close(side, abs(size), position_idx=position_idx)
+                positions[key] = {}
+                updated = True
+            if updated:
+                self.state.state["positions"] = positions
+                self.state.save()
+            return
+
         pos = self.state.state.get("position", {})
         if not pos:
             return
@@ -2296,7 +2727,12 @@ class LiveTradingV2:
             tp = round_to_tick(tp, tick, "down")  # further away (lower)
             sl = round_to_tick(sl, tick, "up")    # further away (higher)
 
-        resp = self.api.place_limit_order(side, price, qty, tp=tp, sl=sl, reduce_only=False)
+        position_idx = None
+        if self.hedge_mode:
+            position_idx = 1 if side == "Buy" else 2
+        resp = self.api.place_limit_order(
+            side, price, qty, tp=tp, sl=sl, reduce_only=False, position_idx=position_idx
+        )
         
         if resp is None:
             # Transport/exception path (ExchangeClient caught exception and returned None)
@@ -2322,6 +2758,7 @@ class LiveTradingV2:
             "created_bar_time": self.state.state.get("last_bar_time"),
             "created_ts": utc_now_str(),
             "external": False,
+            "position_idx": position_idx,
         }
         self.state.save()
 
@@ -2422,6 +2859,11 @@ class LiveTradingV2:
             if bars_df.empty:
                 self.logger.warning("No trade bars available after filtering.")
                 return
+            if not self.fast_bootstrap:
+                ready, reason = self._history_continuity_ready(bars_df)
+                if not ready:
+                    self.logger.info(f"History continuity warmup: {reason}.")
+                    return
             df_feat = self.feature_engine.calculate_features(bars_df)
 
             ok, missing = self._check_feature_coverage(df_feat, bar_time=bar_time)
@@ -2436,6 +2878,7 @@ class LiveTradingV2:
                 self.logger.warning(f"Feature row missing for bar_time={bar_time}.")
                 return
             latest = row_match.iloc[-1]
+            self.last_feature_vector = self._serialize_feature_vector(latest)
 
             recent = bars_df.tail(min(24, len(bars_df)))
             ob_density = (recent["ob_spread_mean"] > 0).sum() / max(len(recent), 1) * 100
@@ -2443,11 +2886,10 @@ class LiveTradingV2:
                 self.logger.warning(f"OB density {ob_density:.0f}% below threshold {self.min_ob_density_pct:.0f}%.")
                 return
 
-            if self.continuous_trade_bars < self.min_trade_bars:
+            if self.min_trade_bars > 0 and self.continuous_trade_bars < self.min_trade_bars:
                 self.logger.info(
-                    f"Trade warmup: {self.continuous_trade_bars}/{self.min_trade_bars} continuous bars."
+                    f"Trade continuity below target: {self.continuous_trade_bars}/{self.min_trade_bars} bars."
                 )
-                return
 
             self._log_feature_vector(latest)
             for warning in self.sanity.check(latest):
@@ -2483,6 +2925,8 @@ class LiveTradingV2:
             )
 
             drift_alerts = self.drift_monitor.update(latest, {"pred_long": pred_long, "pred_short": pred_short})
+            self.last_drift_alerts = drift_alerts
+            self.last_drift_time = utc_now_str()
             if drift_alerts:
                 self.logger.warning("Drift alerts: " + ", ".join(drift_alerts))
 
@@ -2493,24 +2937,51 @@ class LiveTradingV2:
             self._expire_orders(bar_time)
             self._check_position_timeout(bar_time)
 
-            pos = self.state.state.get("position", {})
+            long_pos, short_pos = self._get_positions()
+            long_size = self._position_size(long_pos)
+            short_size = self._position_size(short_pos)
+            has_long = long_size > 0
+            has_short = short_size > 0
+            has_position = has_long or has_short
             daily_pnl = safe_float(self.state.state.get("daily", {}).get("realized_pnl"))
             drawdown_limit = -equity * self.config.live.max_daily_drawdown_pct
             if daily_pnl < drawdown_limit:
                 self.logger.critical("Daily drawdown limit exceeded. Trading paused.")
-                if pos and not self.dry_run:
-                    size = safe_float(pos.get("size"))
-                    side = pos.get("side") or "Buy"
-                    if size > 0:
-                        self.api.market_close(side, abs(size))
+                if has_position and not self.dry_run:
+                    if self.hedge_mode:
+                        if has_long:
+                            idx = safe_int(long_pos.get("position_idx")) or 1
+                            self.api.market_close("Buy", abs(long_size), position_idx=idx)
+                        if has_short:
+                            idx = safe_int(short_pos.get("position_idx")) or 2
+                            self.api.market_close("Sell", abs(short_size), position_idx=idx)
+                    else:
+                        size = safe_float(long_pos.get("size"))
+                        side = long_pos.get("side") or "Buy"
+                        if size > 0:
+                            self.api.market_close(side, abs(size))
                 self._cancel_active_orders("drawdown")
                 self.trade_enabled = False
                 return
 
-            if pos:
-                if self.state.state.get("active_orders"):
-                    self._cancel_active_orders("position_open")
-                self._ensure_tp_sl(latest)
+            if has_position:
+                if self.hedge_mode:
+                    sides_to_cancel = []
+                    if has_long:
+                        sides_to_cancel.append("Buy")
+                    if has_short:
+                        sides_to_cancel.append("Sell")
+                    self._cancel_orders_for_sides(sides_to_cancel, "position_open")
+                    if has_long:
+                        idx = safe_int(long_pos.get("position_idx")) or 1
+                        self._ensure_tp_sl(latest, long_pos, "Buy", position_idx=idx, state_key="long")
+                    if has_short:
+                        idx = safe_int(short_pos.get("position_idx")) or 2
+                        self._ensure_tp_sl(latest, short_pos, "Sell", position_idx=idx, state_key="short")
+                else:
+                    if self.state.state.get("active_orders"):
+                        self._cancel_active_orders("position_open")
+                    self._ensure_tp_sl(latest)
                 return
 
             last_trade_ts = safe_float(self.state.state.get("last_trade_ts"), 0.0)
@@ -2529,9 +3000,65 @@ class LiveTradingV2:
                 self._place_order("Buy", latest, equity)
             if pred_short > threshold and not has_sell:
                 self._place_order("Sell", latest, equity)
+            self.last_regime = regime
+            self.last_sentiment = sentiment
+            self.last_health = self.health.check_health()
+            self.last_prediction = {
+                "bar_time": bar_time,
+                "pred_long": pred_long,
+                "pred_short": pred_short,
+                "threshold": threshold,
+            }
         finally:
             self.state.save()
             self._save_history()
+
+    def _data_health_metrics(self) -> Dict[str, float]:
+        bars = self.bar_window.bars
+        if bars.empty:
+            return {
+                "bars": 0,
+                "macro_pct": 0.0,
+                "ob_density_pct": 0.0,
+                "trade_cont": float(self.continuous_trade_bars),
+            }
+        trade_bars = bars[bars["trade_count"] > 0]
+        n = len(trade_bars)
+        macro_target = max(self.min_feature_bars, 1)
+        macro_pct = min(100.0, (n / macro_target) * 100) if macro_target else 0.0
+        window = min(24, n)
+        if window == 0:
+            ob_density = 0.0
+        else:
+            recent = trade_bars.tail(window)
+            ob_density = (recent["ob_spread_mean"] > 0).sum() / window * 100
+        return {
+            "bars": int(n),
+            "macro_pct": float(macro_pct),
+            "ob_density_pct": float(ob_density),
+            "trade_cont": float(self.continuous_trade_bars),
+        }
+
+    def _serialize_feature_vector(self, row: pd.Series) -> Dict[str, object]:
+        names = list(self.model_features)
+        values: List[Optional[float]] = []
+        for name in names:
+            raw = row.get(name)
+            try:
+                val = float(raw)
+            except Exception:
+                val = None
+            if val is None or math.isnan(val) or math.isinf(val):
+                values.append(None)
+            else:
+                values.append(round(val, 6))
+        return {"names": names, "values": values}
+
+    def _write_metrics(self, payload: Dict[str, object]) -> None:
+        try:
+            append_jsonl(self.metrics_path, payload)
+        except Exception as exc:
+            self.logger.error(f"Failed to write metrics log: {exc}")
 
     def _log_heartbeat(self) -> None:
         last_bar = self.state.state.get("last_bar_time")
@@ -2545,10 +3072,29 @@ class LiveTradingV2:
         lag_bar_str = f"{lag_bar:.1f}s" if lag_bar is not None else "n/a"
         ob_lag_str = f"{ob_lag:.1f}s" if ob_lag is not None else "n/a"
 
-        pos = self.state.state.get("position", {})
-        pos_size = safe_float(pos.get("size")) if pos else 0.0
-        pos_side = pos.get("side") if pos else "Flat"
-        unreal = safe_float(pos.get("unrealized_pnl")) if pos else 0.0
+        long_pos, short_pos = self._get_positions()
+        long_size = self._position_size(long_pos)
+        short_size = self._position_size(short_pos)
+        has_long = long_size > 0
+        has_short = short_size > 0
+        if self.hedge_mode:
+            if has_long and has_short:
+                pos_label = f"Long {long_size:.4f} / Short {short_size:.4f}"
+            elif has_long:
+                pos_label = f"Long {long_size:.4f}"
+            elif has_short:
+                pos_label = f"Short {short_size:.4f}"
+            else:
+                pos_label = "Flat"
+            pos_side = "Hedge" if has_long and has_short else ("Buy" if has_long else "Sell" if has_short else "Flat")
+            pos_size = long_size - short_size
+            unreal = safe_float(long_pos.get("unrealized_pnl")) + safe_float(short_pos.get("unrealized_pnl"))
+        else:
+            pos = self.state.state.get("position", {})
+            pos_size = safe_float(pos.get("size")) if pos else 0.0
+            pos_side = pos.get("side") if pos else "Flat"
+            pos_label = f"{pos_side} {pos_size:.4f}"
+            unreal = safe_float(pos.get("unrealized_pnl")) if pos else 0.0
         daily_pnl = safe_float(self.state.state.get("daily", {}).get("realized_pnl"))
 
         equity = None
@@ -2579,7 +3125,7 @@ class LiveTradingV2:
 
         self.logger.info(
             "HEARTBEAT | "
-            f"pos={pos_side} {pos_size:.4f} | "
+            f"pos={pos_label} | "
             f"open_orders={len(self.state.state.get('active_orders', {}))} | "
             f"equity={equity if equity is not None else 'n/a'} | "
             f"daily_pnl={daily_pnl:.2f} | unreal={unreal:.2f} | "
@@ -2603,17 +3149,135 @@ class LiveTradingV2:
         if ob_lag is not None and ob_lag > self.data_lag_warn:
             self.logger.warning(f"Orderbook data lag: {ob_lag:.1f}s")
 
-        if pos and equity is not None:
-            entry_price = safe_float(pos.get("entry_price"))
-            close = self.bar_window.latest_close()
-            if entry_price > 0 and close is not None:
-                side = 1.0 if pos_side == "Buy" else -1.0
-                local_unreal = (close - entry_price) * pos_size * side
-                diff = abs(local_unreal - unreal)
-                if diff > max(1.0, equity * 0.001):
-                    self.logger.warning(
-                        f"PnL mismatch. local={local_unreal:.2f} exch={unreal:.2f} diff={diff:.2f}"
-                    )
+        if equity is not None:
+            if not self.hedge_mode:
+                pos = self.state.state.get("position", {})
+                if pos:
+                    entry_price = safe_float(pos.get("entry_price"))
+                    close = self.bar_window.latest_close()
+                    if entry_price > 0 and close is not None:
+                        side = 1.0 if pos_side == "Buy" else -1.0
+                        local_unreal = (close - entry_price) * pos_size * side
+                        diff = abs(local_unreal - unreal)
+                        if diff > max(1.0, equity * 0.001):
+                            self.logger.warning(
+                                f"PnL mismatch. local={local_unreal:.2f} exch={unreal:.2f} diff={diff:.2f}"
+                            )
+            else:
+                close = self.bar_window.latest_close()
+                if close is not None and (has_long ^ has_short):
+                    pos = long_pos if has_long else short_pos
+                    entry_price = safe_float(pos.get("entry_price"))
+                    size = self._position_size(pos)
+                    if entry_price > 0 and size > 0:
+                        side = 1.0 if has_long else -1.0
+                        local_unreal = (close - entry_price) * size * side
+                        diff = abs(local_unreal - unreal)
+                        if diff > max(1.0, equity * 0.001):
+                            self.logger.warning(
+                                f"PnL mismatch. local={local_unreal:.2f} exch={unreal:.2f} diff={diff:.2f}"
+                            )
+
+        pos_ref = {}
+        if self.hedge_mode:
+            if has_long and not has_short:
+                pos_ref = long_pos
+            elif has_short and not has_long:
+                pos_ref = short_pos
+        else:
+            pos_ref = self.state.state.get("position", {})
+
+        position_payload = {
+            "side": pos_side,
+            "size": pos_size,
+            "entry_price": safe_float(pos_ref.get("entry_price")) if pos_ref else 0.0,
+            "mark_price": safe_float(pos_ref.get("mark_price")) if pos_ref else 0.0,
+            "unreal_pnl": unreal,
+            "stop_loss": safe_float(pos_ref.get("stop_loss")) if pos_ref else 0.0,
+            "take_profit": safe_float(pos_ref.get("take_profit")) if pos_ref else 0.0,
+            "tpsl_mode": pos_ref.get("tpsl_mode") if pos_ref else None,
+        }
+        if self.hedge_mode and has_long and has_short:
+            position_payload["size"] = long_size + short_size
+        positions_payload = None
+        if self.hedge_mode:
+            positions_payload = {
+                "long": {
+                    "side": long_pos.get("side"),
+                    "size": long_size,
+                    "entry_price": safe_float(long_pos.get("entry_price")),
+                    "mark_price": safe_float(long_pos.get("mark_price")),
+                    "unreal_pnl": safe_float(long_pos.get("unrealized_pnl")),
+                    "stop_loss": safe_float(long_pos.get("stop_loss")),
+                    "take_profit": safe_float(long_pos.get("take_profit")),
+                    "tpsl_mode": long_pos.get("tpsl_mode"),
+                    "position_idx": safe_int(long_pos.get("position_idx")),
+                },
+                "short": {
+                    "side": short_pos.get("side"),
+                    "size": short_size,
+                    "entry_price": safe_float(short_pos.get("entry_price")),
+                    "mark_price": safe_float(short_pos.get("mark_price")),
+                    "unreal_pnl": safe_float(short_pos.get("unrealized_pnl")),
+                    "stop_loss": safe_float(short_pos.get("stop_loss")),
+                    "take_profit": safe_float(short_pos.get("take_profit")),
+                    "tpsl_mode": short_pos.get("tpsl_mode"),
+                    "position_idx": safe_int(short_pos.get("position_idx")),
+                },
+            }
+
+        metrics = {
+            "ts": utc_now_str(),
+            "symbol": self.config.data.symbol,
+            "position_mode": self.position_mode,
+            "model": {
+                "dir": str(self.model_dir),
+                "keys_profile": self.keys_profile,
+            },
+            "startup_time": self.start_time_utc,
+            "uptime_sec": round(now - self.start_time, 2),
+            "trade_enabled": self.trade_enabled,
+            "dry_run": self.dry_run,
+            "prediction": self.last_prediction,
+            "feature_vector": self.last_feature_vector,
+            "position": position_payload,
+            "positions": positions_payload,
+            "orders": {
+                "open_orders": len(self.state.state.get("active_orders", {})),
+                "last_reconcile": self.last_reconcile_info,
+            },
+            "equity": equity,
+            "daily_pnl": daily_pnl,
+            "latency": {
+                "rest_avg_ms": round(latency_avg, 2),
+                "rest_max_ms": round(latency_max, 2),
+                "ws_trade_ms": round(ws_trade_latency, 2) if ws_trade_latency is not None else None,
+                "ws_ob_ms": round(ws_ob_latency, 2) if ws_ob_latency is not None else None,
+                "lag_trade_sec": round(lag_trade, 2) if lag_trade is not None else None,
+                "lag_bar_sec": round(lag_bar, 2) if lag_bar is not None else None,
+                "ob_lag_sec": round(ob_lag, 2) if ob_lag is not None else None,
+            },
+            "data_health": self._data_health_metrics(),
+            "health": {
+                "status": health,
+                "sentiment": sentiment,
+                "regime": self.last_regime,
+                "last_prediction": self.last_prediction,
+            },
+            "drift": {
+                "alerts": self.last_drift_alerts,
+                "last_alert_time": self.last_drift_time,
+            },
+            "errors": {
+                "runtime_count": self.runtime_error_count,
+                "last_runtime_error": self.last_runtime_error,
+                "last_runtime_error_time": self.last_runtime_error_ts,
+                "api_count": self.api.error_count,
+                "last_api_error": self.api.last_error,
+                "last_api_error_time": self.api.last_error_ts,
+            },
+        }
+        self._write_metrics(metrics)
 
     def run(self) -> None:
         last_trade_poll = 0.0
@@ -2684,6 +3348,9 @@ class LiveTradingV2:
                 error_count += 1
                 self.logger.error(f"Runtime error: {exc}")
                 self.logger.debug(traceback.format_exc())
+                self.runtime_error_count += 1
+                self.last_runtime_error = safe_log_message(exc)
+                self.last_runtime_error_ts = time.time()
                 if error_count >= self.config.live.max_api_errors:
                     self.logger.critical("Max error threshold exceeded. Shutting down.")
                     break
@@ -2716,9 +3383,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ob-levels", type=int, default=CONF.data.ob_levels)
     parser.add_argument("--min-ob-density-pct", type=float, default=DEFAULT_MIN_OB_DENSITY_PCT)
     parser.add_argument("--min-trade-bars", type=int, default=DEFAULT_MIN_TRADE_BARS)
+    parser.add_argument("--continuity-bars", type=int, default=DEFAULT_CONTINUITY_BARS)
+    parser.add_argument("--max-last-bar-age-sec", type=float, default=DEFAULT_MAX_LAST_BAR_AGE_SEC)
     parser.add_argument("--max-leverage", type=float, default=DEFAULT_MAX_LEVERAGE)
     parser.add_argument("--exchange-leverage", type=int, default=0, help="Set exchange leverage (0 disables)")
     parser.add_argument("--testnet", action="store_true", help="Use Bybit testnet endpoints")
+    parser.add_argument(
+        "--position-mode",
+        type=str,
+        default=DEFAULT_POSITION_MODE,
+        choices=["oneway", "hedge"],
+        help="Position mode: oneway or hedge",
+    )
     parser.add_argument("--use-ws-trades", action="store_true", help="Use WebSocket trade stream")
     parser.add_argument("--use-ws-ob", action="store_true", help="Use WebSocket orderbook stream")
     parser.add_argument("--use-ws-private", action="store_true", help="Use private WebSocket streams")
@@ -2736,6 +3412,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-z-window", type=int, default=DEFAULT_FEATURE_Z_WINDOW)
     parser.add_argument("--feature-z-threshold", type=float, default=DEFAULT_FEATURE_Z_THRESHOLD)
     parser.add_argument("--bootstrap-klines-days", type=float, default=DEFAULT_BOOTSTRAP_KLINES_DAYS)
+    parser.add_argument(
+        "--fast-bootstrap",
+        action="store_true",
+        default=DEFAULT_FAST_BOOTSTRAP,
+        help="Skip continuity gate and fill missing recent bars from klines",
+    )
+    parser.add_argument("--metrics-log-path", type=str, default=DEFAULT_METRICS_LOG_PATH)
     parser.add_argument("--drift-window", type=int, default=DEFAULT_DRIFT_WINDOW)
     parser.add_argument("--drift-z", type=float, default=DEFAULT_DRIFT_Z)
     parser.add_argument(
@@ -2746,6 +3429,8 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.drift_keys = [k.strip() for k in args.drift_keys.split(",") if k.strip()]
+    if hasattr(args, "position_mode") and args.position_mode:
+        args.position_mode = args.position_mode.lower()
     return args
 
 

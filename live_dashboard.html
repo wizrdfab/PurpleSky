@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Live Trading Dashboard</title>
+  <style>
+    :root {
+      --bg1: #0f172a;
+      --bg2: #111827;
+      --panel: #0b1220;
+      --accent: #22c55e;
+      --accent2: #f59e0b;
+      --danger: #ef4444;
+      --muted: #94a3b8;
+      --text: #e5e7eb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Bahnschrift", "Trebuchet MS", sans-serif;
+      color: var(--text);
+      background: radial-gradient(1200px 600px at 10% 10%, #0b1430 0%, transparent 60%),
+                  radial-gradient(1200px 600px at 90% 20%, #1b2a3a 0%, transparent 60%),
+                  linear-gradient(160deg, var(--bg1), var(--bg2));
+      min-height: 100vh;
+    }
+    header {
+      padding: 28px 32px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      letter-spacing: 0.5px;
+    }
+    h2 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0.3px;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 6px;
+    }
+    .pill {
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.08);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .summary-grid {
+      padding: 0 32px 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .summary-card {
+      background: linear-gradient(180deg, rgba(11,18,32,0.95), rgba(11,18,32,0.85));
+      border: 1px solid rgba(148,163,184,0.15);
+      border-radius: 14px;
+      padding: 12px;
+      cursor: pointer;
+      transition: transform 0.15s ease, border 0.15s ease;
+    }
+    .summary-card:hover { transform: translateY(-2px); }
+    .summary-card.selected {
+      border-color: rgba(34,197,94,0.6);
+      box-shadow: 0 0 0 2px rgba(34,197,94,0.2);
+    }
+    .summary-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.04);
+    }
+    .badge.ok { color: var(--accent); }
+    .badge.warn { color: var(--accent2); }
+    .badge.bad { color: var(--danger); }
+    .summary-value {
+      font-size: 18px;
+      font-weight: 600;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      padding: 3px 0;
+      border-bottom: 1px dashed rgba(148,163,184,0.1);
+    }
+    .row:last-child { border-bottom: none; }
+    .ok { color: var(--accent); }
+    .warn { color: var(--accent2); }
+    .bad { color: var(--danger); }
+    .muted { color: var(--muted); }
+    .detail-wrap {
+      padding: 12px 32px 40px;
+    }
+    .detail-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      margin-bottom: 10px;
+      gap: 12px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 4px 8px;
+      font-size: 11px;
+      max-height: 220px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .feature-item {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .truncate {
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      display: block;
+    }
+    .card {
+      background: linear-gradient(180deg, rgba(11,18,32,0.95), rgba(11,18,32,0.85));
+      border: 1px solid rgba(148,163,184,0.15);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+    }
+    .value {
+      font-size: 24px;
+      font-weight: 600;
+    }
+    canvas {
+      width: 100%;
+      height: 80px;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Live Trading Dashboard</h1>
+      <div class="sub" id="subline">Waiting for metrics...</div>
+    </div>
+    <div class="pill" id="statusPill">Offline</div>
+  </header>
+
+  <section class="summary-grid" id="summaryGrid"></section>
+
+  <section class="detail-wrap">
+    <div class="detail-header">
+      <div>
+        <h2 id="detailTitle">Select a symbol</h2>
+        <div class="sub" id="detailSub">No data loaded</div>
+      </div>
+      <div class="pill" id="detailStatus">--</div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h3>Equity and PnL</h3>
+        <div class="value" id="equityVal">--</div>
+        <div class="row"><span>Daily PnL</span><span id="dailyPnl">--</span></div>
+        <div class="row"><span>Unrealized</span><span id="unrealPnl">--</span></div>
+        <canvas id="equityChart"></canvas>
+      </div>
+      <div class="card">
+        <h3>Position</h3>
+        <div class="value" id="posSide">--</div>
+        <div class="row"><span>Size</span><span id="posSize">--</span></div>
+        <div class="row"><span>Entry</span><span id="posEntry">--</span></div>
+        <div class="row"><span>Mark</span><span id="posMark">--</span></div>
+        <div class="row"><span>TP / SL</span><span id="posTPSL">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Health</h3>
+        <div class="value" id="healthVal">--</div>
+        <div class="row"><span>Sentiment</span><span id="sentimentVal">--</span></div>
+        <div class="row"><span>Regime</span><span id="regimeVal">--</span></div>
+        <div class="row"><span>Trade Enabled</span><span id="tradeEnabled">--</span></div>
+        <div class="row"><span>Drift Alerts</span><span id="driftAlerts">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Model</h3>
+        <div class="value" id="modelPred">--</div>
+        <div class="row"><span>Pred Long</span><span id="predLong">--</span></div>
+        <div class="row"><span>Pred Short</span><span id="predShort">--</span></div>
+        <div class="row"><span>Threshold</span><span id="predThreshold">--</span></div>
+        <div class="row"><span>Bar Time</span><span id="predBar">--</span></div>
+        <div class="row"><span>Model Path</span><span class="truncate" id="modelPath">--</span></div>
+        <div class="row"><span>Keys Profile</span><span id="keysProfile">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Data Quality</h3>
+        <div class="value" id="barsVal">--</div>
+        <div class="row"><span>Macro %</span><span id="macroPct">--</span></div>
+        <div class="row"><span>OB Density</span><span id="obDensity">--</span></div>
+        <div class="row"><span>Trade Continuity</span><span id="tradeCont">--</span></div>
+        <div class="row"><span>Lag Trade / Bar</span><span id="lagTradeBar">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Latency</h3>
+        <div class="value" id="restLatency">--</div>
+        <div class="row"><span>WS Trade</span><span id="wsTrade">--</span></div>
+        <div class="row"><span>WS OB</span><span id="wsOb">--</span></div>
+        <div class="row"><span>OB Lag</span><span id="obLag">--</span></div>
+        <canvas id="latencyChart"></canvas>
+      </div>
+      <div class="card">
+        <h3>Orders</h3>
+        <div class="value" id="openOrders">--</div>
+        <div class="row"><span>Last Reconcile</span><span id="lastReconcile">--</span></div>
+        <div class="row"><span>Source</span><span id="reconcileSource">--</span></div>
+        <div class="row"><span>Protective</span><span id="protectiveCount">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Errors</h3>
+        <div class="value" id="errorCount">--</div>
+        <div class="row"><span>Last Runtime</span><span id="lastRuntime">--</span></div>
+        <div class="row"><span>Last API</span><span id="lastApi">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Features</h3>
+        <div class="feature-grid" id="featureList">--</div>
+      </div>
+    </div>
+  </section>
+
+  <script>
+    const fmt = (v, d=2) => (v === null || v === undefined) ? "--" : Number(v).toFixed(d);
+    const fmtPct = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}%`;
+    const fmtSec = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}s`;
+    const fmtMs = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}ms`;
+
+    const state = {
+      selected: null,
+      latestMap: {},
+      items: [],
+      lastHistorySymbol: null
+    };
+
+    function sparkline(canvas, values, color) {
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width = canvas.clientWidth;
+      const h = canvas.height = canvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+      if (!values.length) return;
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = (max - min) || 1;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      values.forEach((v, i) => {
+        const x = (i / (values.length - 1)) * w;
+        const y = h - ((v - min) / span) * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    function healthClass(text) {
+      if (!text) return "muted";
+      const upper = text.toUpperCase();
+      if (upper.includes("CRITICAL") || upper.includes("ERROR")) return "bad";
+      if (upper.includes("WARNING") || upper.includes("WARN")) return "warn";
+      if (upper.includes("HEALTHY") || upper.includes("STABLE")) return "ok";
+      return "muted";
+    }
+
+    function renderSummary(items) {
+      state.items = items || [];
+      state.latestMap = {};
+      const grid = document.getElementById("summaryGrid");
+      grid.innerHTML = "";
+      state.items.forEach(item => {
+        if (!item || !item.symbol) return;
+        state.latestMap[item.symbol] = item;
+      });
+      const symbols = Object.keys(state.latestMap).sort();
+      document.getElementById("statusPill").textContent = `${symbols.length} symbols`;
+      const subline = document.getElementById("subline");
+      if (subline) {
+        subline.textContent = `Active symbols: ${symbols.length} | Updated: ${new Date().toLocaleTimeString()}`;
+      }
+      if (!state.selected || !state.latestMap[state.selected]) {
+        state.selected = symbols[0] || null;
+      }
+      symbols.forEach(symbol => {
+        const item = state.latestMap[symbol];
+        const card = document.createElement("div");
+        card.className = "summary-card" + (symbol === state.selected ? " selected" : "");
+        card.addEventListener("click", () => selectSymbol(symbol));
+
+        const title = document.createElement("div");
+        title.className = "summary-title";
+        const label = document.createElement("div");
+        label.textContent = symbol;
+        const badge = document.createElement("span");
+        badge.className = "badge " + (item.trade_enabled ? "ok" : "warn");
+        badge.textContent = item.trade_enabled ? "ON" : "OFF";
+        title.appendChild(label);
+        title.appendChild(badge);
+        card.appendChild(title);
+
+        const equity = document.createElement("div");
+        equity.className = "summary-value";
+        equity.textContent = item.equity ? fmt(item.equity, 4) : "--";
+        card.appendChild(equity);
+
+        const rows = [
+          ["Daily PnL", fmt(item.daily_pnl, 4)],
+          ["Position", formatPosition(item.position)],
+          ["Health", item.health?.status || "--"],
+          ["OB Density", fmtPct(item.data_health?.ob_density_pct)],
+          ["Lag Trade", fmtSec(item.latency?.lag_trade_sec)],
+          ["Last Update", item.ts || "--"],
+        ];
+        rows.forEach(([k, v]) => {
+          const row = document.createElement("div");
+          row.className = "row";
+          const left = document.createElement("span");
+          left.textContent = k;
+          const right = document.createElement("span");
+          right.textContent = v;
+          row.appendChild(left);
+          row.appendChild(right);
+          card.appendChild(row);
+        });
+        grid.appendChild(card);
+      });
+      if (state.selected && state.latestMap[state.selected]) {
+        updateDetail(state.latestMap[state.selected]);
+      }
+    }
+
+    function formatPosition(pos) {
+      if (!pos) return "--";
+      const side = pos.side || "Flat";
+      const size = pos.size ? Number(pos.size).toFixed(4) : "0.0000";
+      return `${side} ${size}`;
+    }
+
+    function selectSymbol(symbol) {
+      state.selected = symbol;
+      renderSummary(state.items);
+      if (symbol) {
+        fetchHistory(symbol);
+      }
+    }
+
+    function updateDetail(data) {
+      if (!data || !data.symbol) return;
+      const pos = data.position || {};
+      const health = data.health || {};
+      const latency = data.latency || {};
+      const orders = data.orders || {};
+      const rec = orders.last_reconcile || {};
+      const drift = data.drift || {};
+      const errors = data.errors || {};
+      const dataHealth = data.data_health || {};
+      const prediction = data.prediction || health.last_prediction || {};
+      const model = data.model || {};
+      const featureVector = data.feature_vector || {};
+
+      document.getElementById("detailTitle").textContent = `Selected: ${data.symbol}`;
+      document.getElementById("detailSub").textContent = `Startup: ${data.startup_time || "--"} | Uptime: ${Math.round(data.uptime_sec || 0)}s | Last: ${data.ts || "--"}`;
+      document.getElementById("detailStatus").textContent = data.trade_enabled ? "Trading Enabled" : "Trading Paused";
+      document.getElementById("detailStatus").className = "pill " + (data.trade_enabled ? "ok" : "warn");
+
+      document.getElementById("equityVal").textContent = data.equity ? fmt(data.equity, 4) : "--";
+      document.getElementById("dailyPnl").textContent = fmt(data.daily_pnl, 4);
+      document.getElementById("unrealPnl").textContent = fmt(pos.unreal_pnl, 4);
+
+      document.getElementById("posSide").textContent = pos.side || "--";
+      document.getElementById("posSize").textContent = fmt(pos.size, 4);
+      document.getElementById("posEntry").textContent = fmt(pos.entry_price, 6);
+      document.getElementById("posMark").textContent = fmt(pos.mark_price, 6);
+      document.getElementById("posTPSL").textContent = `${fmt(pos.take_profit, 6)} / ${fmt(pos.stop_loss, 6)}`;
+
+      const healthEl = document.getElementById("healthVal");
+      healthEl.textContent = health.status || "--";
+      healthEl.className = "value " + healthClass(health.status);
+      document.getElementById("sentimentVal").textContent = health.sentiment || "--";
+      document.getElementById("regimeVal").textContent = health.regime || "--";
+      document.getElementById("tradeEnabled").textContent = data.trade_enabled ? "Yes" : "No";
+      const driftText = drift.alerts && drift.alerts.length ? drift.alerts.join(", ") : "None";
+      document.getElementById("driftAlerts").textContent = driftText;
+
+      document.getElementById("barsVal").textContent = dataHealth.bars || 0;
+      document.getElementById("macroPct").textContent = fmtPct(dataHealth.macro_pct);
+      document.getElementById("obDensity").textContent = fmtPct(dataHealth.ob_density_pct);
+      document.getElementById("tradeCont").textContent = dataHealth.trade_cont ?? "--";
+      document.getElementById("lagTradeBar").textContent = `${fmtSec(latency.lag_trade_sec)} / ${fmtSec(latency.lag_bar_sec)}`;
+
+      document.getElementById("restLatency").textContent = fmtMs(latency.rest_avg_ms);
+      document.getElementById("wsTrade").textContent = fmtMs(latency.ws_trade_ms);
+      document.getElementById("wsOb").textContent = fmtMs(latency.ws_ob_ms);
+      document.getElementById("obLag").textContent = fmtSec(latency.ob_lag_sec);
+
+      document.getElementById("openOrders").textContent = orders.open_orders ?? 0;
+      document.getElementById("lastReconcile").textContent = rec.ts || "--";
+      document.getElementById("reconcileSource").textContent = rec.source || "--";
+      document.getElementById("protectiveCount").textContent = rec.protective_orders ?? "--";
+
+      document.getElementById("errorCount").textContent = `${errors.runtime_count ?? 0} / ${errors.api_count ?? 0}`;
+      document.getElementById("lastRuntime").textContent = errors.last_runtime_error || "--";
+      document.getElementById("lastApi").textContent = errors.last_api_error || "--";
+
+      const predLong = prediction.pred_long;
+      const predShort = prediction.pred_short;
+      document.getElementById("modelPred").textContent = `${fmt(predLong, 3)} / ${fmt(predShort, 3)}`;
+      document.getElementById("predLong").textContent = fmt(predLong, 3);
+      document.getElementById("predShort").textContent = fmt(predShort, 3);
+      document.getElementById("predThreshold").textContent = fmt(prediction.threshold, 3);
+      document.getElementById("predBar").textContent = prediction.bar_time ?? "--";
+
+      const modelPath = model.dir || "--";
+      const modelPathEl = document.getElementById("modelPath");
+      modelPathEl.textContent = modelPath;
+      modelPathEl.title = modelPath;
+      document.getElementById("keysProfile").textContent = model.keys_profile || "--";
+
+      renderFeatures(featureVector);
+    }
+
+    function renderFeatures(featureVector) {
+      const container = document.getElementById("featureList");
+      container.innerHTML = "";
+      const names = featureVector.names || [];
+      const values = featureVector.values || [];
+      if (!names.length || !values.length) {
+        container.textContent = "--";
+        return;
+      }
+      for (let i = 0; i < names.length; i++) {
+        const item = document.createElement("div");
+        item.className = "feature-item";
+        item.textContent = `${names[i]}: ${fmt(values[i], 6)}`;
+        container.appendChild(item);
+      }
+    }
+
+    async function fetchSummary() {
+      const resp = await fetch("/api/summary");
+      if (!resp.ok) return;
+      const items = await resp.json();
+      renderSummary(items || []);
+    }
+
+    async function fetchHistory(symbol) {
+      if (!symbol) return;
+      const resp = await fetch(`/api/metrics?symbol=${encodeURIComponent(symbol)}&limit=200`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const equity = data.map(x => Number(x.equity || 0));
+      const latency = data.map(x => Number(x.latency?.rest_avg_ms || 0));
+      sparkline(document.getElementById("equityChart"), equity, "#22c55e");
+      sparkline(document.getElementById("latencyChart"), latency, "#f59e0b");
+      state.lastHistorySymbol = symbol;
+    }
+
+    fetchSummary();
+    setInterval(fetchSummary, 2000);
+    setInterval(() => {
+      if (state.selected) {
+        fetchHistory(state.selected);
+      }
+    }, 10000);
+  </script>
+</body>
+</html>

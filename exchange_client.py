@@ -29,11 +29,11 @@ class ExchangeClient:
         """Returns current datetime synced to Bybit Server Time."""
         return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(milliseconds=self.time_offset_ms)
 
-    def startup_check(self) -> bool:
+    def startup_check(self, position_mode: str = "oneway") -> bool:
         """
         Perform critical safety checks before trading.
         1. Time Sync
-        2. Account Mode (One-Way)
+        2. Position Mode (One-Way or Hedge)
         3. Margin Mode (Isolated/Cross)
         4. Instrument Status
         """
@@ -45,9 +45,9 @@ class ExchangeClient:
             logger.critical(f"Time Drift too high ({drift}ms). Abort.")
             return False
             
-        # 2. Enforce One-Way Mode
-        if not self.enforce_oneway_mode():
-            logger.critical("Failed to enforce One-Way Mode. Abort.")
+        # 2. Enforce Position Mode
+        if not self.enforce_position_mode(position_mode):
+            logger.critical(f"Failed to enforce position mode ({position_mode}). Abort.")
             return False
             
         # 3. Check Margin Mode
@@ -89,38 +89,45 @@ class ExchangeClient:
             logger.error(f"Failed to check Margin Mode: {e}")
             return False
 
-    def enforce_oneway_mode(self) -> bool:
+    def enforce_position_mode(self, position_mode: str) -> bool:
         """
-        Ensure the account is in One-Way Mode (idx=0).
-        Hedge Mode (idx=3) causes ambiguous position reporting.
+        Ensure the account is in the requested position mode.
+        mode=0: One-Way, mode=3: Hedge.
         """
+        mode = (position_mode or "oneway").strip().lower()
+        if mode in {"hedge", "hedged"}:
+            mode_value = 3
+            mode_label = "Hedge"
+        else:
+            mode_value = 0
+            mode_label = "One-Way"
         try:
-            # Check current mode first (optimization to avoid error 110043)
-            # However, Bybit API doesn't easily give "current mode" without querying positions 
-            # or just trying to switch. We try to switch.
-            resp = self.session.switch_position_mode(
+            # Bybit does not always provide current mode, so attempt switch.
+            self.session.switch_position_mode(
                 category="linear",
                 symbol=self.symbol,
-                mode=0, # 0: One-Way, 3: Hedge
-                coin="USDT" 
+                mode=mode_value,
+                coin="USDT",
             )
-            logger.info("Enforced One-Way Mode.")
+            logger.info(f"Enforced {mode_label} Mode.")
             return True
         except Exception as e:
             msg = str(e)
-            # 110043: Position mode not modified (already correct) -> Success
-            # 110025: Position mode not modified (already correct) -> Success
+            # 110043/110025: Position mode not modified (already correct) -> Success
             if "110043" in msg or "110025" in msg:
-                logger.info("Already in One-Way Mode (Verified).")
+                logger.info(f"Already in {mode_label} Mode (Verified).")
                 return True
-            
             # 110029: Position mode cannot be changed while holding position -> Warning
             if "110029" in msg:
-                logger.warning("Could not switch mode (Positions exist). ASSUMING One-Way. Please verify manually!")
-                return True # We proceed, but warn.
-            
-            logger.error(f"Error enforcing One-Way Mode: {e}")
+                logger.warning(
+                    f"Could not switch mode (Positions exist). ASSUMING {mode_label}. Please verify manually!"
+                )
+                return True
+            logger.error(f"Error enforcing {mode_label} Mode: {e}")
             return False
+
+    def enforce_oneway_mode(self) -> bool:
+        return self.enforce_position_mode("oneway")
 
     def check_time_sync(self) -> float:
         """
@@ -475,7 +482,16 @@ class ExchangeClient:
             logger.error(f"Error fetching instrument info: {e}")
             return {}
 
-    def place_limit_order(self, side: str, price: float, qty: float, tp: float = 0, sl: float = 0, reduce_only: bool = False):
+    def place_limit_order(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        tp: float = 0,
+        sl: float = 0,
+        reduce_only: bool = False,
+        position_idx: Optional[int] = None,
+    ):
         """Place a Limit order with attached TP/SL."""
         try:
             params = {
@@ -490,6 +506,7 @@ class ExchangeClient:
             }
             if tp > 0: params["takeProfit"] = str(tp)
             if sl > 0: params["stopLoss"] = str(sl)
+            if position_idx is not None: params["positionIdx"] = int(position_idx)
             
             resp = self.session.place_order(**params)
             return resp
@@ -509,37 +526,43 @@ class ExchangeClient:
         except Exception as e:
             logger.error(f"Error canceling orders: {e}")
 
-    def market_close(self, side: str, qty: float):
+    def market_close(self, side: str, qty: float, position_idx: Optional[int] = None):
         """Immediately close position at market price."""
         try:
             # If we are Long, we need to Sell Market
             # If we are Short, we need to Buy Market
             side_to_send = "Sell" if side == "Buy" else "Buy"
-            self.session.place_order(
-                category="linear",
-                symbol=self.symbol,
-                side=side_to_send,
-                orderType="Market",
-                qty=str(qty),
-                reduceOnly=True
-            )
+            params = {
+                "category": "linear",
+                "symbol": self.symbol,
+                "side": side_to_send,
+                "orderType": "Market",
+                "qty": str(qty),
+                "reduceOnly": True,
+            }
+            if position_idx is not None:
+                params["positionIdx"] = int(position_idx)
+            self.session.place_order(**params)
             logger.info(f"Market Close sent: {side_to_send} {qty}")
         except Exception as e:
             logger.error(f"Error market closing: {e}")
 
-    def place_tp_sl(self, side: str, qty: float, tp: float, sl: float):
+    def place_tp_sl(self, side: str, qty: float, tp: float, sl: float, position_idx: Optional[int] = None):
         """
         Update Position TP/SL or Place Reduce-Only Limit (TP) and Conditional Market (SL).
         For Unified, setting TP/SL on position is easiest.
         """
         try:
             # Set TP/SL for the entire position mode
-            self.session.set_trading_stop(
-                category="linear",
-                symbol=self.symbol,
-                takeProfit=str(tp),
-                stopLoss=str(sl),
-                positionIdx=0 # 0 for One-Way Mode
-            )
+            params = {
+                "category": "linear",
+                "symbol": self.symbol,
+                "takeProfit": str(tp),
+                "stopLoss": str(sl),
+                "positionIdx": 0,
+            }
+            if position_idx is not None:
+                params["positionIdx"] = int(position_idx)
+            self.session.set_trading_stop(**params)
         except Exception as e:
             logger.error(f"Error setting TP/SL: {e}")
