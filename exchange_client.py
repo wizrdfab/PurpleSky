@@ -491,6 +491,7 @@ class ExchangeClient:
         sl: float = 0,
         reduce_only: bool = False,
         position_idx: Optional[int] = None,
+        order_link_id: Optional[str] = None,
     ):
         """Place a Limit order with attached TP/SL."""
         try:
@@ -507,9 +508,14 @@ class ExchangeClient:
             if tp > 0: params["takeProfit"] = str(tp)
             if sl > 0: params["stopLoss"] = str(sl)
             if position_idx is not None: params["positionIdx"] = int(position_idx)
+            if order_link_id: params["orderLinkId"] = str(order_link_id)
             
             resp = self.session.place_order(**params)
             return resp
+        except InvalidRequestError as e:
+            msg = str(e).encode('ascii', 'ignore').decode('ascii')
+            code = getattr(e, "status_code", None)
+            return {"retCode": code if code is not None else -1, "retMsg": msg}
         except Exception as e:
             # Sanitize error message for Windows consoles
             msg = str(e).encode('ascii', 'ignore').decode('ascii')

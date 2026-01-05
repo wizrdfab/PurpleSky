@@ -11,11 +11,12 @@ import os
 import time
 import threading
 import traceback
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import joblib
 import numpy as np
@@ -57,6 +58,10 @@ DEFAULT_WS_PRIVATE_STALE_SEC = 120.0
 DEFAULT_WS_PRIVATE_REST_SEC = 300.0
 DEFAULT_FEATURE_Z_WINDOW = 200
 DEFAULT_FEATURE_Z_THRESHOLD = 3.0
+DEFAULT_ORDERLINK_PREFIX = "LTV2"
+DEFAULT_POSTONLY_RETRY_MAX = 2
+DEFAULT_REST_CONFIRM_ATTEMPTS = 3
+DEFAULT_REST_CONFIRM_SLEEP_SEC = 0.2
 DEFAULT_MODEL_DIR = f"models_v9/{CONF.data.symbol}/{CONF.data.symbol}/rank_1"
 DEFAULT_BOOTSTRAP_KLINES_DAYS = 0.0
 DEFAULT_METRICS_LOG_PATH = ""
@@ -64,6 +69,8 @@ DEFAULT_CONTINUITY_BARS = 24
 DEFAULT_MAX_LAST_BAR_AGE_SEC = 0.0
 DEFAULT_FAST_BOOTSTRAP = False
 DEFAULT_POSITION_MODE = "oneway"
+DEFAULT_TP_MAKER = False
+DEFAULT_TP_MAKER_FALLBACK_SEC = 5.0
 
 BAR_COLUMNS = [
     "bar_time",
@@ -248,6 +255,10 @@ class StateStore:
                 "last_ok_ts": None,
                 "last_closed_pnl_time": 0,
                 "last_exec_time": 0,
+            },
+            "entry_intent": {
+                "Buy": {},
+                "Sell": {},
             },
         }
 
@@ -876,11 +887,12 @@ class SafeExchange:
         sl: float = 0.0,
         reduce_only: bool = False,
         position_idx: Optional[int] = None,
+        order_link_id: Optional[str] = None,
     ) -> Dict:
         return self._call(
             "place_limit_order",
             self.exchange.place_limit_order,
-            side, price, qty, tp, sl, reduce_only, position_idx
+            side, price, qty, tp, sl, reduce_only, position_idx, order_link_id
         )
 
 
@@ -903,6 +915,24 @@ class SafeExchange:
         if not resp:
             return []
         return resp.get("result", {}).get("list", [])
+
+    def get_open_order(self, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Optional[Dict]:
+        if not order_id and not order_link_id:
+            return None
+
+        def _call_open():
+            params = {"category": "linear", "symbol": self.exchange.symbol}
+            if order_id:
+                params["orderId"] = order_id
+            if order_link_id:
+                params["orderLinkId"] = order_link_id
+            return self.exchange.session.get_open_orders(**params)
+
+        resp = self._call("get_open_order", _call_open)
+        if not resp:
+            return None
+        orders = resp.get("result", {}).get("list", [])
+        return orders[0] if orders else None
 
     def get_position_details(self) -> Dict:
         def _call_positions():
@@ -982,9 +1012,14 @@ class SafeExchange:
     def get_instrument_info(self) -> Dict:
         return self._call("fetch_instrument_info", self.exchange.fetch_instrument_info)
 
-    def cancel_order(self, order_id: str) -> bool:
+    def cancel_order(self, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> bool:
         def _cancel():
-            return self.exchange.session.cancel_order(category="linear", symbol=self.exchange.symbol, orderId=order_id)
+            params = {"category": "linear", "symbol": self.exchange.symbol}
+            if order_id:
+                params["orderId"] = order_id
+            if order_link_id:
+                params["orderLinkId"] = order_link_id
+            return self.exchange.session.cancel_order(**params)
         resp = self._call("cancel_order", _cancel)
         return bool(resp)
 
@@ -1038,10 +1073,16 @@ class LiveTradingV2:
         if self.max_last_bar_age_sec <= 0:
             self.max_last_bar_age_sec = float(self.tf_seconds)
         self.fast_bootstrap = args.fast_bootstrap
+        self.tp_maker = args.tp_maker
+        self.tp_maker_fallback_sec = max(0.0, args.tp_maker_fallback_sec)
         self.log_features = args.log_features
         self.log_feature_z = args.log_feature_z
         self.feature_z_threshold = args.feature_z_threshold
         self.feature_z_window = args.feature_z_window
+        self.orderlink_prefix = DEFAULT_ORDERLINK_PREFIX
+        self.postonly_retry_max = DEFAULT_POSTONLY_RETRY_MAX
+        self.rest_confirm_attempts = DEFAULT_REST_CONFIRM_ATTEMPTS
+        self.rest_confirm_sleep_sec = DEFAULT_REST_CONFIRM_SLEEP_SEC
         self.exchange_leverage = args.exchange_leverage
         self.use_ws_trades = args.use_ws_trades
         self.use_ws_ob = args.use_ws_ob
@@ -1100,6 +1141,7 @@ class LiveTradingV2:
         self.last_health: Optional[str] = None
         self.last_prediction: Dict[str, object] = {}
         self.last_feature_vector: Optional[Dict[str, object]] = None
+        self.last_feature_row: Optional[pd.Series] = None
 
         self.state = StateStore(Path(f"bot_state_{self.config.data.symbol}_v2.json"), self.config.data.symbol, self.logger)
         self.state.load()
@@ -1609,8 +1651,108 @@ class LiveTradingV2:
             return {}, {}
         return positions.get("long", {}), positions.get("short", {})
 
+    def _entry_intents(self) -> Dict[str, Dict]:
+        intents = self.state.state.get("entry_intent")
+        if not isinstance(intents, dict):
+            intents = {}
+        intents.setdefault("Buy", {})
+        intents.setdefault("Sell", {})
+        return intents
+
+    def _clear_entry_intent(
+        self,
+        side: str,
+        order_id: Optional[str] = None,
+        order_link_id: Optional[str] = None,
+    ) -> None:
+        if not side:
+            return
+        intents = self._entry_intents()
+        intent = intents.get(side, {})
+        if not intent:
+            return
+        if order_id and intent.get("order_id") != order_id:
+            if not order_link_id or intent.get("order_link_id") != order_link_id:
+                return
+        if order_link_id and intent.get("order_link_id") != order_link_id:
+            return
+        intents[side] = {}
+        self.state.state["entry_intent"] = intents
+
+    def _new_order_link_id(self, kind: str, side: str) -> str:
+        kind_code = (kind or "X")[0].upper()
+        side_code = "B" if side == "Buy" else "S"
+        suffix = uuid.uuid4().hex[:16]
+        return f"{self.orderlink_prefix}{kind_code}{side_code}{suffix}"
+
+    def _is_post_only_reject(self, ret_code: Optional[int], ret_msg: str) -> bool:
+        msg = (ret_msg or "").lower()
+        if ret_code in {110017}:
+            return True
+        if "postonly" in msg or "post only" in msg:
+            return True
+        if "maker" in msg and "taker" in msg:
+            return True
+        if "immediate" in msg and "execute" in msg:
+            return True
+        return False
+
+    def _is_duplicate_order_link(self, ret_code: Optional[int], ret_msg: str) -> bool:
+        msg = (ret_msg or "").lower()
+        if ret_code in {110041}:
+            return True
+        if "orderlink" in msg and ("duplicate" in msg or "exist" in msg):
+            return True
+        return False
+
+    def _get_state_order(self, order_id: Optional[str], order_link_id: Optional[str]) -> Optional[Dict]:
+        orders = self.state.state.get("active_orders", {})
+        if order_id and order_id in orders:
+            return orders.get(order_id)
+        if order_link_id:
+            for info in orders.values():
+                if info.get("order_link_id") == order_link_id:
+                    return info
+        return None
+
+    def _confirm_order_resting(
+        self,
+        order_id: Optional[str],
+        order_link_id: Optional[str],
+    ) -> Optional[Dict]:
+        for attempt in range(self.rest_confirm_attempts):
+            if self.use_ws_private:
+                self._process_ws_private()
+                state_order = self._get_state_order(order_id, order_link_id)
+                if state_order:
+                    return state_order
+                if attempt < self.rest_confirm_attempts - 1:
+                    time.sleep(self.rest_confirm_sleep_sec)
+                    continue
+            if order_id or order_link_id:
+                order = self.api.get_open_order(order_id=order_id, order_link_id=order_link_id)
+                if order:
+                    return order
+            if attempt < self.rest_confirm_attempts - 1:
+                time.sleep(self.rest_confirm_sleep_sec)
+        return None
+
+    def _tp_order_needs_resize(self, pos: Dict, size: float) -> bool:
+        tp_qty = safe_float(pos.get("tp_order_qty"))
+        if tp_qty <= 0:
+            return False
+        desired = abs(size)
+        if desired <= 0:
+            return False
+        qty_step = self.instrument.qty_step
+        tolerance = max(qty_step, desired * 0.01)
+        return abs(tp_qty - desired) >= tolerance
+
     def _position_size(self, pos: Dict) -> float:
         return safe_float(pos.get("size")) if pos else 0.0
+
+    def _is_external_position(self, pos: Dict) -> bool:
+        return bool(pos.get("external")) if pos else False
 
     def _position_key(self, side: Optional[str], position_idx: int = 0) -> Optional[str]:
         if position_idx == 1:
@@ -1942,10 +2084,11 @@ class LiveTradingV2:
         if order.get("symbol") != self.config.data.symbol:
             return False
         if self._is_protective_order(order):
-            return False
+            return self._apply_ws_tp_order_update(order)
         oid = order.get("orderId")
         if not oid:
             return False
+        order_link_id = order.get("orderLinkId")
         status = str(order.get("orderStatus") or "").lower()
         leaves_qty = safe_float(order.get("leavesQty"))
         create_type = str(order.get("createType") or "").lower()
@@ -1954,6 +2097,20 @@ class LiveTradingV2:
 
         if status in closed_statuses or (leaves_qty == 0 and status):
             if oid in state_orders:
+                side = order.get("side")
+                if side:
+                    if status == "filled":
+                        intents = self._entry_intents()
+                        intent = intents.get(side, {})
+                        if intent and (
+                            intent.get("order_id") == oid
+                            or (order_link_id and intent.get("order_link_id") == order_link_id)
+                        ):
+                            intent["filled"] = True
+                            intents[side] = intent
+                            self.state.state["entry_intent"] = intents
+                    else:
+                        self._clear_entry_intent(side, oid, order_link_id)
                 state_orders.pop(oid, None)
                 return True
             return False
@@ -1981,12 +2138,88 @@ class LiveTradingV2:
                 "qty": qty,
                 "tp": tp,
                 "sl": sl,
+                "atr_at_entry": safe_float(existing.get("atr_at_entry")),
                 "created_bar_time": created_bar,
                 "created_ts": utc_now_str(),
                 "external": external,
+                "order_link_id": order_link_id or existing.get("order_link_id"),
             }
             return True
 
+        return False
+
+    def _apply_ws_tp_order_update(self, order: Dict) -> bool:
+        if order.get("symbol") != self.config.data.symbol:
+            return False
+        oid = order.get("orderId")
+        order_link_id = order.get("orderLinkId")
+        if not oid and not order_link_id:
+            return False
+        status = str(order.get("orderStatus") or "").lower()
+        leaves_qty = safe_float(order.get("leavesQty"))
+        closed_statuses = {"cancelled", "filled", "deactivated", "rejected"}
+        is_closed = status in closed_statuses or (leaves_qty == 0 and status)
+        price = safe_float(order.get("price"))
+        qty = leaves_qty if leaves_qty > 0 else safe_float(order.get("qty"))
+
+        def _matches(pos: Dict) -> bool:
+            tp_oid = pos.get("tp_order_id")
+            tp_link = pos.get("tp_order_link_id")
+            if tp_oid and oid and tp_oid == oid:
+                return True
+            if tp_link and order_link_id and tp_link == order_link_id:
+                return True
+            return False
+
+        updated = False
+        if self.hedge_mode:
+            positions = self.state.state.get("positions", {})
+            if not isinstance(positions, dict):
+                return False
+            for key in ("long", "short"):
+                pos = positions.get(key, {})
+                if not pos or not _matches(pos):
+                    continue
+                if is_closed:
+                    pos["tp_order_id"] = None
+                    pos["tp_order_link_id"] = None
+                    pos["tp_order_price"] = None
+                    pos["tp_order_qty"] = None
+                    pos["tp_order_ts"] = None
+                    pos["tp_trigger_seen_ts"] = None
+                else:
+                    pos["tp_order_id"] = oid or pos.get("tp_order_id")
+                    pos["tp_order_link_id"] = order_link_id or pos.get("tp_order_link_id")
+                    if price > 0:
+                        pos["tp_order_price"] = price
+                    if qty > 0:
+                        pos["tp_order_qty"] = qty
+                    pos["tp_order_ts"] = pos.get("tp_order_ts") or time.time()
+                positions[key] = pos
+                updated = True
+            if updated:
+                self.state.state["positions"] = positions
+            return updated
+
+        pos = self.state.state.get("position", {})
+        if pos and _matches(pos):
+            if is_closed:
+                pos["tp_order_id"] = None
+                pos["tp_order_link_id"] = None
+                pos["tp_order_price"] = None
+                pos["tp_order_qty"] = None
+                pos["tp_order_ts"] = None
+                pos["tp_trigger_seen_ts"] = None
+            else:
+                pos["tp_order_id"] = oid or pos.get("tp_order_id")
+                pos["tp_order_link_id"] = order_link_id or pos.get("tp_order_link_id")
+                if price > 0:
+                    pos["tp_order_price"] = price
+                if qty > 0:
+                    pos["tp_order_qty"] = qty
+                pos["tp_order_ts"] = pos.get("tp_order_ts") or time.time()
+            self.state.state["position"] = pos
+            return True
         return False
 
     def _apply_ws_position_update(self, pos: Dict) -> bool:
@@ -2028,6 +2261,8 @@ class LiveTradingV2:
             if created_time > 0:
                 entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
             if not pos_state:
+                intent = self._entry_intents().get(side, {})
+                external = not bool(intent)
                 pos_state = {
                     "side": side,
                     "size": size,
@@ -2037,7 +2272,10 @@ class LiveTradingV2:
                     "tp_sl_set": False,
                     "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
                     "position_idx": position_idx,
+                    "external": external,
                 }
+                if external:
+                    self.logger.warning("External position detected. Pausing new entries.")
 
             pos_state.update({
                 "side": side,
@@ -2051,11 +2289,19 @@ class LiveTradingV2:
                 "tpsl_mode": tpsl_mode,
                 "entry_ts_ms": pos_state.get("entry_ts_ms"),
                 "position_idx": position_idx,
+                "external": pos_state.get("external", False),
             })
             if stop_loss > 0 or take_profit > 0:
                 pos_state["tp_sl_set"] = True
             positions[key] = pos_state
             self.state.state["positions"] = positions
+            if self.tp_maker:
+                if not pos_state.get("external"):
+                    seeded = self._seed_tp_sl_from_order(pos_state, side)
+                    latest_row = None if seeded else self.last_feature_row
+                    self._ensure_tp_sl(latest_row, pos_state, side, position_idx=position_idx, state_key=key)
+                    if pos_state.get("tp_target") or pos_state.get("sl_target"):
+                        self._clear_entry_intent(side)
             return True
 
         pos_state = self.state.state.get("position", {})
@@ -2063,6 +2309,8 @@ class LiveTradingV2:
             entry_bar_time = self.state.state.get("last_bar_time")
             if created_time > 0:
                 entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
+            intent = self._entry_intents().get(side, {})
+            external = not bool(intent)
             pos_state = {
                 "side": side,
                 "size": size,
@@ -2071,7 +2319,10 @@ class LiveTradingV2:
                 "created_ts": utc_now_str(),
                 "tp_sl_set": False,
                 "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
+                "external": external,
             }
+            if external:
+                self.logger.warning("External position detected. Pausing new entries.")
 
         pos_state.update({
             "side": side,
@@ -2084,10 +2335,18 @@ class LiveTradingV2:
             "take_profit": take_profit,
             "tpsl_mode": tpsl_mode,
             "entry_ts_ms": pos_state.get("entry_ts_ms"),
+            "external": pos_state.get("external", False),
         })
         if stop_loss > 0 or take_profit > 0:
             pos_state["tp_sl_set"] = True
         self.state.state["position"] = pos_state
+        if self.tp_maker:
+            if not pos_state.get("external"):
+                seeded = self._seed_tp_sl_from_order(pos_state, side)
+                latest_row = None if seeded else self.last_feature_row
+                self._ensure_tp_sl(latest_row, pos_state, side)
+                if pos_state.get("tp_target") or pos_state.get("sl_target"):
+                    self._clear_entry_intent(side)
         return True
 
     def _apply_ws_execution_update(self, execution: Dict) -> bool:
@@ -2149,6 +2408,9 @@ class LiveTradingV2:
         self.logger.info(f"Limit Offset ATR: {self.config.strategy.base_limit_offset_atr:.3f}")
         self.logger.info(f"TP ATR: {self.config.strategy.take_profit_atr:.3f}")
         self.logger.info(f"SL ATR: {self.config.strategy.stop_loss_atr:.3f}")
+        self.logger.info(
+            f"TP Maker: {self.tp_maker} | TP Fallback: {self.tp_maker_fallback_sec:.1f}s"
+        )
         self.logger.info(f"Order Timeout Bars: {self.config.strategy.time_limit_bars}")
         self.logger.info(f"Max Holding Bars: {self.config.strategy.max_holding_bars}")
         self.logger.info(f"Risk Per Trade: {self.config.strategy.risk_per_trade:.3f}")
@@ -2248,6 +2510,8 @@ class LiveTradingV2:
         else:
             position = self.api.get_position_details()
         state_orders = self.state.state.get("active_orders", {})
+        if isinstance(open_orders, list):
+            self._sync_tp_orders(open_orders)
 
         if self.log_open_orders_raw and isinstance(open_orders, list):
             sig = self._open_orders_signature(open_orders)
@@ -2283,12 +2547,17 @@ class LiveTradingV2:
                     "created_bar_time": created_bar,
                     "created_ts": utc_now_str(),
                     "external": True,
+                    "order_link_id": o.get("orderLinkId"),
                 }
                 self.logger.warning(f"External order detected: {oid}")
 
         missing = [oid for oid in state_orders.keys() if oid not in active_ids]
         for oid in missing:
+            side = state_orders.get(oid, {}).get("side")
+            order_link_id = state_orders.get(oid, {}).get("order_link_id")
             state_orders.pop(oid, None)
+            if side:
+                self._clear_entry_intent(side, oid, order_link_id)
 
         self.state.state["active_orders"] = state_orders
 
@@ -2314,10 +2583,13 @@ class LiveTradingV2:
                 created_time = safe_int(pos.get("created_time"))
                 pos_state = positions_state.get(key, {})
                 if not pos_state:
-                    self.logger.warning("External position detected. Taking ownership.")
                     entry_bar_time = self.state.state.get("last_bar_time")
                     if created_time > 0:
                         entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
+                    intent = self._entry_intents().get(side, {})
+                    external = not bool(intent)
+                    if external:
+                        self.logger.warning("External position detected. Pausing new entries.")
                     pos_state = {
                         "side": side,
                         "size": pos_size,
@@ -2327,6 +2599,7 @@ class LiveTradingV2:
                         "tp_sl_set": False,
                         "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
                         "position_idx": safe_int(pos.get("position_idx")),
+                        "external": external,
                     }
                 pos_state.update({
                     "side": side,
@@ -2340,10 +2613,17 @@ class LiveTradingV2:
                     "tpsl_mode": tpsl_mode,
                     "entry_ts_ms": pos_state.get("entry_ts_ms"),
                     "position_idx": safe_int(pos.get("position_idx")),
+                    "external": pos_state.get("external", False),
                 })
                 if stop_loss > 0 or take_profit > 0:
                     pos_state["tp_sl_set"] = True
                 positions_state[key] = pos_state
+                if self.tp_maker and not pos_state.get("external"):
+                    seeded = self._seed_tp_sl_from_order(pos_state, side)
+                    latest_row = None if seeded else self.last_feature_row
+                    self._ensure_tp_sl(latest_row, pos_state, side, position_idx=safe_int(pos.get("position_idx")), state_key=key)
+                    if pos_state.get("tp_target") or pos_state.get("sl_target"):
+                        self._clear_entry_intent(side)
 
             for key in ("long", "short"):
                 if key not in seen_keys and positions_state.get(key):
@@ -2366,10 +2646,13 @@ class LiveTradingV2:
                 created_time = safe_int(position.get("created_time"))
                 pos_state = self.state.state.get("position", {})
                 if not pos_state:
-                    self.logger.warning("External position detected. Taking ownership.")
                     entry_bar_time = self.state.state.get("last_bar_time")
                     if created_time > 0:
                         entry_bar_time = bar_time_from_ts(created_time / 1000.0, self.tf_seconds)
+                    intent = self._entry_intents().get(side, {})
+                    external = not bool(intent)
+                    if external:
+                        self.logger.warning("External position detected. Pausing new entries.")
                     pos_state = {
                         "side": side,
                         "size": pos_size,
@@ -2378,6 +2661,7 @@ class LiveTradingV2:
                         "created_ts": utc_now_str(),
                         "tp_sl_set": False,
                         "entry_ts_ms": created_time if created_time > 0 else int(time.time() * 1000),
+                        "external": external,
                     }
                 pos_state.update({
                     "side": side,
@@ -2390,10 +2674,17 @@ class LiveTradingV2:
                     "take_profit": take_profit,
                     "tpsl_mode": tpsl_mode,
                     "entry_ts_ms": pos_state.get("entry_ts_ms"),
+                    "external": pos_state.get("external", False),
                 })
                 if stop_loss > 0 or take_profit > 0:
                     pos_state["tp_sl_set"] = True
                 self.state.state["position"] = pos_state
+                if self.tp_maker and not pos_state.get("external"):
+                    seeded = self._seed_tp_sl_from_order(pos_state, side)
+                    latest_row = None if seeded else self.last_feature_row
+                    self._ensure_tp_sl(latest_row, pos_state, side)
+                    if pos_state.get("tp_target") or pos_state.get("sl_target"):
+                        self._clear_entry_intent(side)
         self._update_closed_pnl()
 
         self.state.save()
@@ -2441,9 +2732,279 @@ class LiveTradingV2:
         self.state.state["metrics"] = metrics
         self.logger.info(f"Closed PnL update: {total_pnl:.4f} ({len(new_records)} fills)")
 
+    def _compute_tp_sl_targets(self, side: str, entry_price: float, atr: float) -> Tuple[float, float]:
+        if entry_price <= 0 or atr <= 0:
+            return 0.0, 0.0
+        tp_atr = self.config.strategy.take_profit_atr
+        sl_atr = self.config.strategy.stop_loss_atr
+        tick = self.instrument.tick_size
+
+        if side == "Buy":
+            tp = entry_price + (atr * tp_atr)
+            sl = entry_price - (atr * sl_atr)
+            if tick > 0:
+                tp = math.ceil(tp / tick) * tick
+                sl = math.floor(sl / tick) * tick
+        else:
+            tp = entry_price - (atr * tp_atr)
+            sl = entry_price + (atr * sl_atr)
+            if tick > 0:
+                tp = math.floor(tp / tick) * tick
+                sl = math.ceil(sl / tick) * tick
+        return tp, sl
+
+    def _match_active_order_for_side(self, side: str, entry_price: float) -> Optional[Dict]:
+        orders = self.state.state.get("active_orders", {})
+        if not orders:
+            return None
+        candidates = []
+        for info in orders.values():
+            if info.get("side") != side:
+                continue
+            candidates.append(info)
+        if not candidates:
+            return None
+        if entry_price > 0:
+            return min(candidates, key=lambda info: abs(safe_float(info.get("price")) - entry_price))
+        return max(candidates, key=lambda info: safe_int(info.get("created_bar_time"), 0))
+
+    def _seed_tp_sl_from_order(self, pos: Dict, side: str) -> bool:
+        entry_price = safe_float(pos.get("entry_price"))
+        intents = self._entry_intents()
+        intent = intents.get(side, {})
+        if intent:
+            atr = safe_float(intent.get("atr_at_entry"))
+            tp = safe_float(intent.get("tp"))
+            sl = safe_float(intent.get("sl"))
+            if atr > 0 and entry_price > 0:
+                tp, sl = self._compute_tp_sl_targets(side, entry_price, atr)
+            if tp > 0:
+                pos["tp_target"] = tp
+            if sl > 0:
+                pos["sl_target"] = sl
+            pos["tp_seed_source"] = "entry_intent"
+            return tp > 0 and sl > 0
+        info = self._match_active_order_for_side(side, entry_price)
+        if not info:
+            return False
+        atr = safe_float(info.get("atr_at_entry"))
+        if atr > 0 and entry_price > 0:
+            tp, sl = self._compute_tp_sl_targets(side, entry_price, atr)
+        else:
+            tp = safe_float(info.get("tp"))
+            sl = safe_float(info.get("sl"))
+        if tp > 0:
+            pos["tp_target"] = tp
+        if sl > 0:
+            pos["sl_target"] = sl
+        pos["tp_seed_source"] = "active_order"
+        return tp > 0 and sl > 0
+
+    def _place_tp_limit_order(
+        self,
+        side: str,
+        size: float,
+        tp_price: float,
+        position_idx: Optional[int] = None,
+        order_link_id: Optional[str] = None,
+    ) -> Optional[str]:
+        tick = self.instrument.tick_size
+        if tick > 0:
+            if side == "Buy":
+                tp_price = round_up(tp_price, tick)
+            else:
+                tp_price = round_down(tp_price, tick)
+        if tp_price <= 0:
+            return None
+        qty = abs(size)
+        if qty <= 0:
+            return None
+        order_side = "Sell" if side == "Buy" else "Buy"
+        resp = self.api.place_limit_order(
+            order_side,
+            tp_price,
+            qty,
+            tp=0.0,
+            sl=0.0,
+            reduce_only=True,
+            position_idx=position_idx,
+            order_link_id=order_link_id,
+        )
+        if resp is None:
+            if order_link_id:
+                order = self.api.get_open_order(order_link_id=order_link_id)
+                if order and order.get("orderId"):
+                    return order.get("orderId")
+            self.logger.error("TP limit placement failed (transport error).")
+            return None
+        ret_code = resp.get("retCode")
+        if ret_code != 0:
+            ret_msg = resp.get("retMsg")
+            if self._is_duplicate_order_link(ret_code, ret_msg) and order_link_id:
+                order = self.api.get_open_order(order_link_id=order_link_id)
+                if order and order.get("orderId"):
+                    return order.get("orderId")
+            self.logger.error(f"TP limit rejected: retCode={ret_code} retMsg={ret_msg}")
+            return None
+        order_id = (resp.get("result") or {}).get("orderId")
+        if not order_id:
+            if order_link_id:
+                order = self.api.get_open_order(order_link_id=order_link_id)
+                if order and order.get("orderId"):
+                    return order.get("orderId")
+            self.logger.error(f"TP limit response missing orderId: {resp}")
+            return None
+        self.logger.info(f"TP limit placed: {order_side} {qty:.6f} @ {tp_price:.6f}")
+        return order_id
+
+    def _sync_tp_orders(self, open_orders: List[Dict]) -> None:
+        if not open_orders:
+            return
+        by_id = {o.get("orderId"): o for o in open_orders if o.get("orderId")}
+        by_link = {o.get("orderLinkId"): o for o in open_orders if o.get("orderLinkId")}
+
+        def _sync_pos(pos: Dict) -> bool:
+            if not pos:
+                return False
+            tp_oid = pos.get("tp_order_id")
+            tp_link = pos.get("tp_order_link_id")
+            order = None
+            if tp_oid and tp_oid in by_id:
+                order = by_id.get(tp_oid)
+            elif tp_link and tp_link in by_link:
+                order = by_link.get(tp_link)
+            if order:
+                pos["tp_order_id"] = order.get("orderId") or tp_oid
+                pos["tp_order_link_id"] = order.get("orderLinkId") or tp_link
+                price = safe_float(order.get("price"))
+                if price > 0:
+                    pos["tp_order_price"] = price
+                leaves = safe_float(order.get("leavesQty"))
+                qty = leaves if leaves > 0 else safe_float(order.get("qty"))
+                if qty > 0:
+                    pos["tp_order_qty"] = qty
+                pos["tp_order_ts"] = pos.get("tp_order_ts") or time.time()
+                pos["tp_trigger_seen_ts"] = None
+                return True
+            if tp_oid or tp_link:
+                pos["tp_order_id"] = None
+                pos["tp_order_link_id"] = None
+                pos["tp_order_ts"] = None
+                pos["tp_order_price"] = None
+                pos["tp_order_qty"] = None
+                pos["tp_trigger_seen_ts"] = None
+                return True
+            return False
+
+        updated = False
+        if self.hedge_mode:
+            positions = self.state.state.get("positions", {})
+            if not isinstance(positions, dict):
+                return
+            for key in ("long", "short"):
+                pos = positions.get(key, {})
+                if _sync_pos(pos):
+                    positions[key] = pos
+                    updated = True
+            if updated:
+                self.state.state["positions"] = positions
+            return
+
+        pos = self.state.state.get("position", {})
+        if _sync_pos(pos):
+            self.state.state["position"] = pos
+
+    def _latest_tp_reference_price(self, pos: Dict) -> float:
+        last_trade = safe_float(self.bar_window.trade_builder.last_price)
+        if last_trade > 0:
+            return last_trade
+        mark_price = safe_float(pos.get("mark_price"))
+        if mark_price > 0:
+            return mark_price
+        return safe_float(self.bar_window.latest_close())
+
+    def _check_tp_limit_fallback(self, now: Optional[float] = None) -> None:
+        if not self.tp_maker or self.dry_run:
+            return
+        if self.tp_maker_fallback_sec <= 0:
+            return
+        now = now or time.time()
+        updated = False
+        if self.hedge_mode:
+            positions = self.state.state.get("positions", {})
+            if not isinstance(positions, dict):
+                return
+            for key in ("long", "short"):
+                pos = positions.get(key, {})
+                if self._check_tp_fallback_for_position(pos, now):
+                    positions[key] = pos
+                    updated = True
+            if updated:
+                self.state.state["positions"] = positions
+                self.state.save()
+            return
+
+        pos = self.state.state.get("position", {})
+        if self._check_tp_fallback_for_position(pos, now):
+            self.state.state["position"] = pos
+            self.state.save()
+
+    def _check_tp_fallback_for_position(self, pos: Dict, now: float) -> bool:
+        if not pos:
+            return False
+        if pos.get("tp_mode") != "maker":
+            return False
+        tp_order_id = pos.get("tp_order_id")
+        tp_price = safe_float(pos.get("tp_order_price") or pos.get("tp_target"))
+        if not tp_order_id or tp_price <= 0:
+            return False
+        size = safe_float(pos.get("size"))
+        if size <= 0:
+            pos["tp_order_id"] = None
+            pos["tp_order_link_id"] = None
+            pos["tp_order_ts"] = None
+            pos["tp_order_price"] = None
+            pos["tp_order_qty"] = None
+            pos["tp_trigger_seen_ts"] = None
+            return True
+        side = pos.get("side")
+        if side not in {"Buy", "Sell"}:
+            return False
+        price = self._latest_tp_reference_price(pos)
+        if price <= 0:
+            return False
+        crossed = price >= tp_price if side == "Buy" else price <= tp_price
+        trigger_ts = pos.get("tp_trigger_seen_ts")
+        if crossed:
+            if not trigger_ts:
+                pos["tp_trigger_seen_ts"] = now
+                return True
+            if (now - trigger_ts) >= self.tp_maker_fallback_sec:
+                position_idx = safe_int(pos.get("position_idx")) if self.hedge_mode else None
+                self.logger.warning(
+                    f"TP limit fallback triggered for {side} (price={price:.6f} tp={tp_price:.6f})."
+                )
+                if not self.dry_run:
+                    if tp_order_id:
+                        self.api.cancel_order(tp_order_id, pos.get("tp_order_link_id"))
+                    self.api.market_close(side, abs(size), position_idx=position_idx)
+                pos["tp_order_id"] = None
+                pos["tp_order_link_id"] = None
+                pos["tp_order_ts"] = None
+                pos["tp_order_price"] = None
+                pos["tp_order_qty"] = None
+                pos["tp_trigger_seen_ts"] = None
+                pos["tp_mode"] = "market"
+                return True
+        else:
+            if trigger_ts is not None:
+                pos["tp_trigger_seen_ts"] = None
+                return True
+        return False
+
     def _ensure_tp_sl(
         self,
-        latest_row: pd.Series,
+        latest_row: Optional[pd.Series],
         pos: Optional[Dict] = None,
         side: Optional[str] = None,
         position_idx: Optional[int] = None,
@@ -2455,28 +3016,119 @@ class LiveTradingV2:
             pos = self.state.state.get("position", {})
         if not pos:
             return
-        if pos.get("tp_sl_set"):
-            return
         size = safe_float(pos.get("size"))
         entry_price = safe_float(pos.get("entry_price"))
         if size <= 0 or entry_price <= 0:
             return
         side = side or pos.get("side")
-        atr = safe_float(latest_row.get("atr"))
-        if atr <= 0:
-            return
-        tp_atr = self.config.strategy.take_profit_atr
-        sl_atr = self.config.strategy.stop_loss_atr
+        atr = 0.0
+        if latest_row is not None:
+            atr = safe_float(latest_row.get("atr"))
+        tp_target = safe_float(pos.get("tp_target"))
+        sl_target = safe_float(pos.get("sl_target"))
+        if tp_target <= 0:
+            tp_target = safe_float(pos.get("take_profit"))
+        if sl_target <= 0:
+            sl_target = safe_float(pos.get("stop_loss"))
+        if tp_target <= 0 or sl_target <= 0:
+            if atr <= 0:
+                return
+            tp_target, sl_target = self._compute_tp_sl_targets(side, entry_price, atr)
+        if tp_target > 0:
+            pos["tp_target"] = tp_target
+        if sl_target > 0:
+            pos["sl_target"] = sl_target
+        if pos.get("tp_sl_set"):
+            if not self.tp_maker:
+                return
+            if pos.get("tp_mode") == "market":
+                return
+            tp_order_id = pos.get("tp_order_id")
+            if tp_order_id:
+                if not self._tp_order_needs_resize(pos, size):
+                    return
+                self.logger.info("TP limit size mismatch; replacing order.")
+                if not self.dry_run:
+                    self.api.cancel_order(tp_order_id, pos.get("tp_order_link_id"))
+                new_link_id = self._new_order_link_id("T", side)
+                new_tp_id = self._place_tp_limit_order(
+                    side,
+                    size,
+                    tp_target,
+                    position_idx=position_idx,
+                    order_link_id=new_link_id,
+                )
+                if new_tp_id:
+                    pos["tp_order_id"] = new_tp_id
+                    pos["tp_order_link_id"] = new_link_id
+                    pos["tp_order_ts"] = time.time()
+                    pos["tp_order_price"] = tp_target
+                    pos["tp_order_qty"] = abs(size)
+                    pos["tp_trigger_seen_ts"] = None
+                    pos["tp_mode"] = "maker"
+                    pos["tp_sl_set"] = True
+                    self.logger.info(
+                        f"TP limit resized: {side} {abs(size):.6f} @ {tp_target:.6f}"
+                    )
+                else:
+                    pos["tp_order_id"] = None
+                    pos["tp_order_link_id"] = None
+                    pos["tp_order_qty"] = None
+                    self.logger.warning("TP limit resize failed; keeping existing SL.")
+                if self.hedge_mode and state_key:
+                    positions = self.state.state.get("positions", {})
+                    positions[state_key] = pos
+                    self.state.state["positions"] = positions
+                else:
+                    self.state.state["position"] = pos
+                self.state.save()
+                return
 
-        if side == "Buy":
-            tp = entry_price + (atr * tp_atr)
-            sl = entry_price - (atr * sl_atr)
+        if self.tp_maker:
+            self.api.set_tp_sl(side, size, tp=0.0, sl=sl_target, position_idx=position_idx)
+            tp_order_id = pos.get("tp_order_id")
+            tp_link_id = pos.get("tp_order_link_id")
+            if not tp_order_id:
+                tp_link_id = self._new_order_link_id("T", side)
+                tp_order_id = self._place_tp_limit_order(
+                    side,
+                    size,
+                    tp_target,
+                    position_idx=position_idx,
+                    order_link_id=tp_link_id,
+                )
+            if tp_order_id:
+                pos["tp_order_id"] = tp_order_id
+                if tp_link_id and not pos.get("tp_order_link_id"):
+                    pos["tp_order_link_id"] = tp_link_id
+                pos["tp_order_ts"] = pos.get("tp_order_ts") or time.time()
+                pos["tp_order_price"] = tp_target
+                pos["tp_order_qty"] = abs(size)
+                pos["tp_trigger_seen_ts"] = None
+                pos["tp_mode"] = "maker"
+                pos["tp_sl_set"] = True
+                self.logger.info(
+                    f"TP/SL set (maker TP) for position: TP={tp_target:.6f} SL={sl_target:.6f}"
+                )
+            else:
+                self.logger.warning("TP limit placement failed; falling back to market TP.")
+                self.api.set_tp_sl(side, size, tp=tp_target, sl=sl_target, position_idx=position_idx)
+                pos["tp_order_id"] = None
+                pos["tp_order_link_id"] = None
+                pos["tp_order_qty"] = None
+                pos["tp_mode"] = "market"
+                pos["tp_sl_set"] = True
+                self.logger.info(
+                    f"TP/SL set (market TP) for position: TP={tp_target:.6f} SL={sl_target:.6f}"
+                )
         else:
-            tp = entry_price - (atr * tp_atr)
-            sl = entry_price + (atr * sl_atr)
-
-        self.api.set_tp_sl(side, size, tp, sl, position_idx=position_idx)
-        pos["tp_sl_set"] = True
+            self.api.set_tp_sl(side, size, tp_target, sl_target, position_idx=position_idx)
+            pos["tp_sl_set"] = True
+            pos["tp_mode"] = "market"
+            pos["tp_order_id"] = None
+            pos["tp_order_link_id"] = None
+            pos["tp_order_qty"] = None
+            self.logger.info(f"TP/SL set for position: TP={tp_target:.6f} SL={sl_target:.6f}")
         if self.hedge_mode and state_key:
             positions = self.state.state.get("positions", {})
             positions[state_key] = pos
@@ -2484,7 +3136,6 @@ class LiveTradingV2:
         else:
             self.state.state["position"] = pos
         self.state.save()
-        self.logger.info(f"TP/SL set for position: TP={tp:.6f} SL={sl:.6f}")
 
     def _expire_orders(self, bar_time: int) -> None:
         orders = self.state.state.get("active_orders", {})
@@ -2502,8 +3153,12 @@ class LiveTradingV2:
             return
         for oid in expired:
             if not self.dry_run:
-                self.api.cancel_order(oid)
+                self.api.cancel_order(oid, orders.get(oid, {}).get("order_link_id"))
+            side = orders.get(oid, {}).get("side")
+            order_link_id = orders.get(oid, {}).get("order_link_id")
             orders.pop(oid, None)
+            if side:
+                self._clear_entry_intent(side, oid, order_link_id)
             self.logger.info(f"Order expired and canceled: {oid}")
         self.state.state["active_orders"] = orders
         self.state.save()
@@ -2514,8 +3169,12 @@ class LiveTradingV2:
             return
         for oid in list(orders.keys()):
             if not self.dry_run:
-                self.api.cancel_order(oid)
+                self.api.cancel_order(oid, orders.get(oid, {}).get("order_link_id"))
+            side = orders.get(oid, {}).get("side")
+            order_link_id = orders.get(oid, {}).get("order_link_id")
             orders.pop(oid, None)
+            if side:
+                self._clear_entry_intent(side, oid, order_link_id)
         self.state.state["active_orders"] = orders
         self.state.save()
         self.logger.info(f"Active orders canceled ({reason}).")
@@ -2531,8 +3190,9 @@ class LiveTradingV2:
         for oid, info in list(orders.items()):
             if info.get("side") in sides_set:
                 if not self.dry_run:
-                    self.api.cancel_order(oid)
+                    self.api.cancel_order(oid, info.get("order_link_id"))
                 orders.pop(oid, None)
+                self._clear_entry_intent(info.get("side"), oid, info.get("order_link_id"))
                 canceled.append(oid)
         if canceled:
             self.state.state["active_orders"] = orders
@@ -2579,6 +3239,7 @@ class LiveTradingV2:
                     str(o.get("orderType") or ""),
                     str(o.get("stopOrderType") or ""),
                     str(o.get("createType") or ""),
+                    str(o.get("orderLinkId") or ""),
                     safe_bool(o.get("reduceOnly")),
                     safe_bool(o.get("closeOnTrigger")),
                     str(o.get("takeProfit") or ""),
@@ -2703,51 +3364,88 @@ class LiveTradingV2:
         if self.dry_run:
             return "dry_run"
 
-        # Attaching TP and SL to the limit position right away
-        tp_atr = self.config.strategy.take_profit_atr
-        sl_atr = self.config.strategy.stop_loss_atr
-        tick = self.instrument.tick_size
+        order_link_id = self._new_order_link_id("E", side)
+        position_idx = 1 if self.hedge_mode and side == "Buy" else 2 if self.hedge_mode else None
+        tp, sl = self._compute_tp_sl_targets(side, price, atr)
+        order_tp = tp if not self.tp_maker else 0.0
+        order_id: Optional[str] = None
+        order_info: Optional[Dict] = None
 
-        def round_to_tick(x: float, tick: float, mode: str) -> float:
-            if tick <= 0:
-                return x
-            if mode == "up":
-                return math.ceil(x / tick) * tick
-            return math.floor(x / tick) * tick
+        for attempt in range(self.postonly_retry_max + 1):
+            resp = self.api.place_limit_order(
+                side,
+                price,
+                qty,
+                tp=order_tp,
+                sl=sl,
+                reduce_only=False,
+                position_idx=position_idx,
+                order_link_id=order_link_id,
+            )
+            if resp is None:
+                order_info = self.api.get_open_order(order_link_id=order_link_id)
+                if order_info and order_info.get("orderId"):
+                    order_id = order_info.get("orderId")
+                    break
+                self.logger.error("place_limit_order returned None (exception / transport failure).")
+                return None
 
-        if side == "Buy":
-            tp = price + (atr * tp_atr)
-            sl = price - (atr * sl_atr)
-            # Widen slightly to reduce rejection risk from min-distance rules.
-            tp = round_to_tick(tp, tick, "up")    # further away (higher)
-            sl = round_to_tick(sl, tick, "down")  # further away (lower)
-        else:
-            tp = price - (atr * tp_atr)
-            sl = price + (atr * sl_atr)
-            tp = round_to_tick(tp, tick, "down")  # further away (lower)
-            sl = round_to_tick(sl, tick, "up")    # further away (higher)
+            ret_code = resp.get("retCode")
+            ret_msg = resp.get("retMsg")
+            if ret_code == 0:
+                order_id = (resp.get("result") or {}).get("orderId")
+                if not order_id:
+                    order_info = self.api.get_open_order(order_link_id=order_link_id)
+                    if order_info and order_info.get("orderId"):
+                        order_id = order_info.get("orderId")
+                        break
+                    self.logger.error(f"Bybit response missing orderId: {resp}")
+                    return None
+                break
 
-        position_idx = None
-        if self.hedge_mode:
-            position_idx = 1 if side == "Buy" else 2
-        resp = self.api.place_limit_order(
-            side, price, qty, tp=tp, sl=sl, reduce_only=False, position_idx=position_idx
-        )
-        
-        if resp is None:
-            # Transport/exception path (ExchangeClient caught exception and returned None)
-            self.logger.error("place_limit_order returned None (exception / transport failure).")
+            if self._is_duplicate_order_link(ret_code, ret_msg):
+                order_info = self.api.get_open_order(order_link_id=order_link_id)
+                if order_info and order_info.get("orderId"):
+                    order_id = order_info.get("orderId")
+                    break
+                self.logger.error(f"Duplicate orderLinkId but open order not found: {ret_msg}")
+                return None
+
+            if self._is_post_only_reject(ret_code, ret_msg) and attempt < self.postonly_retry_max:
+                if tick <= 0:
+                    self.logger.error("PostOnly reject but tick size is unknown; aborting.")
+                    return None
+                if side == "Buy":
+                    price = round_down(price - tick, tick)
+                else:
+                    price = round_up(price + tick, tick)
+                if price <= 0:
+                    self.logger.error("PostOnly retry produced invalid price; aborting.")
+                    return None
+                tp, sl = self._compute_tp_sl_targets(side, price, atr)
+                order_tp = tp if not self.tp_maker else 0.0
+                self.logger.warning(f"PostOnly reject; nudging price to {price:.6f}.")
+                continue
+
+            self.logger.error(f"Bybit rejected order: retCode={ret_code} retMsg={ret_msg}")
             return None
-        
-        ret_code = resp.get("retCode")
-        if ret_code != 0:
-            self.logger.error(f"Bybit rejected order: retCode={ret_code} retMsg={resp.get('retMsg')}")
-            return None
 
-        order_id = (resp.get("result") or {}).get("orderId")
         if not order_id:
-            self.logger.error(f"Bybit response missing orderId: {resp}")
+            self.logger.error("Failed to obtain orderId after placement attempts.")
             return None
+
+        confirmed = self._confirm_order_resting(order_id, order_link_id)
+        if confirmed:
+            info_price = safe_float(confirmed.get("price"))
+            if info_price > 0:
+                price = info_price
+            info_qty = safe_float(confirmed.get("leavesQty"))
+            if info_qty <= 0:
+                info_qty = safe_float(confirmed.get("qty"))
+            if info_qty > 0:
+                qty = info_qty
+        else:
+            self.logger.warning("Order not confirmed resting; tracking anyway.")
 
         self.state.state["active_orders"][order_id] = {
             "side": side,
@@ -2755,11 +3453,26 @@ class LiveTradingV2:
             "qty": qty,
             "tp": tp,
             "sl": sl,
+            "atr_at_entry": atr,
             "created_bar_time": self.state.state.get("last_bar_time"),
             "created_ts": utc_now_str(),
             "external": False,
             "position_idx": position_idx,
+            "order_link_id": order_link_id,
         }
+        intents = self._entry_intents()
+        intents[side] = {
+            "order_id": order_id,
+            "order_link_id": order_link_id,
+            "price": price,
+            "qty": qty,
+            "tp": tp,
+            "sl": sl,
+            "atr_at_entry": atr,
+            "created_bar_time": self.state.state.get("last_bar_time"),
+            "created_ts": utc_now_str(),
+        }
+        self.state.state["entry_intent"] = intents
         self.state.save()
 
         return order_id
@@ -2879,6 +3592,7 @@ class LiveTradingV2:
                 return
             latest = row_match.iloc[-1]
             self.last_feature_vector = self._serialize_feature_vector(latest)
+            self.last_feature_row = latest.copy()
 
             recent = bars_df.tail(min(24, len(bars_df)))
             ob_density = (recent["ob_spread_mean"] > 0).sum() / max(len(recent), 1) * 100
@@ -2938,8 +3652,11 @@ class LiveTradingV2:
             self._check_position_timeout(bar_time)
 
             long_pos, short_pos = self._get_positions()
-            long_size = self._position_size(long_pos)
-            short_size = self._position_size(short_pos)
+            external_long = self._is_external_position(long_pos)
+            external_short = self._is_external_position(short_pos)
+            external_present = external_long or external_short
+            long_size = self._position_size(long_pos) if not external_long else 0.0
+            short_size = self._position_size(short_pos) if not external_short else 0.0
             has_long = long_size > 0
             has_short = short_size > 0
             has_position = has_long or has_short
@@ -2964,6 +3681,9 @@ class LiveTradingV2:
                 self.trade_enabled = False
                 return
 
+            if external_present and self.state.state.get("active_orders"):
+                self._cancel_active_orders("external_position")
+
             if has_position:
                 if self.hedge_mode:
                     sides_to_cancel = []
@@ -2982,6 +3702,10 @@ class LiveTradingV2:
                     if self.state.state.get("active_orders"):
                         self._cancel_active_orders("position_open")
                     self._ensure_tp_sl(latest)
+                return
+
+            if external_present:
+                self.logger.warning("External position present. Pausing new entries.")
                 return
 
             last_trade_ts = safe_float(self.state.state.get("last_trade_ts"), 0.0)
@@ -3196,6 +3920,7 @@ class LiveTradingV2:
             "stop_loss": safe_float(pos_ref.get("stop_loss")) if pos_ref else 0.0,
             "take_profit": safe_float(pos_ref.get("take_profit")) if pos_ref else 0.0,
             "tpsl_mode": pos_ref.get("tpsl_mode") if pos_ref else None,
+            "external": bool(pos_ref.get("external")) if pos_ref else False,
         }
         if self.hedge_mode and has_long and has_short:
             position_payload["size"] = long_size + short_size
@@ -3209,22 +3934,24 @@ class LiveTradingV2:
                     "mark_price": safe_float(long_pos.get("mark_price")),
                     "unreal_pnl": safe_float(long_pos.get("unrealized_pnl")),
                     "stop_loss": safe_float(long_pos.get("stop_loss")),
-                    "take_profit": safe_float(long_pos.get("take_profit")),
-                    "tpsl_mode": long_pos.get("tpsl_mode"),
-                    "position_idx": safe_int(long_pos.get("position_idx")),
-                },
-                "short": {
-                    "side": short_pos.get("side"),
-                    "size": short_size,
-                    "entry_price": safe_float(short_pos.get("entry_price")),
-                    "mark_price": safe_float(short_pos.get("mark_price")),
-                    "unreal_pnl": safe_float(short_pos.get("unrealized_pnl")),
-                    "stop_loss": safe_float(short_pos.get("stop_loss")),
-                    "take_profit": safe_float(short_pos.get("take_profit")),
-                    "tpsl_mode": short_pos.get("tpsl_mode"),
-                    "position_idx": safe_int(short_pos.get("position_idx")),
-                },
-            }
+                "take_profit": safe_float(long_pos.get("take_profit")),
+                "tpsl_mode": long_pos.get("tpsl_mode"),
+                "position_idx": safe_int(long_pos.get("position_idx")),
+                "external": bool(long_pos.get("external")),
+            },
+            "short": {
+                "side": short_pos.get("side"),
+                "size": short_size,
+                "entry_price": safe_float(short_pos.get("entry_price")),
+                "mark_price": safe_float(short_pos.get("mark_price")),
+                "unreal_pnl": safe_float(short_pos.get("unrealized_pnl")),
+                "stop_loss": safe_float(short_pos.get("stop_loss")),
+                "take_profit": safe_float(short_pos.get("take_profit")),
+                "tpsl_mode": short_pos.get("tpsl_mode"),
+                "position_idx": safe_int(short_pos.get("position_idx")),
+                "external": bool(short_pos.get("external")),
+            },
+        }
 
         metrics = {
             "ts": utc_now_str(),
@@ -3286,6 +4013,7 @@ class LiveTradingV2:
         last_heartbeat = 0.0
         last_instr_refresh = 0.0
         last_time_sync = 0.0
+        last_tp_fallback_check = 0.0
         error_count = 0
 
         while True:
@@ -3329,6 +4057,10 @@ class LiveTradingV2:
                     for bar_time in closed_times:
                         self._process_bar(bar_time)
                     last_trade_poll = now
+
+                if self.tp_maker and (now - last_tp_fallback_check) >= 1.0:
+                    self._check_tp_limit_fallback(now=now)
+                    last_tp_fallback_check = now
 
                 if now - last_reconcile >= self.reconcile_sec:
                     self._reconcile("interval")
@@ -3394,6 +4126,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_POSITION_MODE,
         choices=["oneway", "hedge"],
         help="Position mode: oneway or hedge",
+    )
+    parser.add_argument(
+        "--tp-maker",
+        action="store_true",
+        default=DEFAULT_TP_MAKER,
+        help="Use maker TP limit with fallback to market",
+    )
+    parser.add_argument(
+        "--tp-maker-fallback-sec",
+        type=float,
+        default=DEFAULT_TP_MAKER_FALLBACK_SEC,
+        help="Seconds after TP breach before market fallback",
     )
     parser.add_argument("--use-ws-trades", action="store_true", help="Use WebSocket trade stream")
     parser.add_argument("--use-ws-ob", action="store_true", help="Use WebSocket orderbook stream")
