@@ -7,10 +7,48 @@ from pybit.exceptions import InvalidRequestError
 import pandas as pd
 import time
 import logging
+import re
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ExchangeClient")
+ERRCODE_RE = re.compile(r"ErrCode:\s*(\d+)")
+
+
+def extract_err_code(message: str) -> Optional[int]:
+    if not message:
+        return None
+    match = ERRCODE_RE.search(message)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _step_decimals(step: float) -> int:
+    try:
+        if step <= 0:
+            return 0
+        dec = Decimal(str(step)).normalize()
+        return max(-dec.as_tuple().exponent, 0)
+    except Exception:
+        return 0
+
+
+def _format_with_step(value: float, step: float) -> str:
+    try:
+        dec = Decimal(str(value))
+    except Exception:
+        return str(value)
+    if step and step > 0:
+        places = _step_decimals(step)
+        quant = Decimal(1).scaleb(-places)
+        dec = dec.quantize(quant, rounding=ROUND_HALF_UP)
+        return f"{dec:.{places}f}"
+    return format(dec.normalize(), "f")
 
 class ExchangeClient:
     def __init__(self, api_key: str, api_secret: str, symbol: str, testnet: bool = False):
@@ -23,6 +61,13 @@ class ExchangeClient:
             max_retries=5,
         )
         self.time_offset_ms = 0.0
+        self.instrument_info: Dict[str, float] = {}
+        self.min_qty = 0.0
+        self.max_qty = 0.0
+        self.qty_step = 0.0
+        self.tick_size = 0.0
+        self.min_notional = 0.0
+        self.max_notional = 0.0
         print(f"Connected to Bybit {'Testnet' if testnet else 'Mainnet'} for {symbol}")
 
     def get_exchange_now(self) -> datetime:
@@ -384,7 +429,7 @@ class ExchangeClient:
                         symbol=self.symbol,
                         side=close_side,
                         orderType="Market",
-                        qty=str(size),
+                        qty=_format_with_step(size, self.qty_step),
                         reduceOnly=True,
                         positionIdx=p.get('positionIdx', 0) # Important for Hedge Mode
                     )
@@ -468,16 +513,41 @@ class ExchangeClient:
             lot_filter = info.get('lotSizeFilter', {})
             price_filter = info.get('priceFilter', {})
             
-            return {
-                'min_qty': self._safe_float(lot_filter.get('minOrderQty', 0.0)),
-                'qty_step': self._safe_float(lot_filter.get('qtyStep', 0.0)),
-                'tick_size': self._safe_float(price_filter.get('tickSize', 0.0)),
-                'min_notional': self._safe_float(
-                    lot_filter.get('minNotionalValue', 0.0)
-                    or lot_filter.get('minOrderValue', 0.0)
-                    or lot_filter.get('minNotional', 0.0)
-                )
+            min_qty = self._safe_float(lot_filter.get('minOrderQty', 0.0))
+            max_qty = self._safe_float(
+                lot_filter.get('maxOrderQty', 0.0)
+                or lot_filter.get('maxOrderSize', 0.0)
+                or lot_filter.get('maxOrderAmount', 0.0)
+            )
+            qty_step = self._safe_float(lot_filter.get('qtyStep', 0.0))
+            tick_size = self._safe_float(price_filter.get('tickSize', 0.0))
+            min_notional = self._safe_float(
+                lot_filter.get('minNotionalValue', 0.0)
+                or lot_filter.get('minOrderValue', 0.0)
+                or lot_filter.get('minNotional', 0.0)
+            )
+            max_notional = self._safe_float(
+                lot_filter.get('maxNotionalValue', 0.0)
+                or lot_filter.get('maxOrderValue', 0.0)
+                or lot_filter.get('maxOrderNotional', 0.0)
+            )
+
+            self.instrument_info = {
+                'min_qty': min_qty,
+                'max_qty': max_qty,
+                'qty_step': qty_step,
+                'tick_size': tick_size,
+                'min_notional': min_notional,
+                'max_notional': max_notional,
             }
+            self.min_qty = min_qty
+            self.max_qty = max_qty
+            self.qty_step = qty_step
+            self.tick_size = tick_size
+            self.min_notional = min_notional
+            self.max_notional = max_notional
+
+            return dict(self.instrument_info)
         except Exception as e:
             logger.error(f"Error fetching instrument info: {e}")
             return {}
@@ -495,18 +565,22 @@ class ExchangeClient:
     ):
         """Place a Limit order with attached TP/SL."""
         try:
+            qty_str = _format_with_step(qty, self.qty_step)
+            price_str = _format_with_step(price, self.tick_size)
             params = {
                 "category": "linear",
                 "symbol": self.symbol,
                 "side": side, # "Buy" or "Sell"
                 "orderType": "Limit",
-                "qty": str(qty),
-                "price": str(price),
+                "qty": qty_str,
+                "price": price_str,
                 "timeInForce": "PostOnly", # Maker only
                 "reduceOnly": reduce_only
             }
-            if tp > 0: params["takeProfit"] = str(tp)
-            if sl > 0: params["stopLoss"] = str(sl)
+            if tp > 0:
+                params["takeProfit"] = _format_with_step(tp, self.tick_size)
+            if sl > 0:
+                params["stopLoss"] = _format_with_step(sl, self.tick_size)
             if position_idx is not None: params["positionIdx"] = int(position_idx)
             if order_link_id: params["orderLinkId"] = str(order_link_id)
             
@@ -515,10 +589,15 @@ class ExchangeClient:
         except InvalidRequestError as e:
             msg = str(e).encode('ascii', 'ignore').decode('ascii')
             code = getattr(e, "status_code", None)
+            if code is None:
+                code = extract_err_code(msg)
             return {"retCode": code if code is not None else -1, "retMsg": msg}
         except Exception as e:
             # Sanitize error message for Windows consoles
             msg = str(e).encode('ascii', 'ignore').decode('ascii')
+            code = extract_err_code(msg)
+            if code is not None:
+                return {"retCode": code, "retMsg": msg}
             logger.error(f"Error placing order: {msg}")
             return None
 
@@ -538,12 +617,13 @@ class ExchangeClient:
             # If we are Long, we need to Sell Market
             # If we are Short, we need to Buy Market
             side_to_send = "Sell" if side == "Buy" else "Buy"
+            qty_str = _format_with_step(qty, self.qty_step)
             params = {
                 "category": "linear",
                 "symbol": self.symbol,
                 "side": side_to_send,
                 "orderType": "Market",
-                "qty": str(qty),
+                "qty": qty_str,
                 "reduceOnly": True,
             }
             if position_idx is not None:
@@ -563,8 +643,8 @@ class ExchangeClient:
             params = {
                 "category": "linear",
                 "symbol": self.symbol,
-                "takeProfit": str(tp),
-                "stopLoss": str(sl),
+                "takeProfit": _format_with_step(tp, self.tick_size),
+                "stopLoss": _format_with_step(sl, self.tick_size),
                 "positionIdx": 0,
             }
             if position_idx is not None:

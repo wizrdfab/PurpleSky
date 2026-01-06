@@ -165,6 +165,169 @@
       height: 80px;
       margin-top: 8px;
     }
+    .chart-large {
+      height: 300px;
+    }
+    .nav-tabs {
+      padding: 0 32px 8px;
+      display: flex;
+      gap: 8px;
+    }
+    .nav-btn {
+      border: 1px solid rgba(148,163,184,0.2);
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      padding: 8px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      transition: all 0.15s ease;
+    }
+    .nav-btn.active {
+      color: var(--text);
+      border-color: rgba(34,197,94,0.6);
+      box-shadow: 0 0 0 2px rgba(34,197,94,0.15);
+    }
+    .section {
+      display: none;
+    }
+    .section.active {
+      display: block;
+    }
+    .account-header {
+      padding: 12px 32px 0;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .account-grid {
+      padding: 12px 32px 0;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+    }
+    .account-chart {
+      margin: 16px 32px;
+      position: relative;
+    }
+    .chart-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 12px;
+    }
+    .chart-controls {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+    }
+    .toggle-group {
+      display: flex;
+      gap: 6px;
+    }
+    .toggle-btn {
+      border: 1px solid rgba(148,163,184,0.2);
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      padding: 4px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 11px;
+      transition: all 0.15s ease;
+    }
+    .toggle-btn.active {
+      color: var(--text);
+      border-color: rgba(34,197,94,0.6);
+      box-shadow: 0 0 0 2px rgba(34,197,94,0.15);
+    }
+    .range-group {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .range-btn {
+      border: 1px solid rgba(148,163,184,0.2);
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      padding: 4px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .range-btn.active {
+      color: var(--text);
+      border-color: rgba(56,189,248,0.6);
+      box-shadow: 0 0 0 2px rgba(56,189,248,0.15);
+    }
+    .legend {
+      display: flex;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    .legend .raw::before { background: #38bdf8; }
+    .legend .adjusted::before { background: #22c55e; }
+    .legend .inactive {
+      color: rgba(148,163,184,0.6);
+    }
+    .profile-list {
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+    }
+    .profile-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      border-bottom: 1px dashed rgba(148,163,184,0.12);
+      padding-bottom: 4px;
+    }
+    .profile-row:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+    .profile-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .profile-metrics {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+    }
+    .profile-spark {
+      width: 120px;
+      height: 26px;
+    }
+    .tooltip {
+      position: absolute;
+      display: none;
+      pointer-events: none;
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 10px;
+      font-size: 12px;
+      box-shadow: 0 10px 20px rgba(0,0,0,0.35);
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -176,84 +339,171 @@
     <div class="pill" id="statusPill">Offline</div>
   </header>
 
-  <section class="summary-grid" id="summaryGrid"></section>
+  <nav class="nav-tabs">
+    <button class="nav-btn active" id="tabAccount" data-view="account">Account Balance</button>
+    <button class="nav-btn" id="tabTraders" data-view="traders">Traders</button>
+  </nav>
 
-  <section class="detail-wrap">
-    <div class="detail-header">
+  <section id="accountSection" class="section active">
+    <div class="account-header">
       <div>
-        <h2 id="detailTitle">Select a symbol</h2>
-        <div class="sub" id="detailSub">No data loaded</div>
+        <h2>Account Balance</h2>
+        <div class="sub" id="accountSub">Waiting for balance updates...</div>
       </div>
-      <div class="pill" id="detailStatus">--</div>
+      <div class="pill" id="accountStatus">--</div>
     </div>
-    <div class="grid">
+    <div class="account-grid">
       <div class="card">
-        <h3>Equity and PnL</h3>
-        <div class="value" id="equityVal">--</div>
-        <div class="row"><span>Daily PnL</span><span id="dailyPnl">--</span></div>
-        <div class="row"><span>Unrealized</span><span id="unrealPnl">--</span></div>
-        <canvas id="equityChart"></canvas>
+        <h3>Total Balance</h3>
+        <div class="value" id="aggBalance">--</div>
+        <div class="row"><span>Available</span><span id="aggAvailable">--</span></div>
+        <div class="row"><span>Profiles</span><span id="aggProfiles">--</span></div>
       </div>
       <div class="card">
-        <h3>Position</h3>
-        <div class="value" id="posSide">--</div>
-        <div class="row"><span>Size</span><span id="posSize">--</span></div>
-        <div class="row"><span>Entry</span><span id="posEntry">--</span></div>
-        <div class="row"><span>Mark</span><span id="posMark">--</span></div>
-        <div class="row"><span>TP / SL</span><span id="posTPSL">--</span></div>
+        <h3>Unified Account</h3>
+        <div class="value" id="aggUnified">--</div>
+        <div class="row"><span>Share</span><span id="aggUnifiedShare">--</span></div>
+        <div class="row"><span>Updated</span><span id="aggUpdated">--</span></div>
       </div>
       <div class="card">
-        <h3>Health</h3>
-        <div class="value" id="healthVal">--</div>
-        <div class="row"><span>Sentiment</span><span id="sentimentVal">--</span></div>
-        <div class="row"><span>Regime</span><span id="regimeVal">--</span></div>
-        <div class="row"><span>Trade Enabled</span><span id="tradeEnabled">--</span></div>
-        <div class="row"><span>Drift Alerts</span><span id="driftAlerts">--</span></div>
+        <h3>Funding Account</h3>
+        <div class="value" id="aggFunding">--</div>
+        <div class="row"><span>Share</span><span id="aggFundingShare">--</span></div>
+        <div class="row"><span>Flow Events</span><span id="aggFlows">--</span></div>
       </div>
       <div class="card">
-        <h3>Model</h3>
-        <div class="value" id="modelPred">--</div>
-        <div class="row"><span>Pred Long</span><span id="predLong">--</span></div>
-        <div class="row"><span>Pred Short</span><span id="predShort">--</span></div>
-        <div class="row"><span>Threshold</span><span id="predThreshold">--</span></div>
-        <div class="row"><span>Bar Time</span><span id="predBar">--</span></div>
-        <div class="row"><span>Model Path</span><span class="truncate" id="modelPath">--</span></div>
-        <div class="row"><span>Keys Profile</span><span id="keysProfile">--</span></div>
-      </div>
-      <div class="card">
-        <h3>Data Quality</h3>
-        <div class="value" id="barsVal">--</div>
-        <div class="row"><span>Macro %</span><span id="macroPct">--</span></div>
-        <div class="row"><span>OB Density</span><span id="obDensity">--</span></div>
-        <div class="row"><span>Trade Continuity</span><span id="tradeCont">--</span></div>
-        <div class="row"><span>Lag Trade / Bar</span><span id="lagTradeBar">--</span></div>
-      </div>
-      <div class="card">
-        <h3>Latency</h3>
-        <div class="value" id="restLatency">--</div>
-        <div class="row"><span>WS Trade</span><span id="wsTrade">--</span></div>
-        <div class="row"><span>WS OB</span><span id="wsOb">--</span></div>
-        <div class="row"><span>OB Lag</span><span id="obLag">--</span></div>
-        <canvas id="latencyChart"></canvas>
-      </div>
-      <div class="card">
-        <h3>Orders</h3>
-        <div class="value" id="openOrders">--</div>
-        <div class="row"><span>Last Reconcile</span><span id="lastReconcile">--</span></div>
-        <div class="row"><span>Source</span><span id="reconcileSource">--</span></div>
-        <div class="row"><span>Protective</span><span id="protectiveCount">--</span></div>
-      </div>
-      <div class="card">
-        <h3>Errors</h3>
-        <div class="value" id="errorCount">--</div>
-        <div class="row"><span>Last Runtime</span><span id="lastRuntime">--</span></div>
-        <div class="row"><span>Last API</span><span id="lastApi">--</span></div>
-      </div>
-      <div class="card">
-        <h3>Features</h3>
-        <div class="feature-grid" id="featureList">--</div>
+        <h3>Performance</h3>
+        <div class="value" id="aggReturn">--</div>
+        <div class="row"><span>Max DD</span><span id="aggMaxDD">--</span></div>
+        <div class="row"><span>Volatility</span><span id="aggVolatility">--</span></div>
+        <div class="row"><span>Stability</span><span id="aggStability">--</span></div>
       </div>
     </div>
+    <div class="card account-chart">
+      <div class="chart-header">
+        <div>
+          <h3>Balance Curve (Raw + Flow-Adjusted)</h3>
+          <div class="sub" id="balanceNote">Flow-adjusted removes large deposits/withdrawals.</div>
+        </div>
+        <div class="chart-controls">
+          <div class="range-group" id="balanceRange">
+            <button class="range-btn active" data-range="all">All</button>
+            <button class="range-btn" data-range="7d">7D</button>
+            <button class="range-btn" data-range="24h">24H</button>
+            <button class="range-btn" data-range="6h">6H</button>
+            <button class="range-btn" data-range="1h">1H</button>
+          </div>
+          <div class="range-group" id="balanceScale">
+            <button class="range-btn active" data-scale="split">Split Scale</button>
+            <button class="range-btn" data-scale="shared">Shared Scale</button>
+          </div>
+          <div class="toggle-group" id="balanceToggle">
+            <button class="toggle-btn active" data-toggle="raw">Raw Curve</button>
+            <button class="toggle-btn active" data-toggle="adjusted">Flow-Adjusted</button>
+          </div>
+        </div>
+      </div>
+      <canvas id="balanceChart" class="chart-large"></canvas>
+      <div id="balanceTooltip" class="tooltip"></div>
+      <div class="legend">
+        <span class="raw">Raw</span>
+        <span class="adjusted">Flow-adjusted</span>
+      </div>
+    </div>
+    <div class="account-grid">
+      <div class="card">
+        <h3>Curve Diagnostics</h3>
+        <div class="row"><span>Smoothness</span><span id="aggSmoothness">--</span></div>
+        <div class="row"><span>Trend / Day</span><span id="aggTrend">--</span></div>
+        <div class="row"><span>Raw Return</span><span id="aggRawReturn">--</span></div>
+        <div class="row"><span>Points</span><span id="aggPoints">--</span></div>
+      </div>
+      <div class="card">
+        <h3>Profiles</h3>
+        <div class="profile-list" id="accountProfiles">--</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tradersSection" class="section">
+    <section class="summary-grid" id="summaryGrid"></section>
+    <section class="detail-wrap">
+      <div class="detail-header">
+        <div>
+          <h2 id="detailTitle">Select a symbol</h2>
+          <div class="sub" id="detailSub">No data loaded</div>
+        </div>
+        <div class="pill" id="detailStatus">--</div>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3>Equity and PnL</h3>
+          <div class="value" id="equityVal">--</div>
+          <div class="row"><span>Daily PnL</span><span id="dailyPnl">--</span></div>
+          <div class="row"><span>Unrealized</span><span id="unrealPnl">--</span></div>
+          <canvas id="equityChart"></canvas>
+        </div>
+        <div class="card">
+          <h3>Position</h3>
+          <div class="value" id="posSide">--</div>
+          <div class="row"><span>Size</span><span id="posSize">--</span></div>
+          <div class="row"><span>Entry</span><span id="posEntry">--</span></div>
+          <div class="row"><span>Mark</span><span id="posMark">--</span></div>
+          <div class="row"><span>TP / SL</span><span id="posTPSL">--</span></div>
+        </div>
+        <div class="card">
+          <h3>Health</h3>
+          <div class="value" id="healthVal">--</div>
+          <div class="row"><span>Sentiment</span><span id="sentimentVal">--</span></div>
+          <div class="row"><span>Regime</span><span id="regimeVal">--</span></div>
+          <div class="row"><span>Trade Enabled</span><span id="tradeEnabled">--</span></div>
+          <div class="row"><span>Drift Alerts</span><span id="driftAlerts">--</span></div>
+        </div>
+        <div class="card">
+          <h3>Model</h3>
+          <div class="value" id="modelPred">--</div>
+          <div class="row"><span>Pred Long</span><span id="predLong">--</span></div>
+          <div class="row"><span>Pred Short</span><span id="predShort">--</span></div>
+          <div class="row"><span>Threshold</span><span id="predThreshold">--</span></div>
+          <div class="row"><span>Bar Time</span><span id="predBar">--</span></div>
+          <div class="row"><span>Model Path</span><span class="truncate" id="modelPath">--</span></div>
+          <div class="row"><span>Keys Profile</span><span id="keysProfile">--</span></div>
+        </div>
+        <div class="card">
+          <h3>Data Quality</h3>
+          <div class="value" id="barsVal">--</div>
+          <div class="row"><span>Macro %</span><span id="macroPct">--</span></div>
+          <div class="row"><span>OB Density</span><span id="obDensity">--</span></div>
+          <div class="row"><span>Trade Continuity</span><span id="tradeCont">--</span></div>
+          <div class="row"><span>Lag Trade / Bar</span><span id="lagTradeBar">--</span></div>
+        </div>
+        <div class="card">
+          <h3>Latency</h3>
+          <div class="value" id="restLatency">--</div>
+          <div class="row"><span>WS Trade</span><span id="wsTrade">--</span></div>
+          <div class="row"><span>WS OB</span><span id="wsOb">--</span></div>
+          <div class="row"><span>OB Lag</span><span id="obLag">--</span></div>
+          <canvas id="latencyChart"></canvas>
+        </div>
+        <div class="card">
+          <h3>Orders</h3>
+          <div class="value" id="openOrders">--</div>
+          <div class="row"><span>Last Reconcile</span><span id="lastReconcile">--</span></div>
+          <div class="row"><span>Source</span><span id="reconcileSource">--</span></div>
+          <div class="row"><span>Protective</span><span id="protectiveCount">--</span></div>
+        </div>
+        <div class="card">
+          <h3>Errors</h3>
+          <div class="value" id="errorCount">--</div>
+          <div class="row"><span>Last Runtime</span><span id="lastRuntime">--</span></div>
+          <div class="row"><span>Last API</span><span id="lastApi">--</span></div>
+        </div>
+        <div class="card">
+          <h3>Features</h3>
+          <div class="feature-grid" id="featureList">--</div>
+        </div>
+      </div>
+    </section>
   </section>
 
   <script>
@@ -266,7 +516,16 @@
       selected: null,
       latestMap: {},
       items: [],
-      lastHistorySymbol: null
+      lastHistorySymbol: null,
+      view: "account",
+      balanceRange: "all",
+      balanceScale: "split",
+      balanceShowRaw: true,
+      balanceShowAdjusted: true,
+      balanceHistory: [],
+      balanceFlowPct: 2.0,
+      balancePlot: null,
+      balanceLatest: null
     };
 
     function sparkline(canvas, values, color) {
@@ -288,6 +547,168 @@
         else ctx.lineTo(x, y);
       });
       ctx.stroke();
+    }
+
+    function parseTs(ts) {
+      if (!ts) return null;
+      const iso = ts.replace(" ", "T") + "Z";
+      const ms = Date.parse(iso);
+      return Number.isNaN(ms) ? null : ms;
+    }
+
+    function drawBalanceChart(canvas, rawSeries, adjustedSeries, scaleMode, showRaw, showAdjusted) {
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width = canvas.clientWidth;
+      const h = canvas.height = canvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+      const activeRaw = showRaw ? rawSeries : [];
+      const activeAdj = showAdjusted ? adjustedSeries : [];
+      const combined = [...activeRaw, ...activeAdj];
+      if (!combined.length) return;
+      const pad = 10;
+      const scaleX = (i, n) => (n <= 1 ? pad : (i / (n - 1)) * (w - pad * 2) + pad);
+
+      const rawMin = activeRaw.length ? Math.min(...activeRaw) : combined[0];
+      const rawMax = activeRaw.length ? Math.max(...activeRaw) : combined[0];
+      const adjMin = activeAdj.length ? Math.min(...activeAdj) : combined[0];
+      const adjMax = activeAdj.length ? Math.max(...activeAdj) : combined[0];
+      const combinedMin = Math.min(rawMin, adjMin);
+      const combinedMax = Math.max(rawMax, adjMax);
+
+      const useShared = (scaleMode || "shared") === "shared";
+      const minRaw = useShared ? combinedMin : rawMin;
+      const maxRaw = useShared ? combinedMax : rawMax;
+      const minAdj = useShared ? combinedMin : adjMin;
+      const maxAdj = useShared ? combinedMax : adjMax;
+
+      const spanRaw = (maxRaw - minRaw) || 1;
+      const spanAdj = (maxAdj - minAdj) || 1;
+      const scaleYRaw = (v) => h - pad - ((v - minRaw) / spanRaw) * (h - pad * 2);
+      const scaleYAdj = (v) => h - pad - ((v - minAdj) / spanAdj) * (h - pad * 2);
+
+      const drawGrid = () => {
+        const lines = 4;
+        ctx.strokeStyle = "rgba(148,163,184,0.12)";
+        ctx.lineWidth = 1;
+        for (let i = 0; i <= lines; i++) {
+          const val = maxRaw - ((maxRaw - minRaw) * (i / lines));
+          const y = scaleYRaw(val);
+          ctx.beginPath();
+          ctx.moveTo(pad, y);
+          ctx.lineTo(w - pad, y);
+          ctx.stroke();
+        }
+      };
+
+      const drawLine = (series, color, scaleY) => {
+        if (!series || !series.length) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        series.forEach((v, i) => {
+          const x = scaleX(i, series.length);
+          const y = scaleY(v);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      };
+
+      drawGrid();
+      if (showRaw) {
+        drawLine(rawSeries, "#38bdf8", scaleYRaw);
+      }
+      if (showAdjusted) {
+        drawLine(adjustedSeries, "#22c55e", scaleYAdj);
+      }
+
+      ctx.fillStyle = "rgba(148,163,184,0.8)";
+      ctx.font = "11px Space Grotesk, sans-serif";
+      const rawLabel = `Raw ${fmt(maxRaw, 2)} / ${fmt(minRaw, 2)}`;
+      ctx.fillText(rawLabel, pad, pad + 2);
+      if (!useShared) {
+        const adjLabel = `Adj ${fmt(maxAdj, 2)} / ${fmt(minAdj, 2)}`;
+        const textWidth = ctx.measureText(adjLabel).width;
+        ctx.fillText(adjLabel, w - textWidth - pad, pad + 2);
+      }
+    }
+
+    function setupBalanceTooltip() {
+      const canvas = document.getElementById("balanceChart");
+      const tooltip = document.getElementById("balanceTooltip");
+      if (!canvas || !tooltip) return;
+
+      canvas.addEventListener("mousemove", (evt) => {
+        if (!state.balancePlot) return;
+        const rect = canvas.getBoundingClientRect();
+        const cardRect = canvas.parentElement.getBoundingClientRect();
+        const x = evt.clientX - rect.left;
+        const n = state.balancePlot.raw.length;
+        const idx = Math.min(n - 1, Math.max(0, Math.round((x / rect.width) * (n - 1))));
+        const raw = state.balanceShowRaw ? state.balancePlot.raw[idx] : null;
+        const adj = state.balanceShowAdjusted ? state.balancePlot.adjusted[idx] : null;
+        const ts = state.balancePlot.labels[idx];
+        let timeText = "--";
+        if (ts) {
+          const parsed = parseTs(ts);
+          if (parsed) {
+            timeText = new Date(parsed).toLocaleString();
+          }
+        }
+        tooltip.style.display = "block";
+        const parts = [];
+        if (raw !== null && raw !== undefined) {
+          parts.push(`Raw: ${fmt(raw, 4)}`);
+        }
+        if (adj !== null && adj !== undefined) {
+          parts.push(`Adj: ${fmt(adj, 4)}`);
+        }
+        tooltip.textContent = `${timeText} | ${parts.length ? parts.join(" | ") : "No series visible"}`;
+        const left = Math.min(cardRect.width - tooltip.offsetWidth - 8, Math.max(8, (rect.left - cardRect.left) + x + 12));
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = `${Math.max(8, (rect.top - cardRect.top) + (evt.clientY - rect.top) - 24)}px`;
+      });
+
+      canvas.addEventListener("mouseleave", () => {
+        tooltip.style.display = "none";
+      });
+    }
+
+    function computeAdjustedSeries(series, flowPct) {
+      if (!series.length) return { adjusted: [], flowEvents: 0 };
+      const adjusted = [series[0]];
+      let flow = 0;
+      let flowEvents = 0;
+      for (let i = 1; i < series.length; i++) {
+        const prev = series[i - 1];
+        const delta = series[i] - prev;
+        const threshold = Math.max(1, prev * (flowPct / 100));
+        if (Math.abs(delta) > threshold) {
+          flow += delta;
+          flowEvents += 1;
+        }
+        adjusted.push(series[i] - flow);
+      }
+      return { adjusted, flowEvents };
+    }
+
+    function filterHistory(history, range) {
+      if (!history.length || range === "all") return history;
+      const lastTs = parseTs(history[history.length - 1].ts);
+      if (!lastTs) return history;
+      const windowMap = {
+        "7d": 7 * 24 * 60 * 60 * 1000,
+        "24h": 24 * 60 * 60 * 1000,
+        "6h": 6 * 60 * 60 * 1000,
+        "1h": 60 * 60 * 1000
+      };
+      const windowMs = windowMap[range] || 0;
+      if (!windowMs) return history;
+      const cutoff = lastTs - windowMs;
+      return history.filter(item => {
+        const ts = parseTs(item.ts);
+        return ts && ts >= cutoff;
+      });
     }
 
     function healthClass(text) {
@@ -362,6 +783,28 @@
       });
       if (state.selected && state.latestMap[state.selected]) {
         updateDetail(state.latestMap[state.selected]);
+      }
+    }
+
+    function setView(view) {
+      state.view = view;
+      const accountSection = document.getElementById("accountSection");
+      const tradersSection = document.getElementById("tradersSection");
+      const tabAccount = document.getElementById("tabAccount");
+      const tabTraders = document.getElementById("tabTraders");
+      if (view === "account") {
+        accountSection.classList.add("active");
+        tradersSection.classList.remove("active");
+        tabAccount.classList.add("active");
+        tabTraders.classList.remove("active");
+      } else {
+        tradersSection.classList.add("active");
+        accountSection.classList.remove("active");
+        tabTraders.classList.add("active");
+        tabAccount.classList.remove("active");
+        if (state.selected) {
+          fetchHistory(state.selected);
+        }
       }
     }
 
@@ -472,6 +915,177 @@
       }
     }
 
+    function renderProfiles(list) {
+      const container = document.getElementById("accountProfiles");
+      container.innerHTML = "";
+      if (!Array.isArray(list) || !list.length) {
+        container.textContent = "--";
+        return;
+      }
+      const filtered = filterHistory(state.balanceHistory, state.balanceRange);
+      const seriesMap = {};
+      filtered.forEach(item => {
+        if (!item || !Array.isArray(item.profiles)) return;
+        item.profiles.forEach(p => {
+          if (!p || !p.name) return;
+          if (!seriesMap[p.name]) seriesMap[p.name] = [];
+          seriesMap[p.name].push(Number(p.total_equity || 0));
+        });
+      });
+      list.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "profile-row";
+        const left = document.createElement("div");
+        left.className = "profile-meta";
+        const name = document.createElement("span");
+        name.textContent = item.name || "--";
+        const sub = document.createElement("span");
+        const unified = item.unified_equity ? fmt(item.unified_equity, 4) : "--";
+        const funding = item.funding_equity ? fmt(item.funding_equity, 4) : "--";
+        const fundingErr = item.funding_error ? ` | Funding: ${item.funding_error}` : "";
+        sub.textContent = `U:${unified} / F:${funding}${fundingErr}`;
+        left.appendChild(name);
+        left.appendChild(sub);
+
+        const right = document.createElement("div");
+        right.className = "profile-metrics";
+        const total = item.total_equity ? fmt(item.total_equity, 4) : "--";
+        const totalEl = document.createElement("span");
+        totalEl.textContent = total;
+        const canvas = document.createElement("canvas");
+        canvas.className = "profile-spark";
+        canvas.dataset.profile = item.name || "";
+        right.appendChild(totalEl);
+        right.appendChild(canvas);
+        row.appendChild(left);
+        row.appendChild(right);
+        container.appendChild(row);
+
+        const series = seriesMap[item.name] || [];
+        const trimmed = series.slice(-80).filter(v => v > 0);
+        sparkline(canvas, trimmed, "#38bdf8");
+      });
+    }
+
+    function updateBalances(data) {
+      if (!data) return;
+      state.balanceLatest = data;
+      const stats = data.stats || {};
+      const total = Number(data.total_equity || 0);
+      const unified = Number(data.total_unified || 0);
+      const funding = Number(data.total_funding || 0);
+      const available = Number(data.total_available || 0);
+      document.getElementById("aggBalance").textContent = total ? fmt(total, 4) : "--";
+      document.getElementById("aggAvailable").textContent = available ? fmt(available, 4) : "--";
+      document.getElementById("aggProfiles").textContent = data.profile_count ?? "--";
+      document.getElementById("aggUnified").textContent = unified ? fmt(unified, 4) : "--";
+      document.getElementById("aggFunding").textContent = funding ? fmt(funding, 4) : "--";
+      document.getElementById("aggUnifiedShare").textContent = total ? `${fmt((unified / total) * 100, 1)}%` : "--";
+      document.getElementById("aggFundingShare").textContent = total ? `${fmt((funding / total) * 100, 1)}%` : "--";
+      document.getElementById("aggUpdated").textContent = data.ts || "--";
+      document.getElementById("aggFlows").textContent = stats.flow_events ?? "--";
+      const fundingStatus = document.getElementById("aggFundingStatus");
+      if (fundingStatus) {
+        fundingStatus.textContent = data.funding_error ? data.funding_error : "OK";
+        fundingStatus.className = data.funding_error ? "bad" : "ok";
+      }
+
+      const accountSub = document.getElementById("accountSub");
+      if (accountSub) {
+        accountSub.textContent = `Total (Unified + Funding): ${total ? fmt(total, 4) : "--"} | Updated: ${data.ts || "--"}`;
+      }
+      const accountStatus = document.getElementById("accountStatus");
+      if (accountStatus) {
+        accountStatus.textContent = data.funding_error ? "Funding Error" : (total > 0 ? "Live" : "No Data");
+      }
+
+      document.getElementById("aggReturn").textContent = stats.total_return_pct === null || stats.total_return_pct === undefined
+        ? "--"
+        : `${fmt(stats.total_return_pct, 2)}%`;
+      document.getElementById("aggMaxDD").textContent = stats.max_drawdown_pct === null || stats.max_drawdown_pct === undefined
+        ? "--"
+        : `${fmt(stats.max_drawdown_pct, 2)}%`;
+      document.getElementById("aggVolatility").textContent = stats.volatility_pct === null || stats.volatility_pct === undefined
+        ? "--"
+        : `${fmt(stats.volatility_pct, 2)}%`;
+      document.getElementById("aggStability").textContent = stats.stability_pct === null || stats.stability_pct === undefined
+        ? "--"
+        : `${fmt(stats.stability_pct, 1)}%`;
+      document.getElementById("aggSmoothness").textContent = stats.smoothness_r2 === null || stats.smoothness_r2 === undefined
+        ? "--"
+        : fmt(stats.smoothness_r2, 2);
+      document.getElementById("aggTrend").textContent = stats.slope_per_day === null || stats.slope_per_day === undefined
+        ? "--"
+        : fmt(stats.slope_per_day, 4);
+      document.getElementById("aggRawReturn").textContent = stats.raw_total_return_pct === null || stats.raw_total_return_pct === undefined
+        ? "--"
+        : `${fmt(stats.raw_total_return_pct, 2)}%`;
+      document.getElementById("aggPoints").textContent = stats.points ?? "--";
+
+      if (stats.flow_threshold_pct) {
+        state.balanceFlowPct = stats.flow_threshold_pct;
+        const note = document.getElementById("balanceNote");
+        if (note) {
+          note.textContent = `Flow threshold: ${fmt(stats.flow_threshold_pct, 1)}% (large deposits/withdrawals removed).`;
+        }
+      }
+      renderProfiles(data.profiles || []);
+      renderBalanceHistory();
+    }
+
+    async function fetchBalances() {
+      const resp = await fetch("/api/balances");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      updateBalances(data);
+    }
+
+    function renderBalanceHistory() {
+      const filtered = filterHistory(state.balanceHistory, state.balanceRange);
+      const raw = [];
+      const labels = [];
+      filtered.forEach(item => {
+        const val = Number(item.total_equity || 0);
+        if (val > 0) {
+          raw.push(val);
+          labels.push(item.ts);
+        }
+      });
+      const { adjusted, flowEvents } = computeAdjustedSeries(raw, state.balanceFlowPct);
+      state.balancePlot = { raw, adjusted, labels, flowEvents };
+      drawBalanceChart(
+        document.getElementById("balanceChart"),
+        raw,
+        adjusted,
+        state.balanceScale,
+        state.balanceShowRaw,
+        state.balanceShowAdjusted,
+      );
+      if (state.balanceLatest) {
+        renderProfiles(state.balanceLatest.profiles || []);
+      }
+      updateLegendVisibility();
+    }
+
+    function updateLegendVisibility() {
+      const rawLabel = document.querySelector(".legend .raw");
+      const adjLabel = document.querySelector(".legend .adjusted");
+      if (rawLabel) {
+        rawLabel.classList.toggle("inactive", !state.balanceShowRaw);
+      }
+      if (adjLabel) {
+        adjLabel.classList.toggle("inactive", !state.balanceShowAdjusted);
+      }
+    }
+
+    async function fetchBalanceHistory() {
+      const resp = await fetch("/api/balance_history?limit=10000");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      state.balanceHistory = data || [];
+      renderBalanceHistory();
+    }
+
     async function fetchSummary() {
       const resp = await fetch("/api/summary");
       if (!resp.ok) return;
@@ -492,12 +1106,51 @@
     }
 
     fetchSummary();
+    fetchBalances();
+    fetchBalanceHistory();
+    setupBalanceTooltip();
     setInterval(fetchSummary, 2000);
+    setInterval(fetchBalances, 5000);
+    setInterval(fetchBalanceHistory, 15000);
     setInterval(() => {
       if (state.selected) {
         fetchHistory(state.selected);
       }
     }, 10000);
+
+    document.getElementById("tabAccount").addEventListener("click", () => setView("account"));
+    document.getElementById("tabTraders").addEventListener("click", () => setView("traders"));
+
+    document.querySelectorAll("#balanceRange .range-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("#balanceRange .range-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        state.balanceRange = btn.dataset.range || "all";
+        renderBalanceHistory();
+      });
+    });
+
+    document.querySelectorAll("#balanceScale .range-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("#balanceScale .range-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        state.balanceScale = btn.dataset.scale || "shared";
+        renderBalanceHistory();
+      });
+    });
+
+    document.querySelectorAll("#balanceToggle .toggle-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const type = btn.dataset.toggle;
+        if (!type) return;
+        const key = type === "raw" ? "balanceShowRaw" : "balanceShowAdjusted";
+        state[key] = !state[key];
+        btn.classList.toggle("active", state[key]);
+        renderBalanceHistory();
+      });
+    });
+
+    setView(state.view);
   </script>
 </body>
 </html>

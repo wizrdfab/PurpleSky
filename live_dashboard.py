@@ -7,12 +7,19 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+try:
+    from pybit.unified_trading import HTTP as BybitHTTP
+except Exception:
+    BybitHTTP = None
 
 
 def tail_jsonl(path: Path, limit: int = 200, max_bytes: int = 512 * 1024):
@@ -66,6 +73,116 @@ def parse_ts(ts: str):
         return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
     except Exception:
         return None
+
+
+def utc_now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, default=str) + "\n")
+
+
+def load_key_profiles(path: Path) -> Dict[str, Dict[str, str]]:
+    if not path or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, dict):
+        return {}
+    return profiles
+
+
+def extract_wallet_balance(resp: dict) -> Dict[str, float]:
+    if not isinstance(resp, dict):
+        return {}
+    result = resp.get("result", {})
+    acct_list = result.get("list", [])
+    if not acct_list:
+        return {}
+    acct = acct_list[0]
+    total_equity = safe_float(acct.get("totalEquity"))
+    if total_equity <= 0:
+        total_equity = safe_float(acct.get("totalWalletBalance"))
+    total_available = safe_float(acct.get("totalAvailableBalance"))
+    coins = acct.get("coin") if isinstance(acct.get("coin"), list) else []
+    if coins:
+        if total_equity <= 0:
+            usd_values = [safe_float(c.get("usdValue")) for c in coins]
+            usd_values = [v for v in usd_values if v > 0]
+            if usd_values:
+                total_equity = sum(usd_values)
+        if total_equity <= 0 and len(coins) == 1:
+            total_equity = safe_float(coins[0].get("equity")) or safe_float(coins[0].get("walletBalance"))
+        if total_equity <= 0:
+            stable_sum = 0.0
+            for coin in coins:
+                if str(coin.get("coin")).upper() in {"USDT", "USDC"}:
+                    stable_sum += safe_float(coin.get("equity")) or safe_float(coin.get("walletBalance"))
+            if stable_sum > 0:
+                total_equity = stable_sum
+        if total_available <= 0 and len(coins) == 1:
+            total_available = safe_float(coins[0].get("availableToWithdraw")) or safe_float(coins[0].get("availableBalance"))
+        if total_available <= 0:
+            stable_avail = 0.0
+            for coin in coins:
+                if str(coin.get("coin")).upper() in {"USDT", "USDC"}:
+                    stable_avail += safe_float(coin.get("availableToWithdraw")) or safe_float(coin.get("availableBalance"))
+            if stable_avail > 0:
+                total_available = stable_avail
+    return {
+        "equity": total_equity,
+        "available": total_available,
+    }
+
+
+def extract_asset_balance(resp: dict) -> Dict[str, float]:
+    if not isinstance(resp, dict):
+        return {}
+    result = resp.get("result", {})
+    balances = result.get("balance") or result.get("list") or []
+    if isinstance(balances, dict):
+        balances = [balances]
+    if not isinstance(balances, list):
+        return {}
+    total_equity = 0.0
+    total_available = 0.0
+    usd_values = []
+    stable_total = 0.0
+    stable_available = 0.0
+    for coin in balances:
+        usd_val = safe_float(coin.get("usdValue"))
+        if usd_val > 0:
+            usd_values.append(usd_val)
+        coin_name = str(coin.get("coin") or "").upper()
+        wallet = safe_float(coin.get("walletBalance"))
+        available = safe_float(coin.get("transferBalance")) or safe_float(coin.get("availableBalance")) or safe_float(coin.get("availableToWithdraw"))
+        if coin_name in {"USDT", "USDC"}:
+            if wallet > 0:
+                stable_total += wallet
+            if available > 0:
+                stable_available += available
+    if usd_values:
+        total_equity = sum(usd_values)
+    elif stable_total > 0:
+        total_equity = stable_total
+    elif len(balances) == 1:
+        total_equity = safe_float(balances[0].get("walletBalance"))
+
+    if stable_available > 0:
+        total_available = stable_available
+    elif len(balances) == 1:
+        total_available = safe_float(balances[0].get("transferBalance")) or safe_float(balances[0].get("availableBalance")) or safe_float(balances[0].get("availableToWithdraw"))
+
+    return {
+        "equity": total_equity,
+        "available": total_available,
+    }
 
 
 def feature_map(latest: dict):
@@ -169,6 +286,364 @@ def compute_trade_stats(metrics_path: Path, limit: int = 400):
     }
 
 
+def compute_balance_stats(history: List[dict], flow_threshold_pct: float = 2.0) -> Dict[str, float]:
+    if not history or len(history) < 2:
+        return {}
+    enriched = []
+    for item in history:
+        ts = parse_ts(item.get("ts"))
+        equity = safe_float(item.get("total_equity"))
+        if equity > 0 and ts is not None:
+            enriched.append((ts, equity))
+    if len(enriched) < 2:
+        return {}
+    enriched.sort(key=lambda x: x[0])
+    times = [x[0] for x in enriched]
+    equities = [x[1] for x in enriched]
+
+    adjusted = []
+    flow = 0.0
+    flow_events = 0
+    for i, eq in enumerate(equities):
+        if i == 0:
+            adjusted.append(eq)
+            continue
+        prev = equities[i - 1]
+        delta = eq - prev
+        threshold = max(1.0, prev * (flow_threshold_pct / 100.0))
+        if abs(delta) > threshold:
+            flow += delta
+            flow_events += 1
+        adjusted.append(eq - flow)
+
+    returns = []
+    for i in range(1, len(adjusted)):
+        prev = adjusted[i - 1]
+        if prev <= 0:
+            continue
+        returns.append((adjusted[i] - prev) / prev)
+
+    stability_pct = None
+    volatility_pct = None
+    if returns:
+        stability_pct = (sum(1 for r in returns if r >= 0) / len(returns)) * 100.0
+    if len(returns) >= 2:
+        mean_ret = sum(returns) / len(returns)
+        var = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
+        volatility_pct = (var ** 0.5) * 100.0
+
+    max_dd = 0.0
+    peak = adjusted[0]
+    for val in adjusted:
+        peak = max(peak, val)
+        if peak > 0:
+            dd = (val - peak) / peak
+            if dd < max_dd:
+                max_dd = dd
+    max_drawdown_pct = abs(max_dd) * 100.0 if len(adjusted) > 1 else None
+
+    slope_per_day = None
+    smoothness_r2 = None
+    if len(times) >= 2:
+        t0 = times[0]
+        xs = [(t - t0) / 86400.0 for t in times]
+        x_mean = sum(xs) / len(xs)
+        y_mean = sum(adjusted) / len(adjusted)
+        var_x = sum((x - x_mean) ** 2 for x in xs)
+        if var_x > 0:
+            cov_xy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, adjusted))
+            slope = cov_xy / var_x
+            slope_per_day = slope
+            ss_tot = sum((y - y_mean) ** 2 for y in adjusted)
+            if ss_tot > 0:
+                ss_res = sum((y - (slope * x + (y_mean - slope * x_mean))) ** 2 for x, y in zip(xs, adjusted))
+                smoothness_r2 = max(0.0, 1.0 - (ss_res / ss_tot))
+
+    total_return_pct = None
+    if adjusted[0] > 0:
+        total_return_pct = ((adjusted[-1] / adjusted[0]) - 1.0) * 100.0
+    raw_total_return_pct = None
+    if equities[0] > 0:
+        raw_total_return_pct = ((equities[-1] / equities[0]) - 1.0) * 100.0
+
+    return {
+        "total_return_pct": total_return_pct,
+        "raw_total_return_pct": raw_total_return_pct,
+        "max_drawdown_pct": max_drawdown_pct,
+        "volatility_pct": volatility_pct,
+        "stability_pct": stability_pct,
+        "smoothness_r2": smoothness_r2,
+        "slope_per_day": slope_per_day,
+        "points": len(adjusted),
+        "flow_events": flow_events,
+        "flow_threshold_pct": flow_threshold_pct,
+    }
+
+
+class BalanceMonitor:
+    def __init__(
+        self,
+        keys_path: Path,
+        metrics_dir: Path,
+        poll_sec: float = 30.0,
+        history_limit: int = 10000,
+        testnet: bool = False,
+        flow_threshold_pct: float = 2.0,
+    ):
+        self.keys_path = keys_path
+        self.metrics_dir = metrics_dir
+        self.poll_sec = poll_sec
+        self.history_limit = history_limit
+        self.testnet = testnet
+        self.flow_threshold_pct = flow_threshold_pct
+        self.history_path = metrics_dir / "balance_history.jsonl"
+        self.history = deque(maxlen=history_limit)
+        self.latest: Dict[str, object] = {}
+        self.sessions: Dict[str, object] = {}
+        self.member_ids: Dict[str, str] = {}
+        self.wallet_perms: Dict[str, bool] = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _load_history(self) -> None:
+        for item in tail_jsonl(self.history_path, limit=self.history_limit):
+            self.history.append(item)
+
+    def _refresh_sessions(self) -> Dict[str, Dict[str, str]]:
+        profiles = load_key_profiles(self.keys_path)
+        if not profiles:
+            return {}
+        for name, creds in profiles.items():
+            if name in self.sessions:
+                continue
+            key = creds.get("api_key")
+            secret = creds.get("api_secret")
+            if not key or not secret or BybitHTTP is None:
+                continue
+            try:
+                self.sessions[name] = BybitHTTP(
+                    testnet=self.testnet,
+                    api_key=key,
+                    api_secret=secret,
+                )
+            except Exception:
+                continue
+        return profiles
+
+    def _fetch_balance(self, session, account_types: List[str], coin: Optional[str] = None) -> Dict[str, float]:
+        for account_type in account_types:
+            try:
+                params = {"accountType": account_type}
+                if coin:
+                    params["coin"] = coin
+                resp = session.get_wallet_balance(**params)
+            except Exception:
+                continue
+            if isinstance(resp, dict) and resp.get("retCode") not in (None, 0):
+                continue
+            bal = extract_wallet_balance(resp)
+            if safe_float(bal.get("equity")) > 0 or safe_float(bal.get("available")) > 0:
+                return bal
+        return {}
+
+    def _fetch_asset_balance(
+        self,
+        session,
+        account_type: str,
+        coin: Optional[str] = None,
+        member_id: Optional[str] = None,
+    ) -> Dict[str, float]:
+        try:
+            if coin:
+                params = {"accountType": account_type, "coin": coin}
+                if member_id:
+                    params["memberId"] = member_id
+                resp = session.get_coin_balance(**params)
+            else:
+                params = {"accountType": account_type}
+                if member_id:
+                    params["memberId"] = member_id
+                resp = session.get_coins_balance(**params)
+        except Exception:
+            return {}
+        if isinstance(resp, dict) and resp.get("retCode") not in (None, 0):
+            return {}
+        bal = extract_asset_balance(resp)
+        if safe_float(bal.get("equity")) > 0 or safe_float(bal.get("available")) > 0:
+            return bal
+        return {}
+
+    def _fetch_asset_balance_with_error(
+        self,
+        session,
+        account_type: str,
+        coin: Optional[str] = None,
+        member_id: Optional[str] = None,
+    ) -> Tuple[Dict[str, float], Optional[int], Optional[str]]:
+        try:
+            if coin:
+                params = {"accountType": account_type, "coin": coin}
+                if member_id:
+                    params["memberId"] = member_id
+                resp = session.get_coin_balance(**params)
+            else:
+                params = {"accountType": account_type}
+                if member_id:
+                    params["memberId"] = member_id
+                resp = session.get_coins_balance(**params)
+        except Exception as exc:
+            return {}, None, str(exc)
+        if isinstance(resp, dict) and resp.get("retCode") not in (None, 0):
+            return {}, safe_int(resp.get("retCode")), str(resp.get("retMsg") or "")
+        bal = extract_asset_balance(resp)
+        return bal, None, None
+
+    def _get_member_id(self, session, name: str) -> Optional[str]:
+        cached = self.member_ids.get(name)
+        if cached:
+            return cached
+        try:
+            resp = session.get_api_key_information()
+        except Exception:
+            return None
+        if not isinstance(resp, dict) or resp.get("retCode") not in (None, 0):
+            return None
+        result = resp.get("result", {}) if isinstance(resp, dict) else {}
+        perms = result.get("permissions") if isinstance(result, dict) else {}
+        wallet_perm = None
+        if isinstance(perms, dict):
+            wallet_list = perms.get("Wallet")
+            wallet_perm = bool(wallet_list)
+        if wallet_perm is not None:
+            self.wallet_perms[name] = wallet_perm
+        user_id = result.get("userID") or result.get("uid") or result.get("userId")
+        if user_id is None:
+            return None
+        member_id = str(user_id)
+        self.member_ids[name] = member_id
+        return member_id
+
+    def start(self) -> None:
+        if not self.keys_path or not self.keys_path.exists() or BybitHTTP is None:
+            return
+        self._load_history()
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _poll_once(self) -> None:
+        profiles = self._refresh_sessions()
+        if not profiles:
+            return
+        totals = {
+            "equity": 0.0,
+            "available": 0.0,
+            "unified": 0.0,
+            "funding": 0.0,
+        }
+        profile_payloads = []
+        funding_errors = []
+        for name, creds in profiles.items():
+            session = self.sessions.get(name)
+            if session is None:
+                continue
+            member_id = self._get_member_id(session, name)
+            unified_bal = self._fetch_balance(session, ["UNIFIED"], coin=None)
+            if not unified_bal:
+                unified_bal = self._fetch_balance(session, ["UNIFIED"], coin="USDT")
+            fund_bal = {}
+            funding_error = None
+            if self.wallet_perms.get(name, True):
+                fund_bal, fund_code, fund_msg = self._fetch_asset_balance_with_error(
+                    session, "FUND", coin=None, member_id=member_id
+                )
+                if not fund_bal and fund_code:
+                    funding_error = f"retCode={fund_code} {fund_msg}".strip()
+                    if fund_code == 10005:
+                        self.wallet_perms[name] = False
+                if not fund_bal and not funding_error:
+                    fund_bal, fund_code, fund_msg = self._fetch_asset_balance_with_error(
+                        session, "FUND", coin="USDT", member_id=member_id
+                    )
+                    if not fund_bal and fund_code:
+                        funding_error = f"retCode={fund_code} {fund_msg}".strip()
+                        if fund_code == 10005:
+                            self.wallet_perms[name] = False
+            else:
+                funding_error = "wallet permission missing"
+            if not fund_bal:
+                fund_bal = self._fetch_balance(session, ["FUNDING"], coin=None)
+            if not fund_bal:
+                fund_bal = self._fetch_balance(session, ["FUNDING"], coin="USDT")
+            if funding_error:
+                funding_errors.append(f"{name}: {funding_error}")
+
+            unified_eq = safe_float(unified_bal.get("equity"))
+            unified_avail = safe_float(unified_bal.get("available"))
+            funding_eq = safe_float(fund_bal.get("equity"))
+            funding_avail = safe_float(fund_bal.get("available"))
+            total_equity = unified_eq + funding_eq
+            total_available = unified_avail + funding_avail
+
+            if total_equity <= 0:
+                continue
+            totals["equity"] += total_equity
+            totals["available"] += total_available
+            totals["unified"] += unified_eq
+            totals["funding"] += funding_eq
+            profile_payloads.append({
+                "name": name,
+                "unified_equity": unified_eq,
+                "funding_equity": funding_eq,
+                "total_equity": total_equity,
+                "available": total_available,
+                "funding_error": funding_error,
+            })
+
+        if not profile_payloads:
+            return
+        now_str = utc_now_str()
+        record = {
+            "ts": now_str,
+            "total_equity": totals["equity"],
+            "total_available": totals["available"],
+            "total_unified": totals["unified"],
+            "total_funding": totals["funding"],
+            "profiles": [
+                {"name": p["name"], "total_equity": p["total_equity"]}
+                for p in profile_payloads
+            ],
+        }
+        self.history.append(record)
+        append_jsonl(self.history_path, record)
+
+        self.latest = {
+            "ts": now_str,
+            "total_equity": totals["equity"],
+            "total_available": totals["available"],
+            "total_unified": totals["unified"],
+            "total_funding": totals["funding"],
+            "profile_count": len(profile_payloads),
+            "profiles": profile_payloads,
+            "stats": compute_balance_stats(list(self.history), flow_threshold_pct=self.flow_threshold_pct),
+            "funding_error": "; ".join(funding_errors) if funding_errors else None,
+        }
+
+    def get_history(self, limit: int = 200):
+        if limit <= 0:
+            return []
+        return list(self.history)[-limit:]
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._poll_once()
+            except Exception:
+                pass
+            time.sleep(self.poll_sec)
+
+
 def is_protective_order(order: dict) -> bool:
     order_type = str(order.get("orderType") or "").lower()
     order_filter = str(order.get("orderFilter") or "").lower()
@@ -229,6 +704,13 @@ def extract_price(latest: dict):
             p = safe_float((positions.get(key) or {}).get("mark_price"))
             if p > 0:
                 return p
+    market = latest.get("market") or {}
+    market_close = safe_float(market.get("last_close"))
+    if market_close > 0:
+        return market_close
+    last_close = safe_float(latest.get("last_close"))
+    if last_close > 0:
+        return last_close
     fmap = feature_map(latest)
     for key in ("close", "mark_price", "last_price"):
         val = fmap.get(key)
@@ -299,7 +781,7 @@ EXTRA_SCRIPT = """
 
   function ensureCard() {
     if (document.getElementById("dashMarketCard")) return;
-    const grid = document.querySelector(".grid");
+    const grid = document.querySelector("#tradersSection .grid");
     if (!grid) return;
     const card = document.createElement("div");
     card.className = "card";
@@ -316,7 +798,7 @@ EXTRA_SCRIPT = """
 
   function ensurePerfCard() {
     if (document.getElementById("dashPerfCard")) return;
-    const grid = document.querySelector(".grid");
+    const grid = document.querySelector("#tradersSection .grid");
     if (!grid) return;
     const card = document.createElement("div");
     card.className = "card";
@@ -528,6 +1010,19 @@ HTML_PAGE = """<!doctype html>
       <div class="row"><span>Unrealized</span><span id="unrealPnl">--</span></div>
       <canvas id="equityChart"></canvas>
     </div>
+    <div class="card" style="animation-delay: 0.08s">
+      <h3>Account Balance</h3>
+      <div class="value" id="aggBalance">--</div>
+      <div class="row"><span>Available</span><span id="aggAvailable">--</span></div>
+      <div class="row"><span>Profiles</span><span id="aggProfiles">--</span></div>
+      <div class="row"><span>Total Return</span><span id="aggReturn">--</span></div>
+      <div class="row"><span>Max DD</span><span id="aggMaxDD">--</span></div>
+      <div class="row"><span>Volatility</span><span id="aggVolatility">--</span></div>
+      <div class="row"><span>Stability</span><span id="aggStability">--</span></div>
+      <div class="row"><span>Smoothness</span><span id="aggSmoothness">--</span></div>
+      <div class="row"><span>Trend / Day</span><span id="aggTrend">--</span></div>
+      <canvas id="balanceChart"></canvas>
+    </div>
     <div class="card" style="animation-delay: 0.1s">
       <h3>Position</h3>
       <div class="value" id="posSide">--</div>
@@ -644,9 +1139,51 @@ HTML_PAGE = """<!doctype html>
       document.getElementById("reconcileSource").textContent = rec.source || "--";
       document.getElementById("protectiveCount").textContent = rec.protective_orders ?? "--";
 
-      document.getElementById("errorCount").textContent = data.errors.runtime_count + " / " + data.errors.api_count;
-      document.getElementById("lastRuntime").textContent = data.errors.last_runtime_error || "--";
-      document.getElementById("lastApi").textContent = data.errors.last_api_error || "--";
+      const errors = data.errors || {};
+      document.getElementById("errorCount").textContent = `${errors.runtime_count ?? 0} / ${errors.api_count ?? 0}`;
+      document.getElementById("lastRuntime").textContent = errors.last_runtime_error || "--";
+      document.getElementById("lastApi").textContent = errors.last_api_error || "--";
+    }
+
+    function updateBalances(data) {
+      if (!data) return;
+      const stats = data.stats || {};
+      document.getElementById("aggBalance").textContent = data.total_equity ? fmt(data.total_equity, 4) : "--";
+      document.getElementById("aggAvailable").textContent = data.total_available ? fmt(data.total_available, 4) : "--";
+      document.getElementById("aggProfiles").textContent = data.profile_count ?? "--";
+      document.getElementById("aggReturn").textContent = stats.total_return_pct === null || stats.total_return_pct === undefined
+        ? "--"
+        : `${fmt(stats.total_return_pct, 2)}%`;
+      document.getElementById("aggMaxDD").textContent = stats.max_drawdown_pct === null || stats.max_drawdown_pct === undefined
+        ? "--"
+        : `${fmt(stats.max_drawdown_pct, 2)}%`;
+      document.getElementById("aggVolatility").textContent = stats.volatility_pct === null || stats.volatility_pct === undefined
+        ? "--"
+        : `${fmt(stats.volatility_pct, 2)}%`;
+      document.getElementById("aggStability").textContent = stats.stability_pct === null || stats.stability_pct === undefined
+        ? "--"
+        : `${fmt(stats.stability_pct, 1)}%`;
+      document.getElementById("aggSmoothness").textContent = stats.smoothness_r2 === null || stats.smoothness_r2 === undefined
+        ? "--"
+        : fmt(stats.smoothness_r2, 2);
+      document.getElementById("aggTrend").textContent = stats.slope_per_day === null || stats.slope_per_day === undefined
+        ? "--"
+        : fmt(stats.slope_per_day, 4);
+    }
+
+    async function fetchBalances() {
+      const resp = await fetch("/api/balances");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      updateBalances(data);
+    }
+
+    async function fetchBalanceHistory() {
+      const resp = await fetch("/api/balance_history?limit=200");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const balances = data.map(x => Number(x.total_equity || 0));
+      sparkline(document.getElementById("balanceChart"), balances, "#38bdf8");
     }
 
     async function fetchLatest() {
@@ -668,8 +1205,12 @@ HTML_PAGE = """<!doctype html>
 
     fetchLatest();
     fetchHistory();
+    fetchBalances();
+    fetchBalanceHistory();
     setInterval(fetchLatest, 2000);
     setInterval(fetchHistory, 10000);
+    setInterval(fetchBalances, 5000);
+    setInterval(fetchBalanceHistory, 15000);
   </script>
 </body>
 </html>
@@ -689,6 +1230,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
     symbols_filter = None
     fixed_files = None
     history_limit: int = 200
+    balance_monitor = None
 
     def _send(self, status, payload, content_type="application/json"):
         self.send_response(status)
@@ -746,6 +1288,18 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 return self._send(200, [])
             limit = int(qs.get("limit", [self.history_limit])[0])
             return self._send(200, tail_jsonl(file_map[symbol], limit=limit))
+
+        if parsed.path == "/api/balances":
+            if not self.balance_monitor:
+                return self._send(200, {})
+            return self._send(200, self.balance_monitor.latest or {})
+
+        if parsed.path == "/api/balance_history":
+            if not self.balance_monitor:
+                return self._send(200, [])
+            qs = parse_qs(parsed.query)
+            limit = int(qs.get("limit", [self.history_limit])[0])
+            return self._send(200, self.balance_monitor.get_history(limit))
 
         return self._send(404, {"error": "not found"})
 
@@ -909,6 +1463,11 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--history-limit", type=int, default=200)
+    parser.add_argument("--keys-file", type=str, default="key_profiles.json")
+    parser.add_argument("--balance-poll-sec", type=float, default=30.0)
+    parser.add_argument("--balance-history-limit", type=int, default=10000)
+    parser.add_argument("--balance-testnet", action="store_true")
+    parser.add_argument("--balance-flow-pct", type=float, default=2.0)
     parser.add_argument("--discord-webhook", type=str, default="")
     parser.add_argument("--notify-offline-sec", type=float, default=120.0)
     parser.add_argument("--notify-poll-sec", type=float, default=5.0)
@@ -930,6 +1489,18 @@ def main():
         MetricsHandler.symbols_filter = symbols_filter
 
     MetricsHandler.history_limit = args.history_limit
+
+    keys_path = Path(args.keys_file).expanduser() if args.keys_file else None
+    balance_monitor = BalanceMonitor(
+        keys_path=keys_path,
+        metrics_dir=MetricsHandler.metrics_dir,
+        poll_sec=max(5.0, args.balance_poll_sec),
+        history_limit=args.balance_history_limit,
+        testnet=args.balance_testnet,
+        flow_threshold_pct=max(0.1, args.balance_flow_pct),
+    )
+    MetricsHandler.balance_monitor = balance_monitor
+    balance_monitor.start()
 
     webhook = args.discord_webhook or os.getenv("DISCORD_WEBHOOK_URL", "")
     notifier = DiscordNotifier(

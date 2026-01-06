@@ -39,10 +39,13 @@ class FeatureEngine:
         # 4. Microstructure (Trade Based)
         # Taker Flow Z-Score
         if 'taker_buy_ratio' in df.columns:
-            df['taker_buy_z'] = (df['taker_buy_ratio'] - 0.5) / df['taker_buy_ratio'].rolling(24).std()
+            tb_std = df['taker_buy_ratio'].rolling(24).std().replace(0, np.nan)
+            df['taker_buy_z'] = (df['taker_buy_ratio'] - 0.5) / tb_std
             
         # Volume Anomaly
-        df['vol_z'] = (df['volume'] - df['volume'].rolling(24).mean()) / df['volume'].rolling(24).std()
+        vol_mean = df['volume'].rolling(24).mean()
+        vol_std = df['volume'].rolling(24).std().replace(0, np.nan)
+        df['vol_z'] = (df['volume'] - vol_mean) / vol_std
         
         # 5. Advanced Orderbook Features
         if 'ob_imbalance_mean' in df.columns:
@@ -58,7 +61,9 @@ class FeatureEngine:
             df['ask_depth_chg'] = df['ob_ask_depth_mean'].pct_change()
             
             # Spread Regime (Historical Z-Score)
-            df['spread_z'] = (df['ob_spread_mean'] - df['ob_spread_mean'].rolling(24).mean()) / df['ob_spread_mean'].rolling(24).std()
+            spread_mean = df['ob_spread_mean'].rolling(24).mean()
+            spread_std = df['ob_spread_mean'].rolling(24).std().replace(0, np.nan)
+            df['spread_z'] = (df['ob_spread_mean'] - spread_mean) / spread_std
 
             # --- NEW Advanced Metrics ---
             
@@ -74,8 +79,8 @@ class FeatureEngine:
             # 3. Imbalance Z-Score (Shock Detection)
             # Is current imbalance unusual compared to last 4 hours (16 bars)?
             roll_mean = df['ob_imbalance_mean'].rolling(window=16).mean()
-            roll_std = df['ob_imbalance_mean'].rolling(window=16).std()
-            df['ob_imbalance_z'] = (df['ob_imbalance_mean'] - roll_mean) / roll_std.replace(0, 1)
+            roll_std = df['ob_imbalance_mean'].rolling(window=16).std().replace(0, np.nan)
+            df['ob_imbalance_z'] = (df['ob_imbalance_mean'] - roll_mean) / roll_std
             
             # 4. Price-Liquidity Divergence
             # Sign(Price Chg) * Sign(Imbalance Chg)
@@ -110,7 +115,9 @@ class FeatureEngine:
                 
                 # Slope Shock (Z-Score)
                 # Detecting when the wall suddenly becomes "Thin/Glassy"
-                df['bid_slope_z'] = (df['ob_bid_elasticity'] - df['ob_bid_elasticity'].rolling(24).mean()) / df['ob_bid_elasticity'].rolling(24).std().replace(0, 1)
+                slope_mean = df['ob_bid_elasticity'].rolling(24).mean()
+                slope_std = df['ob_bid_elasticity'].rolling(24).std().replace(0, np.nan)
+                df['bid_slope_z'] = (df['ob_bid_elasticity'] - slope_mean) / slope_std
 
             # 8. Wall Integrity (Intention)
             # High = Concentrated liquidity at the front (Strong Intent)
@@ -152,7 +159,9 @@ class FeatureEngine:
 
         # 8. Volatility Regimes (Expansion/Compression)
         # Volatility Z-Score (Shock detection)
-        df['atr_z'] = (df['atr'] - df['atr'].rolling(24).mean()) / df['atr'].rolling(24).std().replace(0, 1)
+        atr_mean = df['atr'].rolling(24).mean()
+        atr_std = df['atr'].rolling(24).std().replace(0, np.nan)
+        df['atr_z'] = (df['atr'] - atr_mean) / atr_std
         
         # Volatility Regime (Intraday vs Daily)
         # Ratio > 1.0 = Expanding/High Vol -> Trend Risk

@@ -22,6 +22,7 @@ class DataConfig:
 @dataclass
 class StrategyConfig:
     base_limit_offset_atr: float = 0.88
+    
     time_limit_bars: int = 36        
     max_holding_bars: int = 144       
     stop_loss_atr: float = 3.9       
