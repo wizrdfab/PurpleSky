@@ -1158,6 +1158,11 @@ class LiveTradingV2:
         if self.open_orders_log_path is None:
             self.open_orders_log_path = Path(f"open_orders_{self.config.data.symbol}.jsonl")
         self.last_open_orders_sig: Optional[Tuple] = None
+        self.log_positions_raw = args.log_positions_raw
+        self.positions_log_path = Path(args.positions_log_path) if args.positions_log_path else None
+        if self.positions_log_path is None:
+            self.positions_log_path = Path(f"positions_raw_{self.config.data.symbol}.jsonl")
+        self.positions_raw_logged = False
         self.keys_file = Path(args.keys_file).expanduser() if args.keys_file else None
         self.keys_profile = args.keys_profile
 
@@ -1983,6 +1988,55 @@ class LiveTradingV2:
         atr = safe_float(order_info.get("atr_at_entry"))
         return self._entry_price_within_tolerance(entry_price, order_price, atr)
 
+    def _build_position_uid(
+        self,
+        payload: Dict,
+        side: Optional[str],
+        position_idx: int,
+        entry_ts_ms: int,
+    ) -> Tuple[Optional[str], str]:
+        position_id = payload.get("positionId") or payload.get("positionID") or payload.get("position_id")
+        if position_id:
+            return f"id:{position_id}", "position_id"
+        created_ms = normalize_ts_ms(payload.get("createdTime") or payload.get("created_time"))
+        if created_ms > 0:
+            return f"ct:{created_ms}|idx:{position_idx}|side:{side}", "created_time"
+        if entry_ts_ms > 0:
+            return f"et:{entry_ts_ms}|idx:{position_idx}|side:{side}", "entry_ts"
+        return None, "unknown"
+
+    def _update_position_identity(
+        self,
+        pos_state: Dict,
+        payload: Dict,
+        side: Optional[str],
+        position_idx: int,
+    ) -> None:
+        entry_ts_ms = safe_int(pos_state.get("entry_ts_ms"))
+        uid, source = self._build_position_uid(payload, side, position_idx, entry_ts_ms)
+        if uid:
+            pos_state["position_uid"] = uid
+            pos_state["position_uid_source"] = source
+        elif not pos_state.get("position_uid"):
+            pos_state["position_uid_source"] = source
+        origin_source = pos_state.get("origin_source")
+        pos_state["entry_verified"] = source in {"position_id", "created_time"} or origin_source in {
+            "execution",
+            "entry_intent",
+        }
+
+    def _maybe_refresh_position_entry(self, pos_state: Dict, created_time: int) -> None:
+        created_ms = normalize_ts_ms(created_time)
+        if created_ms <= 0:
+            return
+        existing_ms = safe_int(pos_state.get("entry_ts_ms"))
+        if existing_ms <= 0 or created_ms > existing_ms:
+            pos_state["entry_ts_ms"] = created_ms
+            pos_state["entry_bar_time"] = bar_time_from_ts(created_ms / 1000.0, self.tf_seconds)
+            pos_state["origin_source"] = "created_time"
+        elif not pos_state.get("entry_bar_time"):
+            pos_state["entry_bar_time"] = bar_time_from_ts(existing_ms / 1000.0, self.tf_seconds)
+
     def _data_health(self) -> str:
         bars = self.bar_window.bars
         if bars.empty:
@@ -2520,6 +2574,8 @@ class LiveTradingV2:
                 "position_idx": position_idx,
                 "external": pos_state.get("external", False),
             })
+            self._maybe_refresh_position_entry(pos_state, created_time)
+            self._update_position_identity(pos_state, pos, side, position_idx)
             if stop_loss > 0 or take_profit > 0:
                 pos_state["tp_sl_set"] = True
             positions[key] = pos_state
@@ -2574,6 +2630,8 @@ class LiveTradingV2:
             "entry_ts_ms": pos_state.get("entry_ts_ms"),
             "external": pos_state.get("external", False),
         })
+        self._maybe_refresh_position_entry(pos_state, created_time)
+        self._update_position_identity(pos_state, pos, side, position_idx)
         if stop_loss > 0 or take_profit > 0:
             pos_state["tp_sl_set"] = True
         self.state.state["position"] = pos_state
@@ -2688,6 +2746,8 @@ class LiveTradingV2:
             self.logger.info("Keys File: env")
         if self.log_open_orders_raw:
             self.logger.info(f"Open Orders Raw Log: {self.open_orders_log_path}")
+        if self.log_positions_raw:
+            self.logger.info(f"Positions Raw Log: {self.positions_log_path}")
         self.logger.info(f"Metrics Log: {self.metrics_path}")
         self.logger.info(f"WS Trades: {self.use_ws_trades} | WS OB: {self.use_ws_ob}")
         self.logger.info(f"WS Private: {self.use_ws_private} | Topics: {','.join(self.ws_private_topics) or 'none'}")
@@ -2739,17 +2799,56 @@ class LiveTradingV2:
                     self.last_trade_ids.append(trade["id"])
         return new_trades
 
+    def _log_positions_raw(self, reason: str) -> None:
+        if not self.log_positions_raw or self.positions_raw_logged:
+            return
+        try:
+            def _call_positions():
+                return self.exchange.session.get_positions(
+                    category="linear",
+                    symbol=self.config.data.symbol,
+                )
+            resp = self.api._call("get_positions_raw", _call_positions)
+            payload = {
+                "ts": utc_now_str(),
+                "symbol": self.config.data.symbol,
+                "reason": reason,
+                "response": resp,
+            }
+            append_jsonl(self.positions_log_path, payload)
+            self.positions_raw_logged = True
+            self.logger.info(f"Positions raw payload logged: {self.positions_log_path}")
+        except Exception as exc:
+            self.logger.error(f"Failed to log positions raw payload: {exc}")
+
     def _reconcile(self, reason: str) -> None:
         if self.dry_run:
             return
         now = time.time()
         state_orders = self.state.state.get("active_orders", {})
+        self._log_positions_raw(reason)
 
         if self.use_ws_private and self.ws_private is not None:
             self._process_ws_private()
             ws_fresh = self.ws_private_last_ts > 0 and (now - self.ws_private_last_ts) <= self.ws_private_stale_sec
             rest_due = self.ws_private_rest_sec > 0 and (now - self.ws_private_last_rest) >= self.ws_private_rest_sec
+            rest_needed = False
             if ws_fresh and not rest_due:
+                if self.hedge_mode:
+                    positions_state = self.state.state.get("positions", {})
+                    if isinstance(positions_state, dict):
+                        for key in ("long", "short"):
+                            pos_state = positions_state.get(key, {})
+                            if pos_state and safe_float(pos_state.get("size")) > 0:
+                                if not safe_bool(pos_state.get("entry_verified")):
+                                    rest_needed = True
+                                    break
+                else:
+                    pos_state = self.state.state.get("position", {})
+                    if pos_state and safe_float(pos_state.get("size")) > 0:
+                        if not safe_bool(pos_state.get("entry_verified")):
+                            rest_needed = True
+            if ws_fresh and not rest_due and not rest_needed:
                 self._update_closed_pnl()
                 self.state.save()
                 self.last_reconcile_info = {
@@ -2905,6 +3004,8 @@ class LiveTradingV2:
                     "position_idx": safe_int(pos.get("position_idx")),
                     "external": pos_state.get("external", False),
                 })
+                self._maybe_refresh_position_entry(pos_state, created_time)
+                self._update_position_identity(pos_state, pos, side, safe_int(pos.get("position_idx")))
                 if stop_loss > 0 or take_profit > 0:
                     pos_state["tp_sl_set"] = True
                 positions_state[key] = pos_state
@@ -2979,6 +3080,8 @@ class LiveTradingV2:
                     "entry_ts_ms": pos_state.get("entry_ts_ms"),
                     "external": pos_state.get("external", False),
                 })
+                self._maybe_refresh_position_entry(pos_state, created_time)
+                self._update_position_identity(pos_state, pos, side, 0)
                 if stop_loss > 0 or take_profit > 0:
                     pos_state["tp_sl_set"] = True
                 self.state.state["position"] = pos_state
@@ -3602,6 +3705,8 @@ class LiveTradingV2:
                 pos = positions.get(key, {})
                 if not pos:
                     continue
+                if not safe_bool(pos.get("entry_verified")):
+                    continue
                 entry_bar = pos.get("entry_bar_time")
                 if entry_bar is None:
                     continue
@@ -3627,6 +3732,8 @@ class LiveTradingV2:
 
         pos = self.state.state.get("position", {})
         if not pos:
+            return
+        if not safe_bool(pos.get("entry_verified")):
             return
         entry_bar = pos.get("entry_bar_time")
         if entry_bar is None:
@@ -4482,6 +4589,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keys-profile", type=str, default="default", help="Profile name inside keys file")
     parser.add_argument("--log-open-orders-raw", action="store_true", help="Log raw open orders payload when it changes")
     parser.add_argument("--open-orders-log-path", type=str, default="", help="Path for raw open orders JSONL log")
+    parser.add_argument("--log-positions-raw", action="store_true", help="Log raw positions payload once")
+    parser.add_argument("--positions-log-path", type=str, default="", help="Path for raw positions JSONL log")
     parser.add_argument("--trade-poll-sec", type=float, default=DEFAULT_TRADE_POLL_SEC)
     parser.add_argument("--ob-poll-sec", type=float, default=DEFAULT_OB_POLL_SEC)
     parser.add_argument("--reconcile-sec", type=float, default=DEFAULT_RECONCILE_SEC)

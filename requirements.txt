@@ -12,3 +12,6 @@ optuna>=3.5.0
 
 # Pybit for interface with Bybit
 pybit>=5.0.0
+
+# Binance
+binance-futures-connector>=3.5.0
