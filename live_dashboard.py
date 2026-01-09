@@ -3,6 +3,7 @@ Live Metrics Dashboard (read-only).
 Serves a small web UI backed by live_metrics_<symbol>.jsonl.
 """
 import argparse
+import csv
 import json
 import os
 import threading
@@ -42,6 +43,59 @@ def tail_jsonl(path: Path, limit: int = 200, max_bytes: int = 512 * 1024):
     return records
 
 
+def tail_csv_dicts(path: Path, limit: int = 500, max_bytes: int = 2 * 1024 * 1024):
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            header_line = f.readline().strip()
+    except Exception:
+        return []
+    if not header_line:
+        return []
+    try:
+        header = next(csv.reader([header_line]))
+    except Exception:
+        return []
+    if not header:
+        return []
+    size = path.stat().st_size
+    block = min(size, max_bytes)
+    try:
+        with open(path, "rb") as f:
+            f.seek(-block, os.SEEK_END)
+            data = f.read(block)
+    except Exception:
+        return []
+    lines = data.splitlines()
+    if size > block and lines:
+        lines = lines[1:]
+    rows: List[str] = []
+    for line in lines:
+        try:
+            text = line.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        if text == header_line:
+            continue
+        rows.append(text)
+    if not rows:
+        return []
+    rows = rows[-limit:]
+    parsed = []
+    try:
+        reader = csv.reader(rows)
+        for row in reader:
+            if not row or len(row) < len(header):
+                continue
+            parsed.append({k: v for k, v in zip(header, row)})
+    except Exception:
+        return []
+    return parsed
+
+
 def read_latest(path: Path):
     records = tail_jsonl(path, limit=1, max_bytes=64 * 1024)
     return records[-1] if records else {}
@@ -52,6 +106,15 @@ def safe_float(value, default=0.0):
         if value is None or value == "":
             return default
         return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
     except Exception:
         return default
 
@@ -71,6 +134,15 @@ def parse_ts(ts: str):
         return None
     try:
         return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def day_key_from_ms(ts_ms: int) -> Optional[str]:
+    if not ts_ms:
+        return None
+    try:
+        return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
     except Exception:
         return None
 
@@ -197,93 +269,573 @@ def feature_map(latest: dict):
     return mapping
 
 
-def compute_trade_stats(metrics_path: Path, limit: int = 400):
-    metrics = tail_jsonl(metrics_path, limit=limit)
-    if not metrics:
-        return {}
-    enriched = []
-    for item in metrics:
-        ts = parse_ts(item.get("ts"))
-        enriched.append((ts if ts is not None else 0, item))
-    enriched.sort(key=lambda x: x[0])
-    ordered = [item for _, item in enriched]
+def extract_keys_profile(latest: dict) -> Optional[str]:
+    if not isinstance(latest, dict):
+        return None
+    profile = latest.get("keys_profile")
+    if profile:
+        return str(profile)
+    model = latest.get("model") or {}
+    profile = model.get("keys_profile")
+    if profile:
+        return str(profile)
+    return None
 
-    latest_startup = ordered[-1].get("startup_time")
-    if latest_startup:
-        ordered = [item for item in ordered if item.get("startup_time") == latest_startup]
-        if not ordered:
-            ordered = [enriched[-1][1]]
 
-    daily_pnls = [safe_float(item.get("daily_pnl")) for item in ordered]
-    trade_pnls = []
-    for i in range(1, len(daily_pnls)):
-        diff = daily_pnls[i] - daily_pnls[i - 1]
-        if abs(diff) <= 1e-9:
-            continue
-        prev_ts = parse_ts(ordered[i - 1].get("ts"))
-        curr_ts = parse_ts(ordered[i].get("ts"))
-        if prev_ts and curr_ts:
-            prev_date = datetime.fromtimestamp(prev_ts, tz=timezone.utc).date()
-            curr_date = datetime.fromtimestamp(curr_ts, tz=timezone.utc).date()
-            if curr_date != prev_date and daily_pnls[i] <= 0.0001:
-                # Daily reset; ignore this jump.
+class TradeStatsState:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.file_pos = 0
+        self.buffer = b""
+        self.last_daily_pnl = None
+        self.last_ts = None
+        self.last_startup = None
+        self.trade_count = 0
+        self.sum_trades = 0.0
+        self.sum_wins = 0.0
+        self.sum_losses = 0.0
+        self.win_count = 0
+        self.loss_count = 0
+        self.neg_sq_sum = 0.0
+        self.equity_peak = None
+        self.max_drawdown = 0.0
+
+    def update_from_path(self, metrics_path: Path) -> None:
+        if not metrics_path.exists():
+            return
+        size = metrics_path.stat().st_size
+        if size < self.file_pos:
+            self.reset()
+        if size == self.file_pos and not self.buffer:
+            return
+        with open(metrics_path, "rb") as f:
+            f.seek(self.file_pos)
+            data = f.read()
+            self.file_pos = f.tell()
+        if not data and not self.buffer:
+            return
+        data = self.buffer + data
+        lines = data.splitlines()
+        if data and not data.endswith(b"\n"):
+            self.buffer = lines[-1] if lines else data
+            lines = lines[:-1]
+        else:
+            self.buffer = b""
+        for line in lines:
+            try:
+                item = json.loads(line.decode("utf-8"))
+            except Exception:
                 continue
-        trade_pnls.append(diff)
+            self._process_item(item)
 
-    equity = [safe_float(item.get("equity")) for item in ordered if safe_float(item.get("equity")) > 0]
-    max_dd_pct = None
-    if len(equity) >= 2:
-        peak = equity[0]
-        max_dd = 0.0
-        for val in equity:
-            peak = max(peak, val)
-            if peak > 0:
-                dd = (val - peak) / peak
-                if dd < max_dd:
-                    max_dd = dd
-        max_dd_pct = abs(max_dd) * 100.0
+    def _process_item(self, item: dict) -> None:
+        ts = parse_ts(item.get("ts"))
+        daily = safe_float(item.get("daily_pnl"))
+        startup = item.get("startup_time")
 
-    if not trade_pnls:
+        if self.last_startup is None and startup:
+            self.last_startup = startup
+
+        if startup and self.last_startup and startup != self.last_startup:
+            self.last_startup = startup
+            self.last_daily_pnl = daily
+            self.last_ts = ts
+        else:
+            diff = None
+            if self.last_daily_pnl is not None:
+                diff = daily - self.last_daily_pnl
+                if abs(diff) <= 1e-9:
+                    diff = None
+                elif self.last_ts is not None and ts is not None:
+                    prev_date = datetime.fromtimestamp(self.last_ts, tz=timezone.utc).date()
+                    curr_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                    if curr_date != prev_date and daily <= 0.0001:
+                        diff = None
+            if diff is not None:
+                self.trade_count += 1
+                self.sum_trades += diff
+                if diff > 0:
+                    self.sum_wins += diff
+                    self.win_count += 1
+                else:
+                    self.sum_losses += diff
+                    self.loss_count += 1
+                    self.neg_sq_sum += diff * diff
+            self.last_daily_pnl = daily
+            self.last_ts = ts
+            if startup:
+                self.last_startup = startup
+
+        equity = safe_float(item.get("equity"))
+        if equity > 0:
+            if self.equity_peak is None or equity > self.equity_peak:
+                self.equity_peak = equity
+            if self.equity_peak:
+                dd = (equity - self.equity_peak) / self.equity_peak
+                if dd < self.max_drawdown:
+                    self.max_drawdown = dd
+
+    def summary(self) -> Dict[str, Optional[float]]:
+        max_dd_pct = None
+        if self.equity_peak is not None:
+            max_dd_pct = abs(self.max_drawdown) * 100.0
+        if self.trade_count == 0:
+            return {
+                "trades": 0,
+                "win_rate": None,
+                "sortino": None,
+                "profit_factor": None,
+                "avg_trade": None,
+                "avg_win": None,
+                "avg_loss": None,
+                "max_drawdown_pct": max_dd_pct,
+            }
+
+        win_rate = self.win_count / self.trade_count if self.trade_count else None
+        avg_trade = self.sum_trades / self.trade_count if self.trade_count else None
+        avg_win = self.sum_wins / self.win_count if self.win_count else None
+        avg_loss = self.sum_losses / self.loss_count if self.loss_count else None
+        profit_factor = None
+        if self.sum_wins > 0 and self.sum_losses < 0:
+            profit_factor = self.sum_wins / abs(self.sum_losses)
+
+        if self.loss_count:
+            downside = (self.neg_sq_sum / self.loss_count) ** 0.5
+            sortino = (avg_trade or 0.0) / downside if downside > 0 else 0
+        else:
+            sortino = 10.0
+
         return {
-            "trades": 0,
-            "win_rate": None,
-            "sortino": None,
-            "profit_factor": None,
-            "avg_trade": None,
-            "avg_win": None,
-            "avg_loss": None,
+            "trades": self.trade_count,
+            "win_rate": win_rate,
+            "sortino": sortino,
+            "profit_factor": profit_factor,
+            "avg_trade": avg_trade,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
             "max_drawdown_pct": max_dd_pct,
         }
 
-    wins = [p for p in trade_pnls if p > 0]
-    losses = [p for p in trade_pnls if p < 0]
-    trade_count = len(trade_pnls)
-    win_rate = len(wins) / trade_count if trade_count else None
-    avg_trade = sum(trade_pnls) / trade_count if trade_count else None
-    avg_win = sum(wins) / len(wins) if wins else None
-    avg_loss = sum(losses) / len(losses) if losses else None
-    profit_factor = None
-    if wins and losses:
-        profit_factor = sum(wins) / abs(sum(losses))
 
-    sortino = None
-    if losses:
-        downside = (sum(p * p for p in losses) / len(losses)) ** 0.5
-        if downside > 0:
-            sortino = (avg_trade or 0.0) / downside
-    else:
-        sortino = 10.0
+class ClosedPnlState:
+    def __init__(self, profile: Optional[str] = None) -> None:
+        self.profile = profile
+        self.reset(keep_profile=True)
 
-    return {
-        "trades": trade_count,
-        "win_rate": win_rate,
-        "sortino": sortino,
-        "profit_factor": profit_factor,
-        "avg_trade": avg_trade,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "max_drawdown_pct": max_dd_pct,
-    }
+    def reset(self, keep_profile: bool = True) -> None:
+        profile = self.profile if keep_profile else None
+        self.profile = profile
+        self.backfill_done = False
+        self.last_time = 0
+        self.last_ids: set = set()
+        self.trade_count = 0
+        self.sum_trades = 0.0
+        self.sum_wins = 0.0
+        self.sum_losses = 0.0
+        self.win_count = 0
+        self.loss_count = 0
+        self.neg_sq_sum = 0.0
+        self.cum_pnl = 0.0
+        self.peak_pnl = 0.0
+        self.max_drawdown = 0.0
+        self.day_pnls: Dict[str, float] = {}
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "profile": self.profile,
+            "backfill_done": self.backfill_done,
+            "last_time": self.last_time,
+            "last_ids": list(self.last_ids),
+            "trade_count": self.trade_count,
+            "sum_trades": self.sum_trades,
+            "sum_wins": self.sum_wins,
+            "sum_losses": self.sum_losses,
+            "win_count": self.win_count,
+            "loss_count": self.loss_count,
+            "neg_sq_sum": self.neg_sq_sum,
+            "cum_pnl": self.cum_pnl,
+            "peak_pnl": self.peak_pnl,
+            "max_drawdown": self.max_drawdown,
+            "day_pnls": self.day_pnls,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, object]) -> "ClosedPnlState":
+        state = cls(profile=payload.get("profile"))
+        state.backfill_done = bool(payload.get("backfill_done"))
+        state.last_time = safe_int(payload.get("last_time"), 0)
+        state.last_ids = set(payload.get("last_ids") or [])
+        state.trade_count = safe_int(payload.get("trade_count"), 0)
+        state.sum_trades = safe_float(payload.get("sum_trades"))
+        state.sum_wins = safe_float(payload.get("sum_wins"))
+        state.sum_losses = safe_float(payload.get("sum_losses"))
+        state.win_count = safe_int(payload.get("win_count"), 0)
+        state.loss_count = safe_int(payload.get("loss_count"), 0)
+        state.neg_sq_sum = safe_float(payload.get("neg_sq_sum"))
+        state.cum_pnl = safe_float(payload.get("cum_pnl"))
+        state.peak_pnl = safe_float(payload.get("peak_pnl"))
+        state.max_drawdown = safe_float(payload.get("max_drawdown"))
+        day_pnls = payload.get("day_pnls") or {}
+        if isinstance(day_pnls, dict):
+            state.day_pnls = {str(k): safe_float(v) for k, v in day_pnls.items()}
+        return state
+
+    def _record_id(self, record: Dict[str, object]) -> Optional[str]:
+        for key in ("orderId", "execId", "orderLinkId", "tradeId"):
+            val = record.get(key)
+            if val:
+                return str(val)
+        return None
+
+    def _apply_pnl(self, pnl: float) -> None:
+        self.trade_count += 1
+        self.sum_trades += pnl
+        if pnl > 0:
+            self.sum_wins += pnl
+            self.win_count += 1
+        elif pnl < 0:
+            self.sum_losses += pnl
+            self.loss_count += 1
+            self.neg_sq_sum += pnl * pnl
+        self.cum_pnl += pnl
+        if self.cum_pnl > self.peak_pnl:
+            self.peak_pnl = self.cum_pnl
+        drawdown = self.cum_pnl - self.peak_pnl
+        if drawdown < self.max_drawdown:
+            self.max_drawdown = drawdown
+
+    def ingest_record(self, record: Dict[str, object], allow_old: bool = False) -> bool:
+        created = safe_int(record.get("createdTime"), 0)
+        record_id = self._record_id(record)
+        if not allow_old:
+            if created < self.last_time:
+                return False
+            if created == self.last_time and record_id and record_id in self.last_ids:
+                return False
+        pnl = safe_float(record.get("closedPnl"))
+        self._apply_pnl(pnl)
+        if created > self.last_time:
+            self.last_time = created
+            self.last_ids = set()
+        if created == self.last_time and record_id:
+            self.last_ids.add(record_id)
+        day_key = day_key_from_ms(created)
+        if day_key:
+            self.day_pnls[day_key] = self.day_pnls.get(day_key, 0.0) + pnl
+        return True
+
+    def prune_days(self, cutoff_day: str) -> None:
+        if not self.day_pnls or not cutoff_day:
+            return
+        self.day_pnls = {day: val for day, val in self.day_pnls.items() if day >= cutoff_day}
+
+    def summary(self) -> Dict[str, Optional[float]]:
+        max_dd_pct = None
+        if self.peak_pnl > 0:
+            max_dd_pct = abs(self.max_drawdown) / self.peak_pnl * 100.0
+        if self.trade_count == 0:
+            return {
+                "trades": 0,
+                "win_rate": None,
+                "sortino": None,
+                "profit_factor": None,
+                "avg_trade": None,
+                "avg_win": None,
+                "avg_loss": None,
+                "max_drawdown_pct": max_dd_pct,
+            }
+
+        win_rate = self.win_count / self.trade_count if self.trade_count else None
+        avg_trade = self.sum_trades / self.trade_count if self.trade_count else None
+        avg_win = self.sum_wins / self.win_count if self.win_count else None
+        avg_loss = self.sum_losses / self.loss_count if self.loss_count else None
+        profit_factor = None
+        if self.sum_wins > 0 and self.sum_losses < 0:
+            profit_factor = self.sum_wins / abs(self.sum_losses)
+
+        if self.loss_count:
+            downside = (self.neg_sq_sum / self.loss_count) ** 0.5
+            sortino = (avg_trade or 0.0) / downside if downside > 0 else 0
+        else:
+            sortino = 10.0
+
+        return {
+            "trades": self.trade_count,
+            "win_rate": win_rate,
+            "sortino": sortino,
+            "profit_factor": profit_factor,
+            "avg_trade": avg_trade,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "max_drawdown_pct": max_dd_pct,
+        }
+
+
+class ClosedPnlMonitor:
+    def __init__(
+        self,
+        keys_path: Path,
+        metrics_dir: Path,
+        poll_sec: float = 60.0,
+        testnet: bool = False,
+        symbols_filter: Optional[set] = None,
+        page_limit: int = 50,
+        backfill_sleep: float = 0.2,
+        reset_cutoff_ms: Optional[int] = None,
+    ):
+        self.keys_path = keys_path
+        self.metrics_dir = metrics_dir
+        self.poll_sec = poll_sec
+        self.testnet = testnet
+        self.symbols_filter = symbols_filter
+        self.page_limit = max(10, min(200, page_limit))
+        self.backfill_sleep = max(0.05, backfill_sleep)
+        self.cache_path = metrics_dir / "closed_pnl_stats.json"
+        if reset_cutoff_ms is None:
+            self.cutoff_ms = 1767484800000
+        else:
+            self.cutoff_ms = reset_cutoff_ms
+        self.cutoff_day = day_key_from_ms(self.cutoff_ms) or "1970-01-01"
+        self.states: Dict[str, ClosedPnlState] = {}
+        self.stats: Dict[str, Dict[str, Optional[float]]] = {}
+        self.sessions: Dict[str, object] = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        if reset_cutoff_ms is None:
+            self._load_cache()
+
+    def _load_cache(self) -> None:
+        if not self.cache_path.exists():
+            return
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        symbols = payload.get("symbols")
+        if not isinstance(symbols, dict):
+            return
+        for symbol, entry in symbols.items():
+            if not isinstance(entry, dict):
+                continue
+            if "day_pnls" not in entry:
+                continue
+            state = ClosedPnlState.from_dict(entry)
+            if state.last_time and state.last_time < self.cutoff_ms:
+                continue
+            state.prune_days(self.cutoff_day)
+            self.states[symbol] = state
+            self.stats[symbol] = state.summary()
+
+    def _save_cache(self) -> None:
+        payload = {
+            "version": 1,
+            "updated_at": utc_now_str(),
+            "symbols": {sym: state.to_dict() for sym, state in self.states.items()},
+        }
+        try:
+            self.cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            return
+
+    def _refresh_sessions(self) -> Dict[str, Dict[str, str]]:
+        profiles = load_key_profiles(self.keys_path)
+        if not profiles:
+            return {}
+        for name, creds in profiles.items():
+            if name in self.sessions:
+                continue
+            key = creds.get("api_key")
+            secret = creds.get("api_secret")
+            if not key or not secret or BybitHTTP is None:
+                continue
+            try:
+                self.sessions[name] = BybitHTTP(
+                    testnet=self.testnet,
+                    api_key=key,
+                    api_secret=secret,
+                )
+            except Exception:
+                continue
+        return profiles
+
+    def _fetch_closed_pnl_page(self, session, symbol: str, cursor: Optional[str] = None):
+        params = {"category": "linear", "symbol": symbol, "limit": self.page_limit}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = session.get_closed_pnl(**params)
+        except Exception:
+            return None, None
+        if not isinstance(resp, dict) or resp.get("retCode") not in (None, 0):
+            return None, None
+        result = resp.get("result") or {}
+        records = result.get("list") or []
+        next_cursor = result.get("nextPageCursor") or result.get("cursor")
+        return records, next_cursor
+
+    def _discover_symbol_profiles(self) -> Dict[str, str]:
+        file_map = discover_metrics_files(self.metrics_dir, self.symbols_filter)
+        mapping: Dict[str, str] = {}
+        for symbol, path in file_map.items():
+            latest = read_latest(path)
+            profile = extract_keys_profile(latest)
+            if profile:
+                mapping[symbol] = profile
+        return mapping
+
+    def _backfill_symbol(self, symbol: str, session, state: ClosedPnlState) -> None:
+        cursor = None
+        while not self._stop.is_set():
+            records, cursor = self._fetch_closed_pnl_page(session, symbol, cursor)
+            if records is None:
+                break
+            if not records:
+                break
+            for record in records:
+                if safe_int(record.get("createdTime"), 0) < self.cutoff_ms:
+                    continue
+                state.ingest_record(record, allow_old=True)
+            if not cursor:
+                break
+            time.sleep(self.backfill_sleep)
+        state.backfill_done = True
+
+    def _update_symbol(self, symbol: str, session, state: ClosedPnlState) -> None:
+        prev_last_time = state.last_time
+        prev_last_ids = set(state.last_ids)
+        cursor = None
+        while not self._stop.is_set():
+            records, cursor = self._fetch_closed_pnl_page(session, symbol, cursor)
+            if records is None:
+                break
+            if not records:
+                break
+            oldest = None
+            for record in records:
+                created = safe_int(record.get("createdTime"), 0)
+                if created < self.cutoff_ms:
+                    continue
+                if oldest is None or created < oldest:
+                    oldest = created
+                record_id = state._record_id(record)
+                if created > prev_last_time or (created == prev_last_time and record_id and record_id not in prev_last_ids):
+                    state.ingest_record(record, allow_old=False)
+            if not cursor:
+                break
+            if oldest is None or oldest <= prev_last_time:
+                break
+            time.sleep(self.backfill_sleep)
+
+    def start(self) -> None:
+        if BybitHTTP is None:
+            return
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def get_stats(self, symbol: str) -> Dict[str, Optional[float]]:
+        return self.stats.get(symbol, {})
+
+    def get_daily_pnl(self, symbol: str, day_key: Optional[str] = None) -> Optional[float]:
+        state = self.states.get(symbol)
+        if not state:
+            return None
+        day_key = day_key or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if day_key in state.day_pnls:
+            return state.day_pnls.get(day_key)
+        if state.backfill_done:
+            return 0.0
+        return None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._refresh_sessions()
+            symbol_profiles = self._discover_symbol_profiles()
+            for symbol, profile in symbol_profiles.items():
+                if self._stop.is_set():
+                    break
+                session = self.sessions.get(profile)
+                if not session:
+                    continue
+                state = self.states.get(symbol)
+                if state is None or state.profile != profile:
+                    state = ClosedPnlState(profile=profile)
+                    self.states[symbol] = state
+                if not state.backfill_done:
+                    self._backfill_symbol(symbol, session, state)
+                else:
+                    self._update_symbol(symbol, session, state)
+                self.stats[symbol] = state.summary()
+            self._save_cache()
+            self._stop.wait(self.poll_sec)
+
+
+_TRADE_STATS_CACHE: Dict[str, TradeStatsState] = {}
+CLOSED_PNL_MONITOR: Optional[ClosedPnlMonitor] = None
+
+
+def seed_trade_stats_cache(file_map: Dict[str, Path]) -> None:
+    for path in file_map.values():
+        if not isinstance(path, Path):
+            try:
+                path = Path(path)
+            except Exception:
+                continue
+        if not path.exists():
+            continue
+        state = TradeStatsState()
+        try:
+            state.file_pos = path.stat().st_size
+        except Exception:
+            continue
+        latest = read_latest(path)
+        if isinstance(latest, dict):
+            daily_val = latest.get("daily_pnl")
+            if daily_val is not None and daily_val != "":
+                state.last_daily_pnl = safe_float(daily_val)
+            ts_val = parse_ts(latest.get("ts"))
+            if ts_val is not None:
+                state.last_ts = ts_val
+            startup = latest.get("startup_time")
+            if startup:
+                state.last_startup = startup
+            equity = safe_float(latest.get("equity"))
+            if equity > 0:
+                state.equity_peak = equity
+        _TRADE_STATS_CACHE[str(path)] = state
+
+
+def compute_trade_stats(metrics_path: Path, limit: int = 400):
+    _ = limit
+    key = str(metrics_path)
+    state = _TRADE_STATS_CACHE.get(key)
+    if state is None:
+        state = TradeStatsState()
+        _TRADE_STATS_CACHE[key] = state
+    state.update_from_path(metrics_path)
+    metrics_summary = state.summary()
+
+    if CLOSED_PNL_MONITOR:
+        symbol = metrics_path.stem.replace("live_metrics_", "", 1)
+        if symbol == metrics_path.stem:
+            latest = read_latest(metrics_path)
+            symbol = latest.get("symbol") or symbol
+        closed_stats = CLOSED_PNL_MONITOR.get_stats(symbol)
+        if closed_stats:
+            combined = dict(closed_stats)
+            if metrics_summary.get("max_drawdown_pct") is not None:
+                combined["max_drawdown_pct"] = metrics_summary.get("max_drawdown_pct")
+            return combined
+    return metrics_summary
+
+
+def exchange_daily_pnl(symbol: str) -> Optional[float]:
+    if not CLOSED_PNL_MONITOR:
+        return None
+    return CLOSED_PNL_MONITOR.get_daily_pnl(symbol)
 
 
 def compute_balance_stats(history: List[dict], flow_threshold_pct: float = 2.0) -> Dict[str, float]:
@@ -389,6 +941,7 @@ class BalanceMonitor:
         history_limit: int = 10000,
         testnet: bool = False,
         flow_threshold_pct: float = 2.0,
+        reset_history: bool = False,
     ):
         self.keys_path = keys_path
         self.metrics_dir = metrics_dir
@@ -396,8 +949,10 @@ class BalanceMonitor:
         self.history_limit = history_limit
         self.testnet = testnet
         self.flow_threshold_pct = flow_threshold_pct
+        self.reset_history = reset_history
         self.history_path = metrics_dir / "balance_history.jsonl"
         self.history = deque(maxlen=history_limit)
+        self._history_loaded = False
         self.latest: Dict[str, object] = {}
         self.sessions: Dict[str, object] = {}
         self.member_ids: Dict[str, str] = {}
@@ -406,8 +961,37 @@ class BalanceMonitor:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _load_history(self) -> None:
+        if self._history_loaded:
+            return
         for item in tail_jsonl(self.history_path, limit=self.history_limit):
             self.history.append(item)
+        self._history_loaded = True
+
+    def _sync_latest_from_history(self) -> None:
+        if not self.history:
+            return
+        last = self.history[-1]
+        if not isinstance(last, dict):
+            return
+        profiles = last.get("profiles")
+        if not isinstance(profiles, list):
+            profiles = []
+        total_equity = safe_float(last.get("total_equity"))
+        total_available = safe_float(last.get("total_available"))
+        total_unified = safe_float(last.get("total_unified"))
+        total_funding = safe_float(last.get("total_funding"))
+        profile_count = len(profiles) if profiles else safe_int(last.get("profile_count"), 0)
+        self.latest = {
+            "ts": last.get("ts"),
+            "total_equity": total_equity,
+            "total_available": total_available,
+            "total_unified": total_unified,
+            "total_funding": total_funding,
+            "profile_count": profile_count,
+            "profiles": profiles,
+            "stats": compute_balance_stats(list(self.history), flow_threshold_pct=self.flow_threshold_pct),
+            "funding_error": last.get("funding_error"),
+        }
 
     def _refresh_sessions(self) -> Dict[str, Dict[str, str]]:
         profiles = load_key_profiles(self.keys_path)
@@ -524,9 +1108,14 @@ class BalanceMonitor:
         return member_id
 
     def start(self) -> None:
+        if self.reset_history:
+            self.history.clear()
+            self._history_loaded = True
+        else:
+            self._load_history()
+        self._sync_latest_from_history()
         if not self.keys_path or not self.keys_path.exists() or BybitHTTP is None:
             return
-        self._load_history()
         self._thread.start()
 
     def stop(self) -> None:
@@ -633,6 +1222,9 @@ class BalanceMonitor:
     def get_history(self, limit: int = 200):
         if limit <= 0:
             return []
+        if not self.history:
+            self._load_history()
+            self._sync_latest_from_history()
         return list(self.history)[-limit:]
 
     def _run(self) -> None:
@@ -727,6 +1319,9 @@ def extract_price(latest: dict):
 def augment_latest(latest: dict, symbol: str, metrics_path: Path):
     if not isinstance(latest, dict):
         return latest
+    exch_daily = exchange_daily_pnl(symbol)
+    if exch_daily is not None:
+        latest["daily_pnl"] = exch_daily
     price = extract_price(latest)
     resting = read_open_orders_latest(metrics_path, symbol)
     latest["dashboard"] = {
@@ -779,6 +1374,30 @@ EXTRA_SCRIPT = """
     return num.toFixed(d);
   }
 
+  function ensureStyles() {
+    if (document.getElementById("dashIcebergStyles")) return;
+    const style = document.createElement("style");
+    style.id = "dashIcebergStyles";
+    style.textContent = `
+      .iceberg-controls { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+      .mini-btn {
+        background: #1f2937;
+        border: 1px solid #334155;
+        color: #e5e7eb;
+        padding: 4px 8px;
+        border-radius: 6px;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .mini-btn:hover { border-color: #60a5fa; }
+      .chart-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      .chart-sub { color: var(--muted); font-size: 12px; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  ensureStyles();
+
   function ensureCard() {
     if (document.getElementById("dashMarketCard")) return;
     const grid = document.querySelector("#tradersSection .grid");
@@ -815,24 +1434,884 @@ EXTRA_SCRIPT = """
     grid.appendChild(card);
   }
 
+  function ensureIcebergCard() {
+    if (document.getElementById("dashIcebergCard")) return;
+    const grid = document.querySelector("#tradersSection .grid");
+    if (!grid) return;
+    const card = document.createElement("div");
+    card.className = "card";
+    card.id = "dashIcebergCard";
+    card.innerHTML = `
+      <h3>Iceberg</h3>
+      <div class="value" id="dashIcebergStatus">--</div>
+      <div class="row"><span>Entry Buy</span><span id="dashIcebergBuy" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>Entry Sell</span><span id="dashIcebergSell" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>TP Long</span><span id="dashIcebergTpLong" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>TP Short</span><span id="dashIcebergTpShort" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>L1</span><span id="dashIcebergL1">--</span></div>
+      <div class="row"><span>Controls</span>
+        <span id="dashIcebergControls" class="iceberg-controls">
+          <button class="mini-btn" id="icebergCancelBuy">Cancel Buy</button>
+          <button class="mini-btn" id="icebergCancelSell">Cancel Sell</button>
+          <button class="mini-btn" id="icebergCancelTpLong">Cancel TP Long</button>
+          <button class="mini-btn" id="icebergCancelTpShort">Cancel TP Short</button>
+        </span>
+      </div>
+    `;
+    grid.appendChild(card);
+  }
+
+  let chart = null;
+  let chartInitialized = false;
+  let chartTimer = null;
+  let chartFetchInFlight = false;
+  let chartFullCandles = [];
+  let chartIntervalSec = 60;
+  let chartLastSymbol = null;
+  let chartPricePrecision = 6;
+  let chartLibLoading = false;
+  let chartLibFallback = false;
+  const MIN_PRICE_PRECISION = 5;
+  let chartNeedsFit = true;
+  let chartUserZoom = false;
+  let chartZoomState = null;
+  let chartOverlay = { lines: [], markers: [], livePrice: null };
+
+  function ensureChartSection() {
+    if (document.getElementById("icebergChart")) return;
+    const chartSection = document.getElementById("chartSection");
+    if (chartSection) return;
+    const detailWrap = document.querySelector("#tradersSection .detail-wrap");
+    if (!detailWrap) return;
+    const wrap = document.createElement("div");
+    wrap.id = "icebergChartWrap";
+    wrap.innerHTML = `
+      <div class="chart-header">
+        <h3>Iceberg Chart</h3>
+        <div class="chart-sub" id="icebergChartMeta">--</div>
+      </div>
+      <div id="icebergChart"></div>
+    `;
+    detailWrap.appendChild(wrap);
+  }
+
+  function markChartInteracted() {
+    chartUserZoom = true;
+    chartNeedsFit = false;
+    if (chart && chart.getOption) {
+      const dz = chart.getOption().dataZoom || [];
+      if (dz.length) {
+        chartZoomState = {
+          start: dz[0].start,
+          end: dz[0].end,
+          startValue: dz[0].startValue,
+          endValue: dz[0].endValue,
+        };
+      }
+    }
+  }
+
+  function loadChartLib(callback) {
+    if (window.echarts) {
+      callback();
+      return;
+    }
+    if (chartLibLoading) {
+      setTimeout(() => loadChartLib(callback), 200);
+      return;
+    }
+    chartLibLoading = true;
+    const script = document.createElement("script");
+    script.src = "/static/echarts.min.js";
+    script.onerror = () => {
+      if (!chartLibFallback) {
+        chartLibFallback = true;
+        chartLibLoading = false;
+        const fallback = document.createElement("script");
+        fallback.src = "https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js";
+        fallback.onerror = () => {
+          chartLibLoading = false;
+          const meta = document.getElementById("icebergChartMeta");
+          if (meta) meta.textContent = "Chart library failed to load.";
+        };
+        fallback.onload = () => {
+          chartLibLoading = false;
+          callback();
+        };
+        document.head.appendChild(fallback);
+        return;
+      }
+      chartLibLoading = false;
+      const meta = document.getElementById("icebergChartMeta");
+      if (meta) meta.textContent = "Chart library failed to load.";
+    };
+    script.onload = () => {
+      chartLibLoading = false;
+      callback();
+    };
+    document.head.appendChild(script);
+  }
+
+  function initChart() {
+    if (chartInitialized || !window.echarts) return;
+    ensureChartSection();
+    const container = document.getElementById("icebergChart");
+    if (!container) return;
+    if (container.clientWidth <= 0 || container.clientHeight <= 0) return;
+    chart = window.echarts.init(container, null, { renderer: "canvas", useDirtyRect: true });
+    chartInitialized = true;
+    chartPricePrecision = MIN_PRICE_PRECISION;
+    chart.setOption(baseChartOption(), { notMerge: true, lazyUpdate: true });
+    chart.on("datazoom", () => {
+      const dz = chart.getOption().dataZoom || [];
+      if (dz.length) {
+        chartZoomState = {
+          start: dz[0].start,
+          end: dz[0].end,
+          startValue: dz[0].startValue,
+          endValue: dz[0].endValue,
+        };
+      }
+      chartUserZoom = true;
+      chartNeedsFit = false;
+    });
+    if (chart.getZr) {
+      const zr = chart.getZr();
+      zr.on("mousedown", markChartInteracted);
+      zr.on("mousewheel", markChartInteracted);
+      zr.on("touchstart", markChartInteracted);
+    }
+  }
+
+  function parseTs(ts) {
+    if (ts === null || ts === undefined || ts === "") return null;
+    if (typeof ts === "number") {
+      const asNum = Number(ts);
+      if (!Number.isFinite(asNum)) return null;
+      return asNum > 1e12 ? Math.floor(asNum) : Math.floor(asNum * 1000);
+    }
+    if (typeof ts === "string") {
+      const cleaned = ts.trim();
+      if (!cleaned) return null;
+      const numeric = Number(cleaned);
+      if (Number.isFinite(numeric)) {
+        return numeric > 1e12 ? Math.floor(numeric) : Math.floor(numeric * 1000);
+      }
+      const iso = cleaned.replace(" ", "T");
+      const parsed = Date.parse(iso.endsWith("Z") ? iso : `${iso}Z`);
+      if (!Number.isFinite(parsed)) return null;
+      return parsed;
+    }
+    return null;
+  }
+
+  function inferPrecision(value) {
+    if (!Number.isFinite(value) || value <= 0) return 6;
+    const raw = value.toString();
+    if (raw.includes("e")) return 6;
+    const parts = raw.split(".");
+    const decimals = parts.length > 1 ? parts[1].length : 0;
+    return Math.min(8, Math.max(MIN_PRICE_PRECISION, decimals));
+  }
+
+  function applyPricePrecision(value) {
+    const precision = inferPrecision(value);
+    if (precision === chartPricePrecision) return;
+    chartPricePrecision = precision;
+  }
+
+  function fmtPrice(value) {
+    if (value === null || value === undefined) return "--";
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "--";
+    const precision = Math.max(MIN_PRICE_PRECISION, chartPricePrecision || 0);
+    return num.toFixed(precision);
+  }
+
+  function fmtQty(value) {
+    if (value === null || value === undefined) return "--";
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "--";
+    const abs = Math.abs(num);
+    const precision = abs >= 1 ? 4 : 6;
+    return num.toFixed(precision);
+  }
+
+  function setChartMeta(text) {
+    const meta = document.getElementById("icebergChartMeta");
+    if (meta) meta.textContent = text;
+  }
+
+  function chartTooltipFormatter(params) {
+    if (!Array.isArray(params)) return "";
+    let time = null;
+    let candle = null;
+    let lineValue = null;
+    let volume = null;
+    params.forEach(p => {
+      if (p.seriesId === "primary") {
+        const data = p.data || [];
+        if (p.seriesType === "candlestick") {
+          time = data[0];
+          candle = { open: data[1], close: data[2], low: data[3], high: data[4] };
+        } else {
+          time = data[0];
+          lineValue = Array.isArray(data) ? data[1] : p.value;
+        }
+      } else if (p.seriesId === "volume") {
+        const data = p.data || [];
+        if (Array.isArray(data)) {
+          volume = data[1];
+        } else if (Array.isArray(p.value)) {
+          volume = p.value[1];
+        } else {
+          volume = p.value;
+        }
+      }
+    });
+    const timeText = time ? new Date(time).toLocaleString() : "--";
+    const lines = [timeText];
+    if (candle) {
+      lines.push(`O ${fmtPrice(candle.open)} H ${fmtPrice(candle.high)} L ${fmtPrice(candle.low)} C ${fmtPrice(candle.close)}`);
+    } else if (lineValue !== null && lineValue !== undefined) {
+      lines.push(`Price ${fmtPrice(lineValue)}`);
+    }
+    if (volume !== null && volume !== undefined && volume !== 0) {
+      lines.push(`Vol ${fmtQty(volume)}`);
+    }
+    return lines.join("<br/>");
+  }
+
+  function baseChartOption() {
+    const axisLine = { lineStyle: { color: "#1f2937" } };
+    const splitLine = { show: true, lineStyle: { color: "#1f2937" } };
+    return {
+      backgroundColor: "transparent",
+      animation: false,
+      axisPointer: { link: [{ xAxisIndex: [0, 1] }] },
+      tooltip: {
+        trigger: "axis",
+        axisPointer: { type: "cross", label: { color: "#e5e7eb" } },
+        backgroundColor: "rgba(15, 23, 42, 0.92)",
+        borderColor: "#1f2937",
+        textStyle: { color: "#e5e7eb", fontFamily: "Space Grotesk, sans-serif", fontSize: 12 },
+        formatter: chartTooltipFormatter,
+      },
+      grid: [
+        { left: 56, right: 56, top: 20, height: "62%" },
+        { left: 56, right: 56, top: "70%", height: "20%" },
+      ],
+      xAxis: [
+        { type: "time", boundaryGap: true, axisLine, axisLabel: { color: "#94a3b8" }, splitLine },
+        { type: "time", gridIndex: 1, boundaryGap: true, axisLine, axisLabel: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
+      ],
+      yAxis: [
+        { type: "value", scale: true, axisLine, axisLabel: { color: "#94a3b8", formatter: (val) => fmtPrice(val) }, splitLine },
+        { type: "value", gridIndex: 1, scale: true, axisLine, axisLabel: { color: "#64748b", fontSize: 10 }, splitLine: { show: false } },
+      ],
+      dataZoom: buildDataZoom([]),
+      series: [],
+    };
+  }
+
+  function buildDataZoom(filtered) {
+    const zoom = {};
+    const shouldAuto = !chartUserZoom || chartNeedsFit;
+    if (chartUserZoom && chartZoomState) {
+      if (chartZoomState.start !== undefined && chartZoomState.end !== undefined) {
+        zoom.start = chartZoomState.start;
+        zoom.end = chartZoomState.end;
+      } else if (chartZoomState.startValue !== undefined && chartZoomState.endValue !== undefined) {
+        zoom.startValue = chartZoomState.startValue;
+        zoom.endValue = chartZoomState.endValue;
+      }
+    } else if (shouldAuto && filtered && filtered.length) {
+      zoom.startValue = filtered[0].time;
+      zoom.endValue = filtered[filtered.length - 1].time;
+    }
+    const inside = {
+      type: "inside",
+      xAxisIndex: [0, 1],
+      filterMode: "none",
+      zoomOnMouseWheel: true,
+      moveOnMouseWheel: true,
+      moveOnMouseMove: true,
+    };
+    const slider = {
+      type: "slider",
+      xAxisIndex: [0, 1],
+      bottom: 6,
+      height: 18,
+      borderColor: "#1f2937",
+      fillerColor: "rgba(56, 189, 248, 0.18)",
+      backgroundColor: "rgba(15, 23, 42, 0.6)",
+      handleStyle: { color: "#38bdf8", borderColor: "#38bdf8" },
+      textStyle: { color: "#94a3b8" },
+    };
+    return [Object.assign({}, inside, zoom), Object.assign({}, slider, zoom)];
+  }
+
+  function applyChartOption(series, filtered) {
+    if (!chart) return;
+    chart.setOption({ series, dataZoom: buildDataZoom(filtered || []) }, { lazyUpdate: true, replaceMerge: ["series"] });
+    chartNeedsFit = false;
+    applyChartOverlay();
+  }
+
+  function renderCandles(filtered) {
+    const candleData = (filtered || []).map(c => [c.time, c.open, c.close, c.low, c.high]);
+    const volumeData = (filtered || []).map(c => ({
+      value: [c.time, c.volume || 0],
+      itemStyle: { color: c.close >= c.open ? "rgba(34, 197, 94, 0.45)" : "rgba(239, 68, 68, 0.45)" },
+    }));
+    const series = [
+      {
+        id: "primary",
+        name: "Price",
+        type: "candlestick",
+        data: candleData,
+        encode: { x: 0, y: [1, 2, 3, 4] },
+        itemStyle: { color: "#22c55e", color0: "#ef4444", borderColor: "#22c55e", borderColor0: "#ef4444" },
+      },
+      {
+        id: "volume",
+        name: "Volume",
+        type: "bar",
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        barWidth: "60%",
+        data: volumeData,
+        encode: { x: 0, y: 1 },
+      },
+    ];
+    applyChartOption(series, filtered);
+  }
+
+  function renderLine(points) {
+    const lineData = (points || []).map(p => [p.time, p.value]);
+    const series = [
+      {
+        id: "primary",
+        name: "Price",
+        type: "line",
+        data: lineData,
+        encode: { x: 0, y: 1 },
+        showSymbol: false,
+        lineStyle: { color: "#38bdf8", width: 1.4 },
+        emphasis: { focus: "series" },
+      },
+      {
+        id: "volume",
+        name: "Volume",
+        type: "bar",
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        barWidth: "60%",
+        data: [],
+        encode: { x: 0, y: 1 },
+      },
+    ];
+    applyChartOption(series, points);
+  }
+
+  function applyChartOverlay() {
+    if (!chartInitialized || !chart) return;
+    const seriesList = chart.getOption().series || [];
+    if (!seriesList.some(s => s.id === "primary")) return;
+    const lines = [];
+    (chartOverlay.lines || []).forEach(item => {
+      const price = Number(item.price || 0);
+      if (!Number.isFinite(price) || price <= 0) return;
+      lines.push({
+        yAxis: price,
+        name: item.title || "",
+        lineStyle: { color: item.color || "#94a3b8", width: 1, type: "dashed" },
+        label: { show: true, formatter: "{b}", color: item.color || "#e5e7eb", fontSize: 10 },
+      });
+    });
+    if (chartOverlay.livePrice && Number.isFinite(chartOverlay.livePrice)) {
+      const lastPrice = Number(chartOverlay.livePrice);
+      lines.push({
+        yAxis: lastPrice,
+        name: `Last ${fmtPrice(lastPrice)}`,
+        lineStyle: { color: "#38bdf8", width: 1, type: "solid" },
+        label: { show: true, formatter: "{b}", color: "#38bdf8", fontSize: 10 },
+      });
+    }
+    const markers = (chartOverlay.markers || [])
+      .filter(m => Number.isFinite(m.time) && Number.isFinite(m.price))
+      .map(m => ({
+        coord: [m.time, m.price],
+        name: m.title || "",
+        itemStyle: { color: m.color || "#38bdf8" },
+        label: { show: true, color: "#0b1220", fontSize: 9, formatter: "{b}" },
+      }));
+    chart.setOption({
+      series: [
+        {
+          id: "primary",
+          markLine: { symbol: ["none", "none"], label: { show: true, formatter: "{b}" }, data: lines },
+          markPoint: { symbol: "pin", symbolSize: 32, label: { show: true, formatter: "{b}" }, data: markers },
+        },
+      ],
+    }, { lazyUpdate: true });
+  }
+
+  function normalizeCandles(rows) {
+    if (!Array.isArray(rows)) return [];
+    const out = [];
+    rows.forEach(row => {
+      const rawTime = row.time || row.t || row.timestamp || 0;
+      const timeNum = Number(rawTime);
+      const time = Number.isFinite(timeNum) ? (timeNum > 1e12 ? Math.floor(timeNum) : Math.floor(timeNum * 1000)) : 0;
+      const open = Number(row.open || 0);
+      const high = Number(row.high || 0);
+      const low = Number(row.low || 0);
+      const close = Number(row.close || 0);
+      if (!time || !open || !high || !low || !close) return;
+      const volume = Number(row.volume || 0);
+      out.push({
+        time: Math.floor(time),
+        open,
+        high,
+        low,
+        close,
+        volume: Number.isFinite(volume) ? volume : 0,
+      });
+    });
+    out.sort((a, b) => a.time - b.time);
+    return out;
+  }
+
+  function computeCandleLimit() {
+    if (!chartRangeSec) return 20000;
+    const interval = chartIntervalSec > 0 ? chartIntervalSec : 60;
+    const desired = Math.ceil(chartRangeSec / interval) + 120;
+    return Math.min(20000, Math.max(300, desired));
+  }
+
+  function filterCandles(candles) {
+    if (!chartRangeSec || !candles.length) return candles;
+    const last = candles[candles.length - 1];
+    const cutoff = last.time - chartRangeSec * 1000;
+    return candles.filter(c => c.time >= cutoff);
+  }
+
+  function setCandlesData(candles) {
+    chartFullCandles = candles || [];
+    const filtered = filterCandles(chartFullCandles);
+    if (!filtered.length) {
+      renderCandles([]);
+      setChartMeta("No chart data yet.");
+      return;
+    }
+    renderCandles(filtered);
+    const last = filtered[filtered.length - 1];
+    applyPricePrecision(last.close);
+    const interval = chartIntervalSec ? `${chartIntervalSec}s` : "--";
+    const lastTime = new Date(last.time).toLocaleTimeString();
+    const label = chartRangeLabel || "All";
+    setChartMeta(`Range ${label} | Bars ${filtered.length} | Last ${fmtPrice(last.close)} | ${lastTime} | Int ${interval}`);
+  }
+
+  function metricPrice(m) {
+    const market = m.market || {};
+    const pos = m.position || {};
+    const l1 = (m.iceberg && m.iceberg.l1) ? m.iceberg.l1 : {};
+    const bid = Number(l1.bid || 0);
+    const ask = Number(l1.ask || 0);
+    const mid = (bid > 0 && ask > 0) ? (bid + ask) * 0.5 : 0;
+    const price = Number(market.last_close || mid || pos.mark_price || pos.entry_price || 0);
+    return Number.isFinite(price) ? price : 0;
+  }
+
+  async function fetchMetricHistory(symbol) {
+    if (!chartInitialized) return;
+    const sampleSec = window.__dashMetricsIntervalSec || 2;
+    const targetRange = chartRangeSec || (24 * 60 * 60);
+    const desired = Math.ceil(targetRange / sampleSec) + 200;
+    const limit = Math.min(10000, Math.max(300, desired));
+    const resp = await fetch(`/api/metrics?symbol=${encodeURIComponent(symbol)}&limit=${limit}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!Array.isArray(data)) return;
+    const points = data.map(m => {
+      const time = parseTs(m.ts);
+      const value = metricPrice(m);
+      if (!time || !value) return null;
+      return { time, value };
+    }).filter(Boolean);
+    if (!points.length) {
+      setChartMeta("No chart data yet.");
+      return;
+    }
+    const now = Date.now();
+    const cutoff = chartRangeSec ? (now - chartRangeSec * 1000) : 0;
+    const filtered = cutoff > 0 ? points.filter(p => p.time >= cutoff) : points;
+    if (!filtered.length) {
+      setChartMeta("No data in selected range.");
+      return;
+    }
+    chartFullCandles = [];
+    renderLine(filtered);
+    const last = filtered[filtered.length - 1];
+    applyPricePrecision(last.value);
+    const label = chartRangeLabel || "All";
+    setChartMeta(`Range ${label} | Points ${filtered.length} | Last ${fmtPrice(last.value)} | Metrics feed`);
+  }
+
+  async function fetchChartHistory(force = false) {
+    if (!chartInitialized) return;
+    const symbol = window.__dashSymbol;
+    if (!symbol || chartFetchInFlight) return;
+    if (force) {
+      chartNeedsFit = true;
+      chartUserZoom = false;
+      chartZoomState = null;
+    }
+    chartFetchInFlight = true;
+    const currentSymbol = symbol;
+    try {
+      const limit = computeCandleLimit();
+      const resp = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&limit=${limit}`);
+      if (!resp.ok) {
+        await fetchMetricHistory(symbol);
+        return;
+      }
+      const payload = await resp.json();
+      if (currentSymbol !== window.__dashSymbol) return;
+      if (payload && payload.interval_sec) {
+        const interval = Number(payload.interval_sec);
+        if (Number.isFinite(interval) && interval > 0) {
+          chartIntervalSec = interval;
+        }
+      }
+      const candles = normalizeCandles(payload ? payload.candles : []);
+      if (!candles.length) {
+        await fetchMetricHistory(symbol);
+        return;
+      }
+      setCandlesData(candles);
+    } catch (_err) {
+      await fetchMetricHistory(symbol);
+    } finally {
+      chartFetchInFlight = false;
+    }
+  }
+
+  function updateLivePriceLine(price) {
+    if (!price || !chartInitialized) return;
+    applyPricePrecision(price);
+    if (chartOverlay.livePrice === price) return;
+    chartOverlay.livePrice = price;
+    applyChartOverlay();
+  }
+
+  function resolveMarkerTime(ts) {
+    const time = parseTs(ts);
+    if (!time) return null;
+    if (!chartFullCandles.length) return time;
+    for (let i = chartFullCandles.length - 1; i >= 0; i--) {
+      if (chartFullCandles[i].time <= time) return chartFullCandles[i].time;
+    }
+    return chartFullCandles[0].time;
+  }
+
+  function updateChartMarkers(data) {
+    const markers = [];
+    const ice = data.iceberg || {};
+    const tp = data.iceberg_tp || {};
+    const pushMarker = (time, price, color, title) => {
+      const t = Number(time || 0);
+      const p = Number(price || 0);
+      if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(p) || p <= 0) return;
+      markers.push({ time: t, price: p, color, title });
+    };
+    if (ice.buy && ice.buy.active) {
+      const time = resolveMarkerTime(ice.buy.last_post_ts || ice.buy.created_ts);
+      const price = Number(ice.buy.last_price || ice.buy.target_price || 0);
+      const info = ice.buy.last_post_ts ? icebergClipLabel(ice.buy) : icebergEntryLabel(ice.buy);
+      const label = ice.buy.last_post_ts ? "Buy Clip" : "Buy Entry";
+      pushMarker(time, price, "#22c55e", lineTitle(label, info));
+    }
+    if (ice.sell && ice.sell.active) {
+      const time = resolveMarkerTime(ice.sell.last_post_ts || ice.sell.created_ts);
+      const price = Number(ice.sell.last_price || ice.sell.target_price || 0);
+      const info = ice.sell.last_post_ts ? icebergClipLabel(ice.sell) : icebergEntryLabel(ice.sell);
+      const label = ice.sell.last_post_ts ? "Sell Clip" : "Sell Entry";
+      pushMarker(time, price, "#f97316", lineTitle(label, info));
+    }
+    if (tp.long && (tp.long.active || tp.long.paused)) {
+      const time = resolveMarkerTime(tp.long.tp_order_ts || tp.long.created_ts);
+      const price = Number(tp.long.tp_order_price || tp.long.tp_target || 0);
+      pushMarker(time, price, "#60a5fa", lineTitle("TP Long", tpInfoLabel(tp.long)));
+    }
+    if (tp.short && (tp.short.active || tp.short.paused)) {
+      const time = resolveMarkerTime(tp.short.tp_order_ts || tp.short.created_ts);
+      const price = Number(tp.short.tp_order_price || tp.short.tp_target || 0);
+      pushMarker(time, price, "#f59e0b", lineTitle("TP Short", tpInfoLabel(tp.short)));
+    }
+    chartOverlay.markers = markers;
+    applyChartOverlay();
+  }
+
+  function updateChartLines(data) {
+    const levels = [];
+    const ice = data.iceberg || {};
+    if (ice.buy && ice.buy.active) {
+      levels.push({ price: ice.buy.target_price, color: "#22c55e", title: priceTitle("Entry Buy", ice.buy.target_price, icebergEntryLabel(ice.buy)) });
+      if (ice.buy.tp) levels.push({ price: ice.buy.tp, color: "#38bdf8", title: priceTitle("Entry TP", ice.buy.tp, "") });
+      if (ice.buy.sl) levels.push({ price: ice.buy.sl, color: "#ef4444", title: priceTitle("Entry SL", ice.buy.sl, "") });
+      if (ice.buy.order_id && ice.buy.last_price) {
+        levels.push({ price: ice.buy.last_price, color: "#16a34a", title: priceTitle("Buy Clip", ice.buy.last_price, icebergClipLabel(ice.buy)) });
+      }
+    }
+    if (ice.sell && ice.sell.active) {
+      levels.push({ price: ice.sell.target_price, color: "#f97316", title: priceTitle("Entry Sell", ice.sell.target_price, icebergEntryLabel(ice.sell)) });
+      if (ice.sell.tp) levels.push({ price: ice.sell.tp, color: "#38bdf8", title: priceTitle("Entry TP", ice.sell.tp, "") });
+      if (ice.sell.sl) levels.push({ price: ice.sell.sl, color: "#ef4444", title: priceTitle("Entry SL", ice.sell.sl, "") });
+      if (ice.sell.order_id && ice.sell.last_price) {
+        levels.push({ price: ice.sell.last_price, color: "#ea580c", title: priceTitle("Sell Clip", ice.sell.last_price, icebergClipLabel(ice.sell)) });
+      }
+    }
+    const tp = data.iceberg_tp || {};
+    if (tp.long && (tp.long.active || tp.long.paused)) {
+      if (tp.long.tp_target) levels.push({ price: tp.long.tp_target, color: "#60a5fa", title: priceTitle("TP Long", tp.long.tp_target, tpInfoLabel(tp.long)) });
+      if (tp.long.sl_target) levels.push({ price: tp.long.sl_target, color: "#ef4444", title: priceTitle("SL Long", tp.long.sl_target, "") });
+      if (tp.long.tp_order_price) levels.push({ price: tp.long.tp_order_price, color: "#0ea5e9", title: priceTitle("TP Clip", tp.long.tp_order_price, tpInfoLabel(tp.long)) });
+    }
+    if (tp.short && (tp.short.active || tp.short.paused)) {
+      if (tp.short.tp_target) levels.push({ price: tp.short.tp_target, color: "#f59e0b", title: priceTitle("TP Short", tp.short.tp_target, tpInfoLabel(tp.short)) });
+      if (tp.short.sl_target) levels.push({ price: tp.short.sl_target, color: "#ef4444", title: priceTitle("SL Short", tp.short.sl_target, "") });
+      if (tp.short.tp_order_price) levels.push({ price: tp.short.tp_order_price, color: "#d97706", title: priceTitle("TP Clip", tp.short.tp_order_price, tpInfoLabel(tp.short)) });
+    }
+    chartOverlay.lines = levels.filter(level => Number(level.price) > 0);
+    applyChartOverlay();
+  }
+
+  let controlsBound = false;
+  let chartControlsBound = false;
+  let chartRangeSec = 15 * 60;
+  let chartRangeLabel = "15M";
+  async function sendCommand(scope, side) {
+    const symbol = window.__dashSymbol;
+    if (!symbol) return;
+    const payload = {
+      ts: Date.now() / 1000,
+      action: "cancel_iceberg",
+      scope,
+      side,
+      symbol,
+    };
+    try {
+      await fetch("/api/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      console.error("command failed", err);
+    }
+  }
+
+  function bindIcebergControls() {
+    if (controlsBound) return;
+    const buyBtn = document.getElementById("icebergCancelBuy");
+    const sellBtn = document.getElementById("icebergCancelSell");
+    const tpLongBtn = document.getElementById("icebergCancelTpLong");
+    const tpShortBtn = document.getElementById("icebergCancelTpShort");
+    if (!buyBtn || !sellBtn || !tpLongBtn || !tpShortBtn) return;
+    buyBtn.addEventListener("click", () => sendCommand("entry", "buy"));
+    sellBtn.addEventListener("click", () => sendCommand("entry", "sell"));
+    tpLongBtn.addEventListener("click", () => sendCommand("tp", "long"));
+    tpShortBtn.addEventListener("click", () => sendCommand("tp", "short"));
+    controlsBound = true;
+  }
+
+  function bindChartRangeControls() {
+    if (chartControlsBound) return;
+    const rangeWrap = document.getElementById("chartRange");
+    if (!rangeWrap) return;
+    const mapping = {
+      "15m": { label: "15M", sec: 15 * 60 },
+      "30m": { label: "30M", sec: 30 * 60 },
+      "1h": { label: "1H", sec: 60 * 60 },
+      "4h": { label: "4H", sec: 4 * 60 * 60 },
+      "6h": { label: "6H", sec: 6 * 60 * 60 },
+      "24h": { label: "24H", sec: 24 * 60 * 60 },
+      "1d": { label: "1D", sec: 24 * 60 * 60 },
+      "all": { label: "All", sec: 0 },
+    };
+    rangeWrap.querySelectorAll(".range-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        rangeWrap.querySelectorAll(".range-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        const key = (btn.dataset.range || "").toLowerCase();
+        const meta = mapping[key];
+        if (meta) {
+          chartNeedsFit = true;
+          chartUserZoom = false;
+          chartZoomState = null;
+          chartRangeSec = meta.sec;
+          chartRangeLabel = meta.label;
+          if (chartFullCandles.length) {
+            setCandlesData(chartFullCandles);
+          } else {
+            fetchChartHistory(true);
+          }
+        }
+      });
+    });
+    chartControlsBound = true;
+  }
+
   function formatOrders(list) {
     if (!Array.isArray(list) || !list.length) return "--";
     return list.slice(0, 4).map(item => {
       const side = item.side || "?";
-      const price = fmt(item.price, 6);
-      const qty = fmt(item.qty, 4);
+      const price = fmtPrice(item.price);
+      const qty = fmtQty(item.qty);
       return `${side} ${price} x${qty}`;
     }).join("\\n");
+  }
+
+  function formatIcebergSide(ice) {
+    if (!ice || !ice.active) return "--";
+    const target = fmtPrice(ice.target_price);
+    const tp = fmtPrice(ice.tp);
+    const sl = fmtPrice(ice.sl);
+    const rem = fmtQty(ice.remaining_qty);
+    const total = fmtQty(ice.total_qty);
+    const clip = fmtQty(ice.clip_qty);
+    const state = ice.order_id ? "posted" : "waiting";
+    const ready = (ice.activation_ready === null || ice.activation_ready === undefined)
+      ? "--"
+      : (ice.activation_ready ? "ready" : "wait");
+    return `T ${target} TP ${tp} SL ${sl}\\nRem ${rem}/${total} Clip ${clip} ${state} ${ready}`;
+  }
+
+  function formatTpIceberg(tp) {
+    if (!tp || (!tp.active && !tp.paused)) return "--";
+    const target = fmtPrice(tp.tp_target);
+    const sl = fmtPrice(tp.sl_target);
+    const size = fmtQty(tp.size);
+    const clipQty = fmtQty(tp.tp_order_qty);
+    const clipPrice = fmtPrice(tp.tp_order_price);
+    const clip = (tp.tp_order_qty && tp.tp_order_price) ? `${clipQty} @ ${clipPrice}` : "--";
+    const state = tp.paused ? "paused" : (tp.tp_order_id ? "posted" : "waiting");
+    const ready = (tp.activation_ready === null || tp.activation_ready === undefined)
+      ? "--"
+      : (tp.activation_ready ? "ready" : "wait");
+    return `TP ${target} SL ${sl}\\nSize ${size} Clip ${clip} ${state} ${ready}`;
+  }
+
+  function icebergStateLabel(ice) {
+    if (!ice || !ice.active) return "";
+    if (ice.order_id) return "posted";
+    if (ice.activation_ready === true) return "ready";
+    if (ice.activation_ready === false) return "wait";
+    return "wait";
+  }
+
+  function icebergFillLabel(ice) {
+    if (!ice) return "";
+    const total = Number(ice.total_qty || 0);
+    if (!total) return "";
+    const filled = Number(ice.filled_qty || 0);
+    return `${fmtQty(filled)}/${fmtQty(total)}`;
+  }
+
+  function icebergEntryLabel(ice) {
+    if (!ice || !ice.active) return "";
+    const parts = [];
+    const total = Number(ice.total_qty || 0);
+    if (total > 0) parts.push(`Size ${fmtQty(total)}`);
+    const fill = icebergFillLabel(ice);
+    if (fill) parts.push(`Fill ${fill}`);
+    const state = icebergStateLabel(ice);
+    if (state) parts.push(state);
+    return parts.join(" ");
+  }
+
+  function icebergClipLabel(ice) {
+    if (!ice || !ice.active) return "";
+    const parts = [];
+    const clip = Number(ice.clip_qty || 0);
+    if (clip > 0) parts.push(`Clip ${fmtQty(clip)}`);
+    const state = icebergStateLabel(ice);
+    if (state) parts.push(state);
+    return parts.join(" ");
+  }
+
+  function tpStateLabel(tp) {
+    if (!tp) return "";
+    if (tp.paused) return "paused";
+    if (tp.tp_order_id) return "posted";
+    if (tp.activation_ready === true) return "ready";
+    if (tp.activation_ready === false) return "wait";
+    return "wait";
+  }
+
+  function tpInfoLabel(tp) {
+    if (!tp || (!tp.active && !tp.paused)) return "";
+    const parts = [];
+    const size = Number(tp.size || 0);
+    if (size > 0) parts.push(`Size ${fmtQty(size)}`);
+    const clip = Number(tp.tp_order_qty || 0);
+    if (clip > 0) parts.push(`Clip ${fmtQty(clip)}`);
+    const state = tpStateLabel(tp);
+    if (state) parts.push(state);
+    return parts.join(" ");
+  }
+
+  function lineTitle(base, info) {
+    if (!info) return base;
+    return `${base} ${info}`;
+  }
+
+  function priceTitle(base, price, info) {
+    const tagged = fmtPrice(price);
+    const text = tagged === "--" ? base : `${base} ${tagged}`;
+    return lineTitle(text, info);
+  }
+
+  function resolveLivePrice(data) {
+    if (!data) return 0;
+    const dash = data.dashboard || {};
+    const direct = Number(dash.price || 0);
+    if (direct > 0) return direct;
+    const ice = data.iceberg || {};
+    const l1 = ice.l1 || {};
+    const bid = Number(l1.bid || 0);
+    const ask = Number(l1.ask || 0);
+    if (bid > 0 && ask > 0) return (bid + ask) * 0.5;
+    return 0;
   }
 
   function updateExtra(data) {
     if (!data) return;
     ensureCard();
     ensurePerfCard();
+    ensureIcebergCard();
+    ensureChartSection();
+    bindIcebergControls();
+    bindChartRangeControls();
+    if (data.symbol) {
+      window.__dashSymbol = data.symbol;
+    }
+    if (data.metrics_interval_sec) {
+      window.__dashMetricsIntervalSec = Number(data.metrics_interval_sec) || window.__dashMetricsIntervalSec;
+    }
+    const chartTitle = document.getElementById("chartTitle");
+    if (chartTitle && data.symbol) chartTitle.textContent = `${data.symbol} Chart`;
+    const chartSub = document.getElementById("chartSub");
+    if (chartSub) chartSub.textContent = data.ts ? `Updated ${data.ts}` : "Waiting for data...";
+    const chartStatus = document.getElementById("chartStatus");
+    if (chartStatus) chartStatus.textContent = data.health?.status || "Live";
     const dash = data.dashboard || {};
     const price = dash.price;
     const priceEl = document.getElementById("dashPrice");
-    if (priceEl) priceEl.textContent = price ? fmt(price, 6) : "--";
+    if (priceEl) priceEl.textContent = price ? fmtPrice(price) : "--";
     const modeEl = document.getElementById("dashPosMode");
     if (modeEl) modeEl.textContent = data.position_mode || "--";
     const countEl = document.getElementById("dashOrderCount");
@@ -855,7 +2334,78 @@ EXTRA_SCRIPT = """
     if (avgTradeEl) avgTradeEl.textContent = (stats.avg_trade === null || stats.avg_trade === undefined) ? "--" : fmt(stats.avg_trade, 4);
     const maxDdEl = document.getElementById("dashMaxDD");
     if (maxDdEl) maxDdEl.textContent = (stats.max_drawdown_pct === null || stats.max_drawdown_pct === undefined) ? "--" : `${fmt(stats.max_drawdown_pct, 2)}%`;
+
+    const ice = data.iceberg || {};
+    const buy = ice.buy || {};
+    const sell = ice.sell || {};
+    const tp = data.iceberg_tp || {};
+    const tpLong = tp.long || {};
+    const tpShort = tp.short || {};
+    const statusParts = [];
+    if (buy.active) statusParts.push("Entry Buy");
+    if (sell.active) statusParts.push("Entry Sell");
+    if (tpLong.active) {
+      statusParts.push("TP Long");
+    } else if (tpLong.paused) {
+      statusParts.push("TP Long (paused)");
+    }
+    if (tpShort.active) {
+      statusParts.push("TP Short");
+    } else if (tpShort.paused) {
+      statusParts.push("TP Short (paused)");
+    }
+    const statusText = statusParts.length ? statusParts.join(" & ") : "Idle";
+    const statusEl = document.getElementById("dashIcebergStatus");
+    if (statusEl) statusEl.textContent = statusText;
+    const buyEl = document.getElementById("dashIcebergBuy");
+    if (buyEl) buyEl.textContent = formatIcebergSide(buy);
+    const sellEl = document.getElementById("dashIcebergSell");
+    if (sellEl) sellEl.textContent = formatIcebergSide(sell);
+    const tpLongEl = document.getElementById("dashIcebergTpLong");
+    if (tpLongEl) tpLongEl.textContent = formatTpIceberg(tpLong);
+    const tpShortEl = document.getElementById("dashIcebergTpShort");
+    if (tpShortEl) tpShortEl.textContent = formatTpIceberg(tpShort);
+    const l1 = ice.l1 || {};
+    const l1Text = (l1.bid && l1.ask)
+      ? `${fmtPrice(l1.bid)} / ${fmtPrice(l1.ask)} (${fmt(l1.age_sec, 1)}s | exch ${fmt(l1.exchange_age_sec, 1)}s | ${l1.source || "n/a"})`
+      : "--";
+    const l1El = document.getElementById("dashIcebergL1");
+    if (l1El) l1El.textContent = l1Text;
+
+    loadChartLib(() => {
+      initChart();
+      const symbol = window.__dashSymbol;
+      const symbolChanged = symbol && symbol !== chartLastSymbol;
+      if (symbolChanged) {
+        chartLastSymbol = symbol;
+        chartFullCandles = [];
+        chartNeedsFit = true;
+        chartUserZoom = false;
+        chartZoomState = null;
+        chartOverlay = { lines: [], markers: [], livePrice: null };
+        if (chart) {
+          chart.clear();
+          chart.setOption(baseChartOption(), { notMerge: true, lazyUpdate: true });
+        }
+      }
+      updateChartLines(data);
+      updateChartMarkers(data);
+      updateLivePriceLine(resolveLivePrice(data));
+      if (!chartTimer) {
+        fetchChartHistory(true);
+        chartTimer = setInterval(fetchChartHistory, 10000);
+      } else if (symbolChanged) {
+        fetchChartHistory(true);
+      }
+    });
   }
+
+  window.refreshIcebergChart = function() {
+    loadChartLib(() => {
+      initChart();
+      fetchChartHistory(true);
+    });
+  };
 
   function hook() {
     if (typeof updateDetail === "function") {
@@ -884,7 +2434,7 @@ EXTRA_SCRIPT = """
 
 
 def inject_dashboard_html(html: str) -> str:
-    if "dashMarketCard" in html:
+    if "dashMarketCard" in html and "dashPerfCard" in html and "dashIcebergCard" in html:
         return html
     marker = "</body>"
     if marker in html:
@@ -1231,6 +2781,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
     fixed_files = None
     history_limit: int = 200
     balance_monitor = None
+    static_dir: Path = Path(__file__).with_name("static")
 
     def _send(self, status, payload, content_type="application/json"):
         self.send_response(status)
@@ -1254,10 +2805,52 @@ class MetricsHandler(BaseHTTPRequestHandler):
         symbols = sorted(file_map.keys())
         return symbols[0] if symbols else None
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/command":
+            return self._send(404, {"error": "not found"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            length = 0
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            return self._send(400, {"error": "invalid json"})
+        file_map = self._resolve_files()
+        symbol = payload.get("symbol")
+        symbol = self._choose_symbol(file_map, symbol)
+        if not symbol:
+            return self._send(400, {"error": "unknown symbol"})
+        payload["ts"] = payload.get("ts") or time.time()
+        cmd_path = self.metrics_dir / f"commands_{symbol}.jsonl"
+        append_jsonl(cmd_path, payload)
+        return self._send(200, {"ok": True})
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             return self._send(200, HTML_PAGE, "text/html; charset=utf-8")
+
+        if parsed.path.startswith("/static/"):
+            rel_path = parsed.path.replace("/static/", "", 1)
+            base = self.static_dir.resolve()
+            target = (self.static_dir / rel_path).resolve()
+            try:
+                target.relative_to(base)
+            except ValueError:
+                return self._send(403, {"error": "forbidden"})
+            if not target.exists() or not target.is_file():
+                return self._send(404, {"error": "not found"})
+            content_type = "application/octet-stream"
+            if target.suffix == ".js":
+                content_type = "application/javascript"
+            elif target.suffix == ".css":
+                content_type = "text/css"
+            elif target.suffix in {".svg", ".png"}:
+                content_type = "image/" + target.suffix.lstrip(".")
+            return self._send(200, target.read_bytes(), content_type)
 
         file_map = self._resolve_files()
         if parsed.path == "/api/symbols":
@@ -1287,7 +2880,52 @@ class MetricsHandler(BaseHTTPRequestHandler):
             if not symbol:
                 return self._send(200, [])
             limit = int(qs.get("limit", [self.history_limit])[0])
-            return self._send(200, tail_jsonl(file_map[symbol], limit=limit))
+            max_bytes = max(512 * 1024, limit * 1024)
+            max_bytes = min(max_bytes, 16 * 1024 * 1024)
+            return self._send(200, tail_jsonl(file_map[symbol], limit=limit, max_bytes=max_bytes))
+
+        if parsed.path == "/api/candles":
+            qs = parse_qs(parsed.query)
+            symbol = qs.get("symbol", [""])[0] or None
+            symbol = self._choose_symbol(file_map, symbol)
+            if not symbol:
+                return self._send(200, {"candles": [], "interval_sec": None})
+            limit = int(qs.get("limit", [2000])[0])
+            limit = max(100, min(20000, limit))
+            max_bytes = max(512 * 1024, limit * 256)
+            max_bytes = min(max_bytes, 16 * 1024 * 1024)
+            candles_path = self.metrics_dir / f"data_history_{symbol}.csv"
+            rows = tail_csv_dicts(candles_path, limit=limit, max_bytes=max_bytes)
+            candles = []
+            for row in rows:
+                bar_time = safe_int(row.get("bar_time"), 0)
+                if bar_time <= 0:
+                    continue
+                o = safe_float(row.get("open"))
+                h = safe_float(row.get("high"))
+                l = safe_float(row.get("low"))
+                c = safe_float(row.get("close"))
+                if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+                    continue
+                v = safe_float(row.get("volume"))
+                candles.append({
+                    "time": bar_time,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
+                })
+            interval_sec = None
+            if len(candles) >= 2:
+                diffs = []
+                for idx in range(max(1, len(candles) - 5), len(candles)):
+                    diff = candles[idx]["time"] - candles[idx - 1]["time"]
+                    if diff > 0:
+                        diffs.append(diff)
+                if diffs:
+                    interval_sec = int(sorted(diffs)[len(diffs) // 2])
+            return self._send(200, {"candles": candles, "interval_sec": interval_sec})
 
         if parsed.path == "/api/balances":
             if not self.balance_monitor:
@@ -1428,6 +3066,9 @@ class DiscordNotifier:
 
         equity = safe_float(latest.get("equity"), 0.0)
         daily_pnl = safe_float(latest.get("daily_pnl"), 0.0)
+        exch_daily = exchange_daily_pnl(symbol)
+        if exch_daily is not None:
+            daily_pnl = exch_daily
         drawdown = equity > 0 and daily_pnl <= -(self.drawdown_pct / 100.0) * equity
         if drawdown and not state.get("drawdown_alerted"):
             pct = (daily_pnl / equity) * 100.0 if equity else 0.0
@@ -1468,11 +3109,13 @@ def main():
     parser.add_argument("--balance-history-limit", type=int, default=10000)
     parser.add_argument("--balance-testnet", action="store_true")
     parser.add_argument("--balance-flow-pct", type=float, default=2.0)
+    parser.add_argument("--closed-pnl-poll-sec", type=float, default=60.0)
     parser.add_argument("--discord-webhook", type=str, default="")
     parser.add_argument("--notify-offline-sec", type=float, default=120.0)
     parser.add_argument("--notify-poll-sec", type=float, default=5.0)
     parser.add_argument("--notify-cooldown-sec", type=float, default=60.0)
     parser.add_argument("--notify-drawdown-pct", type=float, default=10.0)
+    parser.add_argument("--reset-stats", action="store_true")
     args = parser.parse_args()
 
     MetricsHandler.metrics_dir = Path(args.metrics_dir)
@@ -1491,6 +3134,12 @@ def main():
     MetricsHandler.history_limit = args.history_limit
 
     keys_path = Path(args.keys_file).expanduser() if args.keys_file else None
+    if args.reset_stats:
+        if MetricsHandler.fixed_files:
+            reset_files = MetricsHandler.fixed_files
+        else:
+            reset_files = discover_metrics_files(MetricsHandler.metrics_dir, symbols_filter)
+        seed_trade_stats_cache(reset_files)
     balance_monitor = BalanceMonitor(
         keys_path=keys_path,
         metrics_dir=MetricsHandler.metrics_dir,
@@ -1498,9 +3147,25 @@ def main():
         history_limit=args.balance_history_limit,
         testnet=args.balance_testnet,
         flow_threshold_pct=max(0.1, args.balance_flow_pct),
+        reset_history=args.reset_stats,
     )
     MetricsHandler.balance_monitor = balance_monitor
     balance_monitor.start()
+
+    global CLOSED_PNL_MONITOR
+    closed_symbols_filter = symbols_filter
+    if MetricsHandler.fixed_files:
+        closed_symbols_filter = set(MetricsHandler.fixed_files.keys())
+    closed_pnl_monitor = ClosedPnlMonitor(
+        keys_path=keys_path,
+        metrics_dir=MetricsHandler.metrics_dir,
+        poll_sec=max(10.0, args.closed_pnl_poll_sec),
+        testnet=args.balance_testnet,
+        symbols_filter=closed_symbols_filter,
+        reset_cutoff_ms=int(time.time() * 1000) if args.reset_stats else None,
+    )
+    CLOSED_PNL_MONITOR = closed_pnl_monitor
+    closed_pnl_monitor.start()
 
     webhook = args.discord_webhook or os.getenv("DISCORD_WEBHOOK_URL", "")
     notifier = DiscordNotifier(

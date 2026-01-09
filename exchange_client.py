@@ -601,6 +601,45 @@ class ExchangeClient:
             logger.error(f"Error placing order: {msg}")
             return None
 
+    def place_market_order(
+        self,
+        side: str,
+        qty: float,
+        reduce_only: bool = False,
+        position_idx: Optional[int] = None,
+        order_link_id: Optional[str] = None,
+    ):
+        """Place a Market order."""
+        try:
+            qty_str = _format_with_step(qty, self.qty_step)
+            params = {
+                "category": "linear",
+                "symbol": self.symbol,
+                "side": side,
+                "orderType": "Market",
+                "qty": qty_str,
+                "reduceOnly": reduce_only,
+            }
+            if position_idx is not None:
+                params["positionIdx"] = int(position_idx)
+            if order_link_id:
+                params["orderLinkId"] = str(order_link_id)
+            resp = self.session.place_order(**params)
+            return resp
+        except InvalidRequestError as e:
+            msg = str(e).encode('ascii', 'ignore').decode('ascii')
+            code = getattr(e, "status_code", None)
+            if code is None:
+                code = extract_err_code(msg)
+            return {"retCode": code if code is not None else -1, "retMsg": msg}
+        except Exception as e:
+            msg = str(e).encode('ascii', 'ignore').decode('ascii')
+            code = extract_err_code(msg)
+            if code is not None:
+                return {"retCode": code, "retMsg": msg}
+            logger.error(f"Error placing market order: {msg}")
+            return None
+
     def cancel_all_orders(self):
         """Cancel all open orders for symbol."""
         try:
@@ -643,6 +682,7 @@ class ExchangeClient:
             params = {
                 "category": "linear",
                 "symbol": self.symbol,
+                "tpslMode": "Full",
                 "takeProfit": _format_with_step(tp, self.tick_size),
                 "stopLoss": _format_with_step(sl, self.tick_size),
                 "positionIdx": 0,

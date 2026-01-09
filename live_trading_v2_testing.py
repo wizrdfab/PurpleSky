@@ -155,17 +155,6 @@ def safe_int(value, default: int = 0) -> int:
         return default
 
 
-def normalize_ts_ms(value: object) -> int:
-    ts = safe_int(value)
-    if ts <= 0:
-        return 0
-    if ts < 1_000_000_000_000:
-        return ts * 1000
-    if ts > 1_000_000_000_000_000:
-        return int(ts / 1000)
-    return ts
-
-
 def safe_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
@@ -849,36 +838,16 @@ class BarWindow:
         return closed_times
 
     def _append_bar(self, bar: Dict) -> None:
-        bar_time = safe_int(bar.get("bar_time"))
-        if bar_time <= 0:
-            return
-        bar["bar_time"] = bar_time
-        ob = self.ob_agg.finalize(bar_time)
+        ob = self.ob_agg.finalize(bar["bar_time"])
         if ob:
             self.last_ob.update(ob)
         for key, val in self.last_ob.items():
             bar.setdefault(key, val)
 
-        bar["datetime"] = pd.to_datetime(bar_time, unit="s")
+        bar["datetime"] = pd.to_datetime(bar["bar_time"], unit="s")
         row = {col: bar.get(col, 0.0) for col in BAR_COLUMNS}
 
-        if self.bars.empty:
-            self.bars = pd.DataFrame([row])
-            return
-
-        last_bar_time = safe_int(self.bars.iloc[-1]["bar_time"])
-        existing = self.bars["bar_time"] == bar_time
-        if existing.any():
-            self.bars.loc[existing, :] = row
-        else:
-            self.bars = pd.concat([self.bars, pd.DataFrame([row])], ignore_index=True)
-
-        if existing.any() or bar_time < last_bar_time:
-            self.bars = (
-                self.bars.drop_duplicates(subset=["bar_time"], keep="last")
-                .sort_values("bar_time")
-                .reset_index(drop=True)
-            )
+        self.bars = pd.concat([self.bars, pd.DataFrame([row])], ignore_index=True)
         if len(self.bars) > self.window_size:
             self.bars = self.bars.iloc[-self.window_size :].reset_index(drop=True)
 
@@ -1011,8 +980,8 @@ class SafeExchange:
             stop_loss = safe_float(pos.get("stopLoss"))
             take_profit = safe_float(pos.get("takeProfit"))
             tpsl_mode = pos.get("tpslMode") or pos.get("tpSlMode")
-            created_time = normalize_ts_ms(pos.get("createdTime"))
-            updated_time = normalize_ts_ms(pos.get("updatedTime"))
+            created_time = safe_int(pos.get("createdTime"))
+            updated_time = safe_int(pos.get("updatedTime"))
             return {
                 "size": size,
                 "side": side,
@@ -1048,8 +1017,8 @@ class SafeExchange:
             stop_loss = safe_float(pos.get("stopLoss"))
             take_profit = safe_float(pos.get("takeProfit"))
             tpsl_mode = pos.get("tpslMode") or pos.get("tpSlMode")
-            created_time = normalize_ts_ms(pos.get("createdTime"))
-            updated_time = normalize_ts_ms(pos.get("updatedTime"))
+            created_time = safe_int(pos.get("createdTime"))
+            updated_time = safe_int(pos.get("updatedTime"))
             position_idx = safe_int(pos.get("positionIdx"))
             results.append({
                 "size": size,
@@ -1679,7 +1648,6 @@ class LiveTradingV2:
             return
         try:
             save_df = self.bar_window.bars.tail(self.window_size).copy()
-            save_df = save_df.drop_duplicates(subset=["bar_time"], keep="last").sort_values("bar_time")
             save_df.to_csv(self.history_path, index=False)
         except Exception as exc:
             self.logger.error(f"Failed to save history: {exc}")
@@ -1719,29 +1687,6 @@ class LiveTradingV2:
         intents.setdefault("Buy", {})
         intents.setdefault("Sell", {})
         return intents
-
-    def _resolve_entry_ts_ms(
-        self,
-        created_time: int,
-        internal_exec: Optional[Dict],
-        intent: Optional[Dict],
-    ) -> Tuple[int, str]:
-        created_ms = normalize_ts_ms(created_time)
-        entry_ts_ms = created_ms
-        entry_source = "created_time"
-
-        exec_ms = 0
-        if internal_exec:
-            exec_ms = normalize_ts_ms(internal_exec.get("exec_time"))
-        if exec_ms > 0 and (created_ms <= 0 or exec_ms >= created_ms):
-            entry_ts_ms = exec_ms
-            entry_source = "execution"
-        elif intent:
-            entry_source = "entry_intent"
-
-        if entry_ts_ms <= 0:
-            entry_ts_ms = int(time.time() * 1000)
-        return entry_ts_ms, entry_source
 
     def _is_internal_order_link_id(self, order_link_id: Optional[str]) -> bool:
         if not order_link_id:
@@ -1935,53 +1880,6 @@ class LiveTradingV2:
         if side == "Sell":
             return "short"
         return None
-
-    def _entry_price_within_tolerance(self, entry_price: float, ref_price: float, atr: float) -> bool:
-        if entry_price <= 0 or ref_price <= 0:
-            return True
-        tol = max(entry_price * 0.002, atr * 0.5)
-        tick = self.instrument.tick_size
-        if tick > 0:
-            tol = max(tol, tick * 5)
-        return abs(entry_price - ref_price) <= tol
-
-    def _position_matches_missing_order(
-        self,
-        side: Optional[str],
-        order_info: Dict,
-        position: Dict,
-        positions: List[Dict],
-    ) -> bool:
-        if not side or order_info.get("external"):
-            return False
-        if self.hedge_mode:
-            order_idx = safe_int(order_info.get("position_idx"))
-            for pos in positions:
-                if safe_float(pos.get("size")) <= 0:
-                    continue
-                pos_side = pos.get("side")
-                if pos_side and pos_side != side:
-                    continue
-                if order_idx:
-                    pos_idx = safe_int(pos.get("position_idx"))
-                    if pos_idx and pos_idx != order_idx:
-                        continue
-                entry_price = safe_float(pos.get("avg_price") or pos.get("entry_price"))
-                order_price = safe_float(order_info.get("price"))
-                atr = safe_float(order_info.get("atr_at_entry"))
-                if self._entry_price_within_tolerance(entry_price, order_price, atr):
-                    return True
-            return False
-
-        if not position or safe_float(position.get("size")) <= 0:
-            return False
-        pos_side = position.get("side")
-        if pos_side and pos_side != side:
-            return False
-        entry_price = safe_float(position.get("avg_price") or position.get("entry_price"))
-        order_price = safe_float(order_info.get("price"))
-        atr = safe_float(order_info.get("atr_at_entry"))
-        return self._entry_price_within_tolerance(entry_price, order_price, atr)
 
     def _data_health(self) -> str:
         bars = self.bar_window.bars
@@ -2336,7 +2234,7 @@ class LiveTradingV2:
             return False
 
         if status in active_statuses or leaves_qty > 0:
-            created_ms = normalize_ts_ms(order.get("createdTime"))
+            created_ms = safe_int(order.get("createdTime"))
             created_bar = self.state.state.get("last_bar_time")
             if created_ms > 0:
                 created_bar = bar_time_from_ts(created_ms / 1000.0, self.tf_seconds)
@@ -2488,7 +2386,13 @@ class LiveTradingV2:
                 intent = self._entry_intents().get(side, {})
                 internal_exec = self._find_recent_internal_exec(side, position_idx)
                 external = not bool(intent or internal_exec)
-                entry_ts_ms, entry_source = self._resolve_entry_ts_ms(created_time, internal_exec, intent)
+                entry_ts_ms = created_time if created_time > 0 else int(time.time() * 1000)
+                entry_source = "created_time"
+                if internal_exec:
+                    entry_ts_ms = safe_int(internal_exec.get("exec_time")) or entry_ts_ms
+                    entry_source = "execution"
+                elif intent:
+                    entry_source = "entry_intent"
                 entry_bar_time = bar_time_from_ts(entry_ts_ms / 1000.0, self.tf_seconds)
                 pos_state = {
                     "side": side,
@@ -2544,7 +2448,13 @@ class LiveTradingV2:
             intent = self._entry_intents().get(side, {})
             internal_exec = self._find_recent_internal_exec(side)
             external = not bool(intent or internal_exec)
-            entry_ts_ms, entry_source = self._resolve_entry_ts_ms(created_time, internal_exec, intent)
+            entry_ts_ms = created_time if created_time > 0 else int(time.time() * 1000)
+            entry_source = "created_time"
+            if internal_exec:
+                entry_ts_ms = safe_int(internal_exec.get("exec_time")) or entry_ts_ms
+                entry_source = "execution"
+            elif intent:
+                entry_source = "entry_intent"
             entry_bar_time = bar_time_from_ts(entry_ts_ms / 1000.0, self.tf_seconds)
             pos_state = {
                 "side": side,
@@ -2595,9 +2505,10 @@ class LiveTradingV2:
     def _apply_ws_execution_update(self, execution: Dict) -> bool:
         if execution.get("symbol") != self.config.data.symbol:
             return False
-        exec_time = normalize_ts_ms(execution.get("execTime"))
-        if exec_time <= 0:
+        exec_time_raw = safe_float(execution.get("execTime"))
+        if exec_time_raw <= 0:
             return False
+        exec_time = int(exec_time_raw if exec_time_raw > 1e10 else exec_time_raw * 1000)
         metrics = self.state.state.get("metrics", {})
         metrics["last_exec_time"] = max(exec_time, safe_int(metrics.get("last_exec_time")))
         self.state.state["metrics"] = metrics
@@ -2795,7 +2706,7 @@ class LiveTradingV2:
                 continue
             active_ids.add(oid)
             if oid not in state_orders:
-                created_ms = normalize_ts_ms(o.get("createdTime"))
+                created_ms = safe_int(o.get("createdTime"))
                 created_bar = self.state.state.get("last_bar_time")
                 if created_ms > 0:
                     created_bar = bar_time_from_ts(created_ms / 1000.0, self.tf_seconds)
@@ -2815,36 +2726,10 @@ class LiveTradingV2:
 
         missing = [oid for oid in state_orders.keys() if oid not in active_ids]
         for oid in missing:
-            info = state_orders.get(oid, {})
-            side = info.get("side")
-            order_link_id = info.get("order_link_id")
-            keep_intent = False
-            if side:
-                keep_intent = self._position_matches_missing_order(side, info, position, positions)
+            side = state_orders.get(oid, {}).get("side")
+            order_link_id = state_orders.get(oid, {}).get("order_link_id")
             state_orders.pop(oid, None)
-            if side and keep_intent:
-                intents = self._entry_intents()
-                intent = intents.get(side, {})
-                if (
-                    not intent
-                    or (intent.get("order_id") != oid and (not order_link_id or intent.get("order_link_id") != order_link_id))
-                ):
-                    intent = {
-                        "order_id": oid,
-                        "order_link_id": order_link_id,
-                        "price": info.get("price"),
-                        "qty": info.get("qty"),
-                        "tp": info.get("tp"),
-                        "sl": info.get("sl"),
-                        "atr_at_entry": info.get("atr_at_entry"),
-                        "created_bar_time": info.get("created_bar_time"),
-                        "created_ts": info.get("created_ts"),
-                        "position_idx": info.get("position_idx"),
-                    }
-                intent["filled"] = True
-                intents[side] = intent
-                self.state.state["entry_intent"] = intents
-            elif side:
+            if side:
                 self._clear_entry_intent(side, oid, order_link_id)
 
         self.state.state["active_orders"] = state_orders
@@ -2874,7 +2759,13 @@ class LiveTradingV2:
                     intent = self._entry_intents().get(side, {})
                     internal_exec = self._find_recent_internal_exec(side, safe_int(pos.get("position_idx")))
                     external = not bool(intent or internal_exec)
-                    entry_ts_ms, entry_source = self._resolve_entry_ts_ms(created_time, internal_exec, intent)
+                    entry_ts_ms = created_time if created_time > 0 else int(time.time() * 1000)
+                    entry_source = "created_time"
+                    if internal_exec:
+                        entry_ts_ms = safe_int(internal_exec.get("exec_time")) or entry_ts_ms
+                        entry_source = "execution"
+                    elif intent:
+                        entry_source = "entry_intent"
                     entry_bar_time = bar_time_from_ts(entry_ts_ms / 1000.0, self.tf_seconds)
                     if external:
                         self.logger.warning("External position detected. Pausing new entries.")
@@ -2950,7 +2841,13 @@ class LiveTradingV2:
                     intent = self._entry_intents().get(side, {})
                     internal_exec = self._find_recent_internal_exec(side)
                     external = not bool(intent or internal_exec)
-                    entry_ts_ms, entry_source = self._resolve_entry_ts_ms(created_time, internal_exec, intent)
+                    entry_ts_ms = created_time if created_time > 0 else int(time.time() * 1000)
+                    entry_source = "created_time"
+                    if internal_exec:
+                        entry_ts_ms = safe_int(internal_exec.get("exec_time")) or entry_ts_ms
+                        entry_source = "execution"
+                    elif intent:
+                        entry_source = "entry_intent"
                     entry_bar_time = bar_time_from_ts(entry_ts_ms / 1000.0, self.tf_seconds)
                     if external:
                         self.logger.warning("External position detected. Pausing new entries.")
@@ -3081,11 +2978,6 @@ class LiveTradingV2:
         entry_price = safe_float(pos.get("entry_price"))
         intents = self._entry_intents()
         intent = intents.get(side, {})
-        if intent:
-            intent_price = safe_float(intent.get("price"))
-            atr = safe_float(intent.get("atr_at_entry"))
-            if not self._entry_price_within_tolerance(entry_price, intent_price, atr):
-                intent = {}
         if intent:
             atr = safe_float(intent.get("atr_at_entry"))
             tp = safe_float(intent.get("tp"))
@@ -3909,14 +3801,6 @@ class LiveTradingV2:
             bars_df = self.bar_window.bars.copy()
             if bars_df.empty:
                 return
-            if bars_df["bar_time"].duplicated().any():
-                bars_df = (
-                    bars_df.drop_duplicates(subset=["bar_time"], keep="last")
-                    .sort_values("bar_time")
-                    .tail(self.window_size)
-                    .reset_index(drop=True)
-                )
-                self.bar_window.load_bars(bars_df)
             bars_all = bars_df
             if len(bars_df) < self.min_feature_bars:
                 self.logger.warning(f"Warmup: {len(bars_df)} bars < {self.min_feature_bars}.")

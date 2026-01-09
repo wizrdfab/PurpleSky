@@ -168,6 +168,9 @@
     .chart-large {
       height: 300px;
     }
+    #icebergChart {
+      height: 420px;
+    }
     .nav-tabs {
       padding: 0 32px 8px;
       display: flex;
@@ -342,6 +345,7 @@
   <nav class="nav-tabs">
     <button class="nav-btn active" id="tabAccount" data-view="account">Account Balance</button>
     <button class="nav-btn" id="tabTraders" data-view="traders">Traders</button>
+    <button class="nav-btn" id="tabChart" data-view="chart">Chart</button>
   </nav>
 
   <section id="accountSection" class="section active">
@@ -389,6 +393,7 @@
           <div class="range-group" id="balanceRange">
             <button class="range-btn active" data-range="all">All</button>
             <button class="range-btn" data-range="7d">7D</button>
+            <button class="range-btn" data-range="1d">1D</button>
             <button class="range-btn" data-range="24h">24H</button>
             <button class="range-btn" data-range="6h">6H</button>
             <button class="range-btn" data-range="1h">1H</button>
@@ -506,6 +511,36 @@
     </section>
   </section>
 
+  <section id="chartSection" class="section">
+    <div class="detail-header">
+      <div>
+        <h2 id="chartTitle">Chart</h2>
+        <div class="sub" id="chartSub">Select a symbol to view price.</div>
+      </div>
+      <div class="pill" id="chartStatus">--</div>
+    </div>
+    <div class="account-chart">
+      <div class="chart-header">
+        <div>
+          <h3>Price and Iceberg Levels</h3>
+          <div class="sub" id="icebergChartMeta">--</div>
+        </div>
+        <div class="chart-controls">
+          <div class="range-group" id="chartRange">
+            <button class="range-btn active" data-range="15m">15M</button>
+            <button class="range-btn" data-range="30m">30M</button>
+            <button class="range-btn" data-range="1h">1H</button>
+            <button class="range-btn" data-range="4h">4H</button>
+            <button class="range-btn" data-range="6h">6H</button>
+            <button class="range-btn" data-range="24h">24H</button>
+            <button class="range-btn" data-range="1d">1D</button>
+          </div>
+        </div>
+      </div>
+      <div id="icebergChart" class="chart-large"></div>
+    </div>
+  </section>
+
   <script>
     const fmt = (v, d=2) => (v === null || v === undefined) ? "--" : Number(v).toFixed(d);
     const fmtPct = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}%`;
@@ -554,6 +589,14 @@
       const iso = ts.replace(" ", "T") + "Z";
       const ms = Date.parse(iso);
       return Number.isNaN(ms) ? null : ms;
+    }
+
+    function latestTimestamp(history) {
+      for (let i = history.length - 1; i >= 0; i--) {
+        const ts = parseTs(history[i]?.ts);
+        if (ts) return ts;
+      }
+      return null;
     }
 
     function drawBalanceChart(canvas, rawSeries, adjustedSeries, scaleMode, showRaw, showAdjusted) {
@@ -694,8 +737,16 @@
 
     function filterHistory(history, range) {
       if (!history.length || range === "all") return history;
-      const lastTs = parseTs(history[history.length - 1].ts);
+      const lastTs = latestTimestamp(history);
       if (!lastTs) return history;
+      if (range === "1d") {
+        const d = new Date(lastTs);
+        const cutoff = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+        return history.filter(item => {
+          const ts = parseTs(item.ts);
+          return ts && ts >= cutoff;
+        });
+      }
       const windowMap = {
         "7d": 7 * 24 * 60 * 60 * 1000,
         "24h": 24 * 60 * 60 * 1000,
@@ -790,18 +841,34 @@
       state.view = view;
       const accountSection = document.getElementById("accountSection");
       const tradersSection = document.getElementById("tradersSection");
+      const chartSection = document.getElementById("chartSection");
       const tabAccount = document.getElementById("tabAccount");
       const tabTraders = document.getElementById("tabTraders");
+      const tabChart = document.getElementById("tabChart");
       if (view === "account") {
         accountSection.classList.add("active");
         tradersSection.classList.remove("active");
+        chartSection.classList.remove("active");
         tabAccount.classList.add("active");
         tabTraders.classList.remove("active");
+        tabChart.classList.remove("active");
+      } else if (view === "chart") {
+        chartSection.classList.add("active");
+        accountSection.classList.remove("active");
+        tradersSection.classList.remove("active");
+        tabChart.classList.add("active");
+        tabAccount.classList.remove("active");
+        tabTraders.classList.remove("active");
+        if (typeof window.refreshIcebergChart === "function") {
+          window.refreshIcebergChart();
+        }
       } else {
         tradersSection.classList.add("active");
         accountSection.classList.remove("active");
+        chartSection.classList.remove("active");
         tabTraders.classList.add("active");
         tabAccount.classList.remove("active");
+        tabChart.classList.remove("active");
         if (state.selected) {
           fetchHistory(state.selected);
         }
@@ -1082,7 +1149,12 @@
       const resp = await fetch("/api/balance_history?limit=10000");
       if (!resp.ok) return;
       const data = await resp.json();
-      state.balanceHistory = data || [];
+      const sorted = (data || []).slice().sort((a, b) => {
+        const ta = parseTs(a?.ts) || 0;
+        const tb = parseTs(b?.ts) || 0;
+        return ta - tb;
+      });
+      state.balanceHistory = sorted;
       renderBalanceHistory();
     }
 
@@ -1120,6 +1192,7 @@
 
     document.getElementById("tabAccount").addEventListener("click", () => setView("account"));
     document.getElementById("tabTraders").addEventListener("click", () => setView("traders"));
+    document.getElementById("tabChart").addEventListener("click", () => setView("chart"));
 
     document.querySelectorAll("#balanceRange .range-btn").forEach(btn => {
       btn.addEventListener("click", () => {
