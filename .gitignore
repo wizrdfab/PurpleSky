@@ -147,6 +147,16 @@ sync-data.sh
 .pycache_tmp/
 
 # ----------------------------------------------------------------------------
+# Trading State and History (Local only)
+# ----------------------------------------------------------------------------
+bot_state*
+live_metrics*
+data_history*
+balance_history*
+closed_pnl*
+positions_raw*
+
+# ----------------------------------------------------------------------------
 # Keep these files tracked (use ! to negate ignore)
 # ----------------------------------------------------------------------------
 !.gitkeep
