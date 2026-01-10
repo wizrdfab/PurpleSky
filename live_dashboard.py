@@ -2884,6 +2884,19 @@ class MetricsHandler(BaseHTTPRequestHandler):
             max_bytes = min(max_bytes, 16 * 1024 * 1024)
             return self._send(200, tail_jsonl(file_map[symbol], limit=limit, max_bytes=max_bytes))
 
+        if parsed.path == "/api/signals":
+            qs = parse_qs(parsed.query)
+            symbol = qs.get("symbol", [""])[0] or None
+            symbol = self._choose_symbol(file_map, symbol)
+            if not symbol:
+                return self._send(200, [])
+            limit = int(qs.get("limit", [40])[0])
+            limit = max(1, min(200, limit))
+            max_bytes = max(256 * 1024, limit * 1024)
+            max_bytes = min(max_bytes, 4 * 1024 * 1024)
+            signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+            return self._send(200, tail_jsonl(signals_path, limit=limit, max_bytes=max_bytes))
+
         if parsed.path == "/api/candles":
             qs = parse_qs(parsed.query)
             symbol = qs.get("symbol", [""])[0] or None

@@ -160,6 +160,7 @@ class LiveDataManager:
         self.total_snapshots = 0
         self.new_bar_event = False
         self.history_file = Path(f"data_history_{config.data.symbol}.csv")
+        self.resample_rule = "5min"
         
         # Continuity Tracker: Bars collected WITHOUT a gap
         self.continuous_bars = 0
@@ -235,6 +236,9 @@ class LiveDataManager:
                     for col in self.transient_cols:
                         if col not in self.trade_bars.columns:
                             self.trade_bars[col] = 0.0
+
+                if not self.trade_bars.empty:
+                    self.trade_bars = self._fill_missing_trade_bars(self.trade_bars, self.resample_rule)
                 
                 if not self.trade_bars.empty: self.current_bar_idx = self.trade_bars.index[-1]
                 logger.info(f"Loaded {len(df)} bars from history for {self.config.data.symbol}. Continuous: {self.continuous_bars}")
@@ -349,6 +353,7 @@ class LiveDataManager:
             self.trade_bars = full_history
             
         self.trade_bars.sort_index(inplace=True)
+        self.trade_bars = self._fill_missing_trade_bars(self.trade_bars, self.resample_rule)
         # Ensure we keep the full window
         self.trade_bars = self.trade_bars.iloc[-self.window_size:]
         

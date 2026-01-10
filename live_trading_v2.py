@@ -16,8 +16,9 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import joblib
 import numpy as np
@@ -66,6 +67,7 @@ DEFAULT_REST_CONFIRM_SLEEP_SEC = 0.2
 DEFAULT_MODEL_DIR = f"models_v9/{CONF.data.symbol}/{CONF.data.symbol}/rank_1"
 DEFAULT_BOOTSTRAP_KLINES_DAYS = 0.0
 DEFAULT_METRICS_LOG_PATH = ""
+DEFAULT_SIGNAL_LOG_PATH = ""
 DEFAULT_CONTINUITY_BARS = 24
 DEFAULT_MAX_LAST_BAR_AGE_SEC = 0.0
 DEFAULT_FAST_BOOTSTRAP = False
@@ -199,6 +201,16 @@ def round_up(value: float, step: float) -> float:
     if step <= 0:
         return value
     return math.ceil(value / step) * step
+
+
+def step_decimals(step: float) -> int:
+    if step <= 0:
+        return 0
+    try:
+        dec = Decimal(str(step)).normalize()
+        return max(-dec.as_tuple().exponent, 0)
+    except Exception:
+        return 0
 
 
 def atomic_write_json(path: Path, data: Dict) -> None:
@@ -628,11 +640,18 @@ class TradeBarBuilder:
 
         completed.append(self._finalize_bar(force_synthetic=True))
         gap = int((now_ts - self.current_bar_time) / self.tf_seconds) - 1
+        last_bar_time = self.current_bar_time
         if gap > 0:
             for i in range(gap):
                 gap_time = self.current_bar_time + self.tf_seconds * (i + 1)
                 completed.append(self._synthetic_bar(gap_time))
-        self.current_bar_time = None
+                last_bar_time = gap_time
+        next_bar_time = last_bar_time + self.tf_seconds if last_bar_time is not None else None
+        if next_bar_time is not None and now_ts >= next_bar_time:
+            seed_price = self.last_price if self.last_price is not None else 0.0
+            self._start_bar(next_bar_time, seed_price)
+        else:
+            self.current_bar_time = None
         return [c for c in completed if c is not None]
 
 
@@ -829,7 +848,12 @@ class BarWindow:
     def ingest_orderbook(self, snapshot: Dict) -> None:
         self.ob_agg.ingest(snapshot)
 
-    def ingest_trades(self, trades: List[Dict], now_ts: float) -> List[int]:
+    def ingest_trades(
+        self,
+        trades: List[Dict],
+        now_ts: float,
+        on_close: Optional[Callable[[int], None]] = None,
+    ) -> List[int]:
         closed_times: List[int] = []
         for trade in trades:
             ts = trade["timestamp"]
@@ -840,11 +864,15 @@ class BarWindow:
             for bar in completed:
                 self._append_bar(bar)
                 closed_times.append(bar["bar_time"])
+                if on_close:
+                    on_close(bar["bar_time"])
 
         forced = self.trade_builder.force_close(now_ts)
         for bar in forced:
             self._append_bar(bar)
             closed_times.append(bar["bar_time"])
+            if on_close:
+                on_close(bar["bar_time"])
 
         return closed_times
 
@@ -1167,6 +1195,7 @@ class LiveTradingV2:
         self.keys_profile = args.keys_profile
 
         self.dry_run = args.dry_run
+        self.signal_only = args.signal_only
         self.trade_enabled = True
         self.continuous_trade_bars = 0
         self.last_trade_bar_time: Optional[int] = None
@@ -1203,6 +1232,7 @@ class LiveTradingV2:
         self.last_sentiment: Optional[str] = None
         self.last_health: Optional[str] = None
         self.last_prediction: Dict[str, object] = {}
+        self.last_signal: Dict[str, object] = {}
         self.last_feature_vector: Optional[Dict[str, object]] = None
         self.last_feature_row: Optional[pd.Series] = None
 
@@ -1242,9 +1272,16 @@ class LiveTradingV2:
             self.metrics_path = Path(args.metrics_log_path)
         else:
             self.metrics_path = Path(f"live_metrics_{self.config.data.symbol}.jsonl")
-        self._bootstrap_bars()
+        if args.signal_log_path:
+            self.signal_log_path = Path(args.signal_log_path)
+        else:
+            self.signal_log_path = Path(f"signals_{self.config.data.symbol}.jsonl")
         self._load_history()
+        self._fill_history_gaps()
+        self._bootstrap_bars()
+        self._fill_history_gaps()
         self._fast_bootstrap_fill_gaps()
+        self._seed_trade_builder_from_history()
 
         self.drift_monitor = DriftMonitor(args.drift_keys, args.drift_window, args.drift_z)
         self.health = HealthMonitor()
@@ -1444,15 +1481,42 @@ class LiveTradingV2:
         return required
 
     def _bootstrap_bars(self) -> None:
-        if self.history_path.exists() and self.history_path.stat().st_size > 0:
-            self.logger.info("History file present; skipping bootstrap.")
+        ready, reasons = self._history_ready()
+        if ready:
+            self.logger.info("History meets requirements; bootstrap not required.")
             return
 
+        detail = ", ".join(reasons) if reasons else "unknown"
+        self.logger.warning(f"History insufficient ({detail}); bootstrapping.")
+
+        existing = self._normalize_bars(self.bar_window.bars.copy())
+        required_bars = max(self.min_feature_bars, self.continuity_bars, 1)
+        required_days = (required_bars * self.tf_seconds) / 86400.0
+        target_days = max(required_days, self.bootstrap_klines_days or 0.0)
+
         bootstrapped = False
-        if self.bootstrap_klines_days and self.bootstrap_klines_days > 0:
-            bootstrapped = self._bootstrap_from_klines(self.bootstrap_klines_days)
+        if target_days > 0:
+            bootstrapped = self._bootstrap_from_klines(target_days)
         if not bootstrapped:
-            self._bootstrap_from_trades()
+            bootstrapped = self._bootstrap_from_trades()
+
+        merged = existing
+        if bootstrapped:
+            merged = self._merge_history(existing, self.bar_window.bars.copy())
+        if merged is None or merged.empty:
+            seed = self._get_seed_price()
+            if seed > 0 and self._bootstrap_synthetic(required_bars, seed):
+                return
+            self.logger.warning("Bootstrap failed; no usable data sources.")
+            return
+
+        seed = self._get_seed_price()
+        merged = self._pad_history_to_min_bars(merged, required_bars, seed)
+        if merged is None or merged.empty:
+            self.logger.warning("Bootstrap failed; merged history unusable.")
+            return
+        self.bar_window.load_bars(merged)
+        self._save_history()
 
     def _bootstrap_from_klines(self, days: float) -> bool:
         interval_map = {60: "1", 300: "5", 900: "15", 3600: "60", 14400: "240"}
@@ -1537,6 +1601,9 @@ class LiveTradingV2:
 
         last_ts = trades[-1]["timestamp"]
         self.bar_window.ingest_trades(trades, last_ts)
+        if self.bar_window.bars.empty:
+            self.logger.warning("Trade bootstrap produced no bars; falling back.")
+            return False
         self.state.state["last_trade_ts"] = max(
             safe_float(self.state.state.get("last_trade_ts"), 0.0),
             last_ts,
@@ -1546,12 +1613,196 @@ class LiveTradingV2:
         )
         return True
 
+    def _fill_history_gaps(self) -> None:
+        bars_df = self._normalize_bars(self.bar_window.bars.copy())
+        if bars_df is None or bars_df.empty:
+            return
+
+        start_bar = safe_int(bars_df["bar_time"].min())
+        last_bar = safe_int(bars_df["bar_time"].max())
+        end_bar = bar_time_from_ts(time.time() - self.tf_seconds, self.tf_seconds)
+        if end_bar < last_bar:
+            end_bar = last_bar
+        if start_bar <= 0 or end_bar <= 0 or end_bar <= start_bar:
+            return
+
+        expected_times = list(range(start_bar, end_bar + self.tf_seconds, self.tf_seconds))
+        existing_times = set(bars_df["bar_time"].astype(int).tolist())
+        missing = [bt for bt in expected_times if bt not in existing_times]
+        if not missing:
+            self.logger.info("Gap fill: no missing bars detected.")
+            return
+
+        self.logger.info(
+            f"Gap fill: {len(missing)} missing bars between {start_bar} and {end_bar}."
+        )
+
+        interval_map = {60: "1", 300: "5", 900: "15", 3600: "60", 14400: "240"}
+        interval = interval_map.get(self.tf_seconds, "15")
+        limit = 200
+        start_ms = int(start_bar * 1000)
+        end_ms = int((end_bar + self.tf_seconds) * 1000)
+        target_bars = len(expected_times)
+        max_iters = max(1, int(target_bars / limit) + 10)
+        batches: List[pd.DataFrame] = []
+        current_end = end_ms
+
+        for _ in range(max_iters):
+            klines = self.api.fetch_kline(interval=interval, limit=limit, end=current_end)
+            if not isinstance(klines, pd.DataFrame) or klines.empty:
+                break
+            batches.append(klines)
+            oldest_ts = safe_float(klines["timestamp"].min())
+            if oldest_ts <= 0:
+                break
+            oldest_ms = int(oldest_ts * 1000)
+            if oldest_ms <= start_ms:
+                break
+            current_end = oldest_ms - 1
+            time.sleep(0.1)
+
+        kline_map: Dict[int, Dict[str, object]] = {}
+        if batches:
+            full = pd.concat(batches).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+            full = full[(full["timestamp"] >= start_bar) & (full["timestamp"] <= end_bar)]
+            for _, row in full.iterrows():
+                ts = safe_float(row.get("timestamp"))
+                if ts <= 0:
+                    continue
+                bar_time = bar_time_from_ts(ts, self.tf_seconds)
+                if bar_time not in missing:
+                    continue
+                volume = safe_float(row.get("volume"))
+                close = safe_float(row.get("close"))
+                open_p = safe_float(row.get("open"))
+                high = safe_float(row.get("high"))
+                low = safe_float(row.get("low"))
+                turnover = safe_float(row.get("turnover"))
+                dollar_val = turnover if turnover > 0 else close * volume
+                trade_count = 1 if volume > 0 else 0
+                vol_buy = volume / 2.0
+                vol_sell = volume / 2.0
+                bar = {
+                    "bar_time": bar_time,
+                    "datetime": pd.to_datetime(bar_time, unit="s"),
+                    "open": open_p,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                    "trade_count": trade_count,
+                    "vol_buy": vol_buy,
+                    "vol_sell": vol_sell,
+                    "vol_delta": vol_buy - vol_sell,
+                    "dollar_val": dollar_val,
+                    "total_val": dollar_val,
+                    "vwap": (dollar_val / volume) if volume > 0 else close,
+                    "taker_buy_ratio": 0.5,
+                    "buy_vol": vol_buy,
+                    "sell_vol": vol_sell,
+                }
+                for key in self.bar_window.last_ob:
+                    bar[key] = 0.0
+                kline_map[bar_time] = bar
+
+        fill_rows = []
+        filled_klines = 0
+        filled_synth = 0
+        missing_left = 0
+        last_close = None
+        seed_price = self._get_seed_price()
+        existing_lookup = bars_df.set_index("bar_time")
+
+        for bar_time in expected_times:
+            if bar_time in existing_times:
+                try:
+                    last_close = safe_float(existing_lookup.loc[bar_time, "close"])
+                except Exception:
+                    last_close = last_close
+                if (last_close is None or last_close <= 0) and seed_price > 0:
+                    last_close = seed_price
+                continue
+            bar = kline_map.get(bar_time)
+            if bar:
+                fill_rows.append(bar)
+                filled_klines += 1
+                last_close = safe_float(bar.get("close"))
+                continue
+            if last_close is not None and last_close > 0:
+                volume = 0.0
+                bar = {
+                    "bar_time": bar_time,
+                    "datetime": pd.to_datetime(bar_time, unit="s"),
+                    "open": last_close,
+                    "high": last_close,
+                    "low": last_close,
+                    "close": last_close,
+                    "volume": volume,
+                    "trade_count": 0,
+                    "vol_buy": 0.0,
+                    "vol_sell": 0.0,
+                    "vol_delta": 0.0,
+                    "dollar_val": 0.0,
+                    "total_val": 0.0,
+                    "vwap": last_close,
+                    "taker_buy_ratio": 0.5,
+                    "buy_vol": 0.0,
+                    "sell_vol": 0.0,
+                }
+                for key in self.bar_window.last_ob:
+                    bar[key] = 0.0
+                fill_rows.append(bar)
+                filled_synth += 1
+            elif seed_price > 0:
+                bar = self._synthetic_bar_row(bar_time, seed_price)
+                fill_rows.append(bar)
+                filled_synth += 1
+                last_close = seed_price
+            else:
+                missing_left += 1
+
+        if not fill_rows:
+            if missing_left:
+                self.logger.warning(
+                    f"Gap fill: unable to fill {missing_left} bars (no reference data)."
+                )
+            return
+
+        fill_df = pd.DataFrame(fill_rows)
+        merged = bars_df.set_index("bar_time").combine_first(fill_df.set_index("bar_time"))
+        merged = merged.reset_index().sort_values("bar_time")
+        merged = self._normalize_bars(merged)
+        if merged is None or merged.empty:
+            self.logger.warning("Gap fill: normalized bars empty after merge.")
+            return
+        self.bar_window.load_bars(merged)
+        self._save_history()
+
+        last_bar_filled = self.bar_window.latest_bar_time()
+        if last_bar_filled is not None:
+            self.state.state["last_bar_time"] = last_bar_filled
+            last_processed = self.state.state.get("last_processed_bar_time")
+            if not last_processed or last_processed < last_bar_filled:
+                self.state.state["last_processed_bar_time"] = last_bar_filled
+            last_trade_ts = safe_float(self.state.state.get("last_trade_ts"), 0.0)
+            if last_trade_ts < last_bar_filled:
+                self.state.state["last_trade_ts"] = float(last_bar_filled)
+
+        self.logger.info(
+            f"Gap fill complete: klines={filled_klines} synthetic={filled_synth} "
+            f"remaining={missing_left}."
+        )
+
     def _fast_bootstrap_fill_gaps(self) -> None:
         if not self.fast_bootstrap:
             return
         bars_df = self.bar_window.bars.copy()
         if bars_df.empty:
-            self.logger.info("Fast bootstrap: no bars loaded; skipping gap fill.")
+            seed = self._get_seed_price()
+            if seed > 0 and self._bootstrap_synthetic(self.continuity_bars, seed):
+                self.logger.info("Fast bootstrap: created synthetic continuity window.")
+            else:
+                self.logger.warning("Fast bootstrap: no bars loaded and no seed price available.")
             return
         bars_df = bars_df.drop_duplicates(subset=["bar_time"]).sort_values("bar_time")
         end_bar = int(bars_df["bar_time"].max())
@@ -1568,69 +1819,287 @@ class LiveTradingV2:
         limit = min(200, len(expected_times) + 5)
         end_ms = int((end_bar + self.tf_seconds) * 1000)
         klines = self.api.fetch_kline(interval=interval, limit=limit, end=end_ms)
-        if not isinstance(klines, pd.DataFrame) or klines.empty:
-            self.logger.warning("Fast bootstrap: kline fetch empty; skipping gap fill.")
-            return
-
         rows = []
-        for _, row in klines.iterrows():
-            ts = safe_float(row.get("timestamp"))
-            if ts <= 0:
-                continue
-            bar_time = bar_time_from_ts(ts, self.tf_seconds)
-            if bar_time not in missing:
-                continue
-            volume = safe_float(row.get("volume"))
-            close = safe_float(row.get("close"))
-            open_p = safe_float(row.get("open"))
-            high = safe_float(row.get("high"))
-            low = safe_float(row.get("low"))
-            turnover = safe_float(row.get("turnover"))
-            dollar_val = turnover if turnover > 0 else close * volume
-            trade_count = 1 if volume > 0 else 0
-            vol_buy = volume / 2.0
-            vol_sell = volume / 2.0
-            bar = {
-                "bar_time": bar_time,
-                "datetime": pd.to_datetime(bar_time, unit="s"),
-                "open": open_p,
-                "high": high,
-                "low": low,
-                "close": close,
-                "volume": volume,
-                "trade_count": trade_count,
-                "vol_buy": vol_buy,
-                "vol_sell": vol_sell,
-                "vol_delta": vol_buy - vol_sell,
-                "dollar_val": dollar_val,
-                "total_val": dollar_val,
-                "vwap": (dollar_val / volume) if volume > 0 else close,
-                "taker_buy_ratio": 0.5,
-                "buy_vol": vol_buy,
-                "sell_vol": vol_sell,
-            }
-            for key in self.bar_window.last_ob:
-                bar[key] = 0.0
-            rows.append(bar)
+        row_times: set = set()
+        if isinstance(klines, pd.DataFrame) and not klines.empty:
+            for _, row in klines.iterrows():
+                ts = safe_float(row.get("timestamp"))
+                if ts <= 0:
+                    continue
+                bar_time = bar_time_from_ts(ts, self.tf_seconds)
+                if bar_time not in missing:
+                    continue
+                volume = safe_float(row.get("volume"))
+                close = safe_float(row.get("close"))
+                open_p = safe_float(row.get("open"))
+                high = safe_float(row.get("high"))
+                low = safe_float(row.get("low"))
+                turnover = safe_float(row.get("turnover"))
+                dollar_val = turnover if turnover > 0 else close * volume
+                trade_count = 1 if volume > 0 else 0
+                vol_buy = volume / 2.0
+                vol_sell = volume / 2.0
+                bar = {
+                    "bar_time": bar_time,
+                    "datetime": pd.to_datetime(bar_time, unit="s"),
+                    "open": open_p,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                    "trade_count": trade_count,
+                    "vol_buy": vol_buy,
+                    "vol_sell": vol_sell,
+                    "vol_delta": vol_buy - vol_sell,
+                    "dollar_val": dollar_val,
+                    "total_val": dollar_val,
+                    "vwap": (dollar_val / volume) if volume > 0 else close,
+                    "taker_buy_ratio": 0.5,
+                    "buy_vol": vol_buy,
+                    "sell_vol": vol_sell,
+                }
+                for key in self.bar_window.last_ob:
+                    bar[key] = 0.0
+                rows.append(bar)
+                row_times.add(bar_time)
+        else:
+            self.logger.warning("Fast bootstrap: kline fetch empty; using synthetic bars.")
+
+        missing_left = [bt for bt in missing if bt not in row_times]
+        if missing_left:
+            seed = safe_float(bars_df.iloc[-1].get("close"))
+            if seed <= 0:
+                seed = self._get_seed_price()
+            if seed > 0:
+                for bar_time in missing_left:
+                    rows.append(self._synthetic_bar_row(bar_time, seed))
+            else:
+                self.logger.warning("Fast bootstrap: no price seed for synthetic fill.")
 
         if not rows:
-            self.logger.warning("Fast bootstrap: no missing bars found in kline data.")
+            self.logger.warning("Fast bootstrap: no bars to fill after kline + synthetic.")
             return
 
         fill_df = pd.DataFrame(rows)
         merged = bars_df.set_index("bar_time").combine_first(fill_df.set_index("bar_time"))
         merged = merged.reset_index().sort_values("bar_time")
-        if "datetime" not in merged.columns:
-            merged["datetime"] = pd.to_datetime(merged["bar_time"], unit="s")
-        for col in BAR_COLUMNS:
-            if col not in merged.columns:
-                merged[col] = 0.0
-        merged = merged[BAR_COLUMNS]
+        merged = self._normalize_bars(merged)
+        if merged is None or merged.empty:
+            self.logger.warning("Fast bootstrap: normalized bars empty after gap fill.")
+            return
         self.bar_window.load_bars(merged)
         self._save_history()
+        last_bar_filled = self.bar_window.latest_bar_time()
+        if last_bar_filled is not None:
+            self.state.state["last_bar_time"] = last_bar_filled
+            last_processed = self.state.state.get("last_processed_bar_time")
+            if not last_processed or last_processed < last_bar_filled:
+                self.state.state["last_processed_bar_time"] = last_bar_filled
+            last_trade_ts = safe_float(self.state.state.get("last_trade_ts"), 0.0)
+            if last_trade_ts < last_bar_filled:
+                self.state.state["last_trade_ts"] = float(last_bar_filled)
         self.logger.info(
             f"Fast bootstrap filled {len(rows)} missing bars in last {self.continuity_bars}."
         )
+
+    def _normalize_bars(self, bars_df: pd.DataFrame) -> pd.DataFrame:
+        if bars_df is None or bars_df.empty:
+            return bars_df
+        df = bars_df.copy()
+        for col in BAR_COLUMNS:
+            if col not in df.columns:
+                df[col] = 0.0
+        df["bar_time"] = pd.to_numeric(df["bar_time"], errors="coerce").fillna(0).astype(int)
+        before = len(df)
+        df = df[df["bar_time"] > 0]
+        if len(df) < before:
+            self.logger.warning(f"Normalized bars: dropped {before - len(df)} invalid bar_time rows.")
+        df = df.drop_duplicates(subset=["bar_time"], keep="last").sort_values("bar_time").reset_index(drop=True)
+
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df.loc[df["close"] <= 0, "close"] = np.nan
+        df["close"] = df["close"].ffill().bfill()
+        if df["close"].isna().any():
+            df["close"] = df["close"].fillna(0.0)
+            self.logger.warning("Normalized bars: close missing; filled remaining rows with 0.0.")
+
+        for col in ("open", "high", "low"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.loc[df[col] <= 0, col] = np.nan
+            df[col] = df[col].fillna(df["close"])
+        df["high"] = df[["high", "open", "close"]].max(axis=1)
+        df["low"] = df[["low", "open", "close"]].min(axis=1)
+
+        for col in ("volume", "vol_buy", "vol_sell", "dollar_val", "total_val", "buy_vol", "sell_vol"):
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        df["trade_count"] = pd.to_numeric(df["trade_count"], errors="coerce").fillna(0).astype(int)
+        df.loc[(df["trade_count"] <= 0) & (df["volume"] > 0), "trade_count"] = 1
+
+        df["vol_delta"] = df["vol_buy"] - df["vol_sell"]
+        df["dollar_val"] = df["dollar_val"].where(df["dollar_val"] > 0, df["close"] * df["volume"])
+        df["total_val"] = df["total_val"].where(df["total_val"] > 0, df["dollar_val"])
+        df["vwap"] = np.where(df["volume"] > 0, df["dollar_val"] / df["volume"], df["close"])
+        df["taker_buy_ratio"] = np.where(df["volume"] > 0, df["vol_buy"] / df["volume"], 0.5)
+        df["buy_vol"] = df["vol_buy"]
+        df["sell_vol"] = df["vol_sell"]
+
+        ob_cols = [c for c in BAR_COLUMNS if c.startswith("ob_")]
+        if ob_cols:
+            for col in ob_cols:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[ob_cols] = df[ob_cols].ffill().fillna(0.0)
+
+        df["datetime"] = pd.to_datetime(df["bar_time"], unit="s", errors="coerce")
+        return df[BAR_COLUMNS]
+
+    def _get_seed_price(self) -> float:
+        last_close = self.bar_window.latest_close()
+        if last_close and last_close > 0:
+            return last_close
+        last_trade = safe_float(self.bar_window.trade_builder.last_price)
+        if last_trade > 0:
+            return last_trade
+        try:
+            trades_df = self.api.fetch_recent_trades(limit=20)
+            if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                price = safe_float(trades_df.iloc[-1].get("price"))
+                if price > 0:
+                    return price
+            elif isinstance(trades_df, list) and trades_df:
+                price = safe_float(trades_df[-1].get("price"))
+                if price > 0:
+                    return price
+        except Exception:
+            pass
+        try:
+            ob = self.api.fetch_orderbook(limit=1)
+            if isinstance(ob, dict):
+                bids = ob.get("b") or []
+                asks = ob.get("a") or []
+                if bids and asks:
+                    bid = safe_float(bids[0][0])
+                    ask = safe_float(asks[0][0])
+                    if bid > 0 and ask > 0:
+                        return (bid + ask) * 0.5
+        except Exception:
+            pass
+        return 0.0
+
+    def _synthetic_bar_row(self, bar_time: int, price: float) -> Dict[str, object]:
+        price = safe_float(price)
+        bar = {
+            "bar_time": bar_time,
+            "datetime": pd.to_datetime(bar_time, unit="s"),
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": 0.0,
+            "trade_count": 0,
+            "vol_buy": 0.0,
+            "vol_sell": 0.0,
+            "vol_delta": 0.0,
+            "dollar_val": 0.0,
+            "total_val": 0.0,
+            "vwap": price,
+            "taker_buy_ratio": 0.5,
+            "buy_vol": 0.0,
+            "sell_vol": 0.0,
+        }
+        for key in self.bar_window.last_ob:
+            bar[key] = 0.0
+        return bar
+
+    def _merge_history(self, primary: pd.DataFrame, secondary: pd.DataFrame) -> pd.DataFrame:
+        if primary is None or primary.empty:
+            return self._normalize_bars(secondary)
+        if secondary is None or secondary.empty:
+            return self._normalize_bars(primary)
+        merged = primary.set_index("bar_time").combine_first(secondary.set_index("bar_time"))
+        merged = merged.reset_index().sort_values("bar_time")
+        return self._normalize_bars(merged)
+
+    def _history_gap_count(self, bars_df: pd.DataFrame) -> int:
+        if bars_df is None or len(bars_df) < 2 or self.tf_seconds <= 0:
+            return 0
+        times = bars_df["bar_time"].astype(int).to_numpy()
+        diffs = np.diff(times)
+        gaps = diffs[diffs > self.tf_seconds]
+        if gaps.size == 0:
+            return 0
+        missing = int(np.sum((gaps / self.tf_seconds) - 1))
+        return max(0, missing)
+
+    def _history_ready(self) -> Tuple[bool, List[str]]:
+        bars_df = self._normalize_bars(self.bar_window.bars.copy())
+        if bars_df is None or bars_df.empty:
+            return False, ["no bars"]
+        self.bar_window.load_bars(bars_df)
+
+        reasons: List[str] = []
+        if len(bars_df) < self.min_feature_bars:
+            reasons.append(f"bars<{self.min_feature_bars}")
+        gap_count = self._history_gap_count(bars_df)
+        if gap_count:
+            reasons.append(f"gaps={gap_count}")
+        last_bar = safe_int(bars_df.iloc[-1]["bar_time"])
+        bar_close = last_bar + self.tf_seconds
+        age_sec = time.time() - bar_close
+        if age_sec < 0:
+            age_sec = 0.0
+        if age_sec > self.max_last_bar_age_sec:
+            reasons.append(f"last_bar_age>{self.max_last_bar_age_sec:.1f}s")
+        if (bars_df["close"] <= 0).any():
+            reasons.append("close<=0")
+        return len(reasons) == 0, reasons
+
+    def _pad_history_to_min_bars(self, bars_df: pd.DataFrame, min_bars: int, seed_price: float) -> pd.DataFrame:
+        if bars_df is None or bars_df.empty or min_bars <= 0:
+            return bars_df
+        missing = max(0, min_bars - len(bars_df))
+        if missing == 0:
+            return bars_df
+        first_bar = safe_int(bars_df.iloc[0]["bar_time"])
+        price = safe_float(bars_df.iloc[0].get("close"))
+        if price <= 0:
+            price = seed_price
+        if price <= 0:
+            return bars_df
+
+        rows = []
+        for i in range(missing):
+            bar_time = first_bar - self.tf_seconds * (missing - i)
+            rows.append(self._synthetic_bar_row(bar_time, price))
+        padded = pd.concat([pd.DataFrame(rows), bars_df], ignore_index=True)
+        return self._normalize_bars(padded)
+
+    def _bootstrap_synthetic(self, min_bars: int, seed_price: float) -> bool:
+        if min_bars <= 0 or seed_price <= 0:
+            return False
+        end_bar = bar_time_from_ts(time.time() - self.tf_seconds, self.tf_seconds)
+        if end_bar <= 0:
+            return False
+        start_bar = end_bar - (min_bars - 1) * self.tf_seconds
+        rows = []
+        for bar_time in range(start_bar, end_bar + self.tf_seconds, self.tf_seconds):
+            rows.append(self._synthetic_bar_row(bar_time, seed_price))
+        df = self._normalize_bars(pd.DataFrame(rows))
+        if df is None or df.empty:
+            return False
+        self.bar_window.load_bars(df)
+        self._save_history()
+        self.logger.warning(f"Synthetic bootstrap created {len(df)} bars using price seed {seed_price:.6f}.")
+        return True
+
+    def _seed_trade_builder_from_history(self) -> None:
+        if self.bar_window.trade_builder.current_bar_time is not None:
+            return
+        last_bar = self.bar_window.latest_bar_time()
+        last_close = self.bar_window.latest_close()
+        if last_bar is None or not last_close or last_close <= 0:
+            return
+        next_bar = last_bar + self.tf_seconds
+        self.bar_window.trade_builder._start_bar(next_bar, last_close)
 
     def _load_history(self) -> None:
         if not self.history_path.exists():
@@ -1647,24 +2116,26 @@ class LiveTradingV2:
                 df["bar_time"] = (df["datetime"].astype("int64") // 1_000_000_000).astype(int)
                 df["bar_time"] = df["bar_time"].apply(lambda ts: bar_time_from_ts(ts, self.tf_seconds))
 
-            for col in BAR_COLUMNS:
-                if col not in df.columns:
-                    df[col] = 0.0
-            df = df[BAR_COLUMNS]
-            df = df.drop_duplicates(subset=["bar_time"], keep="last").sort_values("bar_time")
+            df = self._normalize_bars(df)
+            if df is None or df.empty:
+                self.logger.warning("History load: no usable bars after normalization.")
+                return
 
             base = self.bar_window.bars.copy()
             if not base.empty:
-                for col in BAR_COLUMNS:
-                    if col not in base.columns:
-                        base[col] = 0.0
-                merged = df.set_index("bar_time").combine_first(base.set_index("bar_time"))
-                merged = merged.reset_index().sort_values("bar_time")
-                merged["datetime"] = pd.to_datetime(merged["bar_time"], unit="s")
-                merged = merged[BAR_COLUMNS]
+                base = self._normalize_bars(base)
+                if base is None or base.empty:
+                    merged = df
+                else:
+                    merged = df.set_index("bar_time").combine_first(base.set_index("bar_time"))
+                    merged = merged.reset_index().sort_values("bar_time")
+                    merged = self._normalize_bars(merged)
             else:
                 merged = df
 
+            if merged is None or merged.empty:
+                self.logger.warning("History load: normalized bars empty after merge.")
+                return
             self.bar_window.load_bars(merged)
             last_bar = self.bar_window.latest_bar_time()
             if last_bar is not None:
@@ -2042,16 +2513,20 @@ class LiveTradingV2:
         if bars.empty:
             return "Data: EMPTY"
         trade_bars = bars[bars["trade_count"] > 0]
-        n = len(trade_bars)
+        n_trade = len(trade_bars)
+        total = len(bars)
         macro_target = max(self.min_feature_bars, 1)
-        macro_pct = min(100.0, (n / macro_target) * 100)
-        window = min(24, n)
+        macro_pct = min(100.0, (total / macro_target) * 100)
+        window = min(24, total)
         if window == 0:
             ob_density = 0.0
         else:
-            recent = trade_bars.tail(window)
+            recent = bars.tail(window)
             ob_density = (recent["ob_spread_mean"] > 0).sum() / window * 100
-        return f"Bars: {n} | Macro: {macro_pct:.0f}% | OB-Density(2h): {ob_density:.0f}% | TradeCont: {self.continuous_trade_bars}"
+        return (
+            f"Bars: {n_trade}/{total} | Macro: {macro_pct:.0f}% | "
+            f"OB-Density(2h): {ob_density:.0f}% | TradeCont: {self.continuous_trade_bars}"
+        )
 
     def _history_continuity_ready(self, bars_df: pd.DataFrame) -> Tuple[bool, str]:
         if bars_df.empty:
@@ -2739,6 +3214,7 @@ class LiveTradingV2:
         self.logger.info(f"Bootstrap Klines Days: {self.bootstrap_klines_days}")
         self.logger.info(f"Fast Bootstrap: {self.fast_bootstrap}")
         self.logger.info(f"Dry Run: {self.dry_run}")
+        self.logger.info(f"Signal Only: {self.signal_only}")
         self.logger.info(f"Exchange Leverage: {self.exchange_leverage if self.exchange_leverage else 'unchanged'}")
         if self.keys_file:
             self.logger.info(f"Keys File: {self.keys_file} | Profile: {self.keys_profile}")
@@ -2749,6 +3225,7 @@ class LiveTradingV2:
         if self.log_positions_raw:
             self.logger.info(f"Positions Raw Log: {self.positions_log_path}")
         self.logger.info(f"Metrics Log: {self.metrics_path}")
+        self.logger.info(f"Signals Log: {self.signal_log_path}")
         self.logger.info(f"WS Trades: {self.use_ws_trades} | WS OB: {self.use_ws_ob}")
         self.logger.info(f"WS Private: {self.use_ws_private} | Topics: {','.join(self.ws_private_topics) or 'none'}")
         if self.use_ws_private:
@@ -3370,7 +3847,7 @@ class LiveTradingV2:
         return safe_float(self.bar_window.latest_close())
 
     def _check_tp_limit_fallback(self, now: Optional[float] = None) -> None:
-        if not self.tp_maker or self.dry_run:
+        if not self.tp_maker or self.dry_run or self.signal_only:
             return
         if self.tp_maker_fallback_sec <= 0:
             return
@@ -3753,21 +4230,109 @@ class LiveTradingV2:
             self._clear_entry_intent(side, force=True)
         self.state.save()
 
+    def _calc_entry_price(self, side: str, close: float, atr: float) -> float:
+        offset = self.config.strategy.base_limit_offset_atr
+        price = close - (atr * offset) if side == "Buy" else close + (atr * offset)
+        tick = self.instrument.tick_size
+        if tick > 0:
+            price = round_down(price, tick) if side == "Buy" else round_up(price, tick)
+        return price
+
+    def _signal_entry_price(self, side: str, close: float, atr: float) -> float:
+        return self._calc_entry_price(side, close, atr)
+
+    def _build_signal(
+        self,
+        side: str,
+        pred: float,
+        latest_row: pd.Series,
+        bar_time: int,
+        threshold: float,
+        ts: str,
+        ts_ms: int,
+    ) -> Optional[Dict[str, object]]:
+        atr = safe_float(latest_row.get("atr"))
+        close = safe_float(latest_row.get("close"))
+        if atr <= 0 or close <= 0:
+            return None
+        entry_price = self._signal_entry_price(side, close, atr)
+        if entry_price <= 0:
+            return None
+        tp, sl = self._compute_tp_sl_targets(side, entry_price, atr)
+        tick_size = safe_float(getattr(self.instrument, "tick_size", 0.0))
+        if tick_size > 0:
+            price_decimals = step_decimals(tick_size)
+            entry_price = round(entry_price, price_decimals)
+            tp = round(tp, price_decimals) if tp else 0.0
+            sl = round(sl, price_decimals) if sl else 0.0
+        return {
+            "id": f"{bar_time}-{side}-{uuid.uuid4().hex[:8]}",
+            "ts": ts,
+            "ts_ms": ts_ms,
+            "bar_time": bar_time,
+            "symbol": self.config.data.symbol,
+            "side": side,
+            "pred": round(float(pred), 6),
+            "threshold": round(float(threshold), 6),
+            "entry_price": entry_price,
+            "target": entry_price,
+            "tp": tp,
+            "sl": sl,
+            "tp_atr": round(safe_float(self.config.strategy.take_profit_atr), 6),
+            "sl_atr": round(safe_float(self.config.strategy.stop_loss_atr), 6),
+            "tick_size": round(tick_size, 8) if tick_size else 0.0,
+            "atr": round(atr, 6),
+            "close": round(close, 6),
+            "timeframe": self.config.features.base_timeframe,
+            "mode": "signal_only" if self.signal_only else "live",
+        }
+
+    def _record_signals(self, signals: List[Dict[str, object]]) -> None:
+        if not signals:
+            return
+        try:
+            for signal in signals:
+                append_jsonl(self.signal_log_path, signal)
+        except Exception as exc:
+            self.logger.error(f"Failed to write signal log: {exc}")
+
+    def _update_signals(
+        self,
+        bar_time: int,
+        latest_row: pd.Series,
+        pred_long: float,
+        pred_short: float,
+        threshold: float,
+    ) -> None:
+        ts = utc_now_str()
+        ts_ms = int(time.time() * 1000)
+        signals: List[Dict[str, object]] = []
+        if pred_long > threshold:
+            signal = self._build_signal("Buy", pred_long, latest_row, bar_time, threshold, ts, ts_ms)
+            if signal:
+                signals.append(signal)
+        if pred_short > threshold:
+            signal = self._build_signal("Sell", pred_short, latest_row, bar_time, threshold, ts, ts_ms)
+            if signal:
+                signals.append(signal)
+        if signals:
+            self.last_signal = {
+                "ts": ts,
+                "ts_ms": ts_ms,
+                "bar_time": bar_time,
+                "signals": signals,
+            }
+            self._record_signals(signals)
+        else:
+            self.last_signal = {}
+
     def _place_order(self, side: str, latest_row: pd.Series, equity: float) -> Optional[str]:
         atr = safe_float(latest_row.get("atr"))
         close = safe_float(latest_row.get("close"))
         if atr <= 0 or close <= 0:
             return None
 
-        offset = self.config.strategy.base_limit_offset_atr
-        if side == "Buy":
-            price = close - (atr * offset)
-        else:
-            price = close + (atr * offset)
-
-        tick = self.instrument.tick_size
-        if tick > 0:
-            price = round_down(price, tick) if side == "Buy" else round_up(price, tick)
+        price = self._calc_entry_price(side, close, atr)
         if price <= 0:
             return None
 
@@ -3802,7 +4367,7 @@ class LiveTradingV2:
         qty = max(qty, min_qty_req)
 
         if max_qty_allowed > 0 and min_qty_req > max_qty_allowed:
-            self.logger.warning("Min size exceeds max allowed; skipping order.")
+            self.logger.warning("Min size exceeds max allowed; order blocked.")
             return None
 
         if max_qty_allowed > 0 and qty > max_qty_allowed:
@@ -3827,7 +4392,7 @@ class LiveTradingV2:
 
         # Final guard
         if qty <= 0:
-            self.logger.warning("Qty quantized to 0; skipping order.")
+            self.logger.warning("Qty quantized to 0; order blocked.")
             return None      	
         
         self.logger.info(f"Placing {side} limit: price={price:.6f} qty={qty:.6f}")
@@ -4026,13 +4591,30 @@ class LiveTradingV2:
                 self.bar_window.load_bars(bars_df)
             bars_all = bars_df
             if len(bars_df) < self.min_feature_bars:
-                self.logger.warning(f"Warmup: {len(bars_df)} bars < {self.min_feature_bars}.")
-                return
+                self.logger.warning(f"Warmup: {len(bars_df)} bars < {self.min_feature_bars}; padding history.")
+                seed = self._get_seed_price()
+                padded = self._pad_history_to_min_bars(bars_df, self.min_feature_bars, seed)
+                if padded is None or padded.empty or len(padded) < self.min_feature_bars:
+                    return
+                self.bar_window.load_bars(padded)
+                bars_df = padded
+                bars_all = bars_df
 
             bar_rows = bars_df[bars_df["bar_time"] == bar_time]
             if bar_rows.empty:
-                self.logger.warning(f"Bar time {bar_time} missing in window.")
-                return
+                seed = self._get_seed_price()
+                if seed > 0:
+                    synth_df = pd.DataFrame([self._synthetic_bar_row(bar_time, seed)])
+                    merged = pd.concat([bars_df, synth_df], ignore_index=True)
+                    merged = self._normalize_bars(merged)
+                    if merged is not None and not merged.empty:
+                        self.bar_window.load_bars(merged)
+                        bars_df = merged
+                        bars_all = bars_df
+                        bar_rows = bars_df[bars_df["bar_time"] == bar_time]
+                if bar_rows.empty:
+                    self.logger.warning(f"Bar time {bar_time} missing in window.")
+                    return
             raw_row = bar_rows.iloc[-1]
             trade_count = safe_int(raw_row.get("trade_count"))
             if trade_count > 0:
@@ -4045,18 +4627,24 @@ class LiveTradingV2:
                 self.continuous_trade_bars = 0
 
             if trade_count == 0:
-                self.logger.info(f"Bar {pd.to_datetime(bar_time, unit='s')} has no trades. Skipping.")
-                return
+                self.logger.info(f"Bar {pd.to_datetime(bar_time, unit='s')} has no trades.")
 
-            bars_df = bars_all[bars_all["trade_count"] > 0].copy()
+            bars_df = bars_all.copy()
             if bars_df.empty:
-                self.logger.warning("No trade bars available after filtering.")
+                self.logger.warning("No bars available after loading window.")
                 return
             ready, reason = self._history_continuity_ready(bars_all)
             if not ready:
-                self.logger.info(f"History continuity warmup: {reason}.")
-                return
+                self.logger.info(f"History continuity warmup: {reason}. Attempting recovery.")
+                self._fill_history_gaps()
+                bars_df = self.bar_window.bars.copy()
+                bars_all = bars_df
+                ready, reason = self._history_continuity_ready(bars_all)
+                if not ready:
+                    self.logger.info(f"History continuity still not ready: {reason}.")
+                    return
             df_feat = self.feature_engine.calculate_features(bars_df)
+            df_feat = df_feat.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
             ok, missing = self._check_feature_coverage(df_feat, bar_time=bar_time)
             if not ok:
@@ -4075,9 +4663,9 @@ class LiveTradingV2:
 
             recent = bars_df.tail(min(24, len(bars_df)))
             ob_density = (recent["ob_spread_mean"] > 0).sum() / max(len(recent), 1) * 100
-            if ob_density < self.min_ob_density_pct:
+            ob_ok = ob_density >= self.min_ob_density_pct
+            if not ob_ok:
                 self.logger.warning(f"OB density {ob_density:.0f}% below threshold {self.min_ob_density_pct:.0f}%.")
-                return
 
             if self.min_trade_bars > 0 and self.continuous_trade_bars < self.min_trade_bars:
                 self.logger.info(
@@ -4099,6 +4687,7 @@ class LiveTradingV2:
                 "pred_short": pred_short,
                 "threshold": threshold,
             }
+            self._update_signals(bar_time, latest, pred_long, pred_short, threshold)
 
             equity = 10000.0
             if not self.dry_run:
@@ -4129,8 +4718,20 @@ class LiveTradingV2:
             if drift_alerts:
                 self.logger.warning("Drift alerts: " + ", ".join(drift_alerts))
 
+            if self.signal_only:
+                self.last_regime = regime
+                self.last_sentiment = sentiment
+                self.last_health = self.health.check_health()
+                return
+
+            if trade_count == 0:
+                self.logger.info("No trades in bar; orders deferred.")
+                return
+            if not ob_ok:
+                return
+
             if spread_pct > self.config.live.max_spread_pct:
-                self.logger.warning(f"Spread too wide ({spread_pct:.4%}). Skipping orders.")
+                self.logger.warning(f"Spread too wide ({spread_pct:.4%}). Orders paused.")
                 return
 
             self._expire_orders(bar_time)
@@ -4195,7 +4796,7 @@ class LiveTradingV2:
 
             last_trade_ts = safe_float(self.state.state.get("last_trade_ts"), 0.0)
             if last_trade_ts > 0 and (time.time() - last_trade_ts) > self.data_lag_error:
-                self.logger.error("Trade data lag exceeds error threshold. Skipping orders.")
+                self.logger.error("Trade data lag exceeds error threshold. Orders paused.")
                 return
 
             if not self.trade_enabled:
@@ -4221,22 +4822,27 @@ class LiveTradingV2:
         if bars.empty:
             return {
                 "bars": 0,
+                "bars_total": 0,
+                "bars_zero_trade": 0,
                 "macro_pct": 0.0,
                 "ob_density_pct": 0.0,
                 "trade_cont": float(self.continuous_trade_bars),
             }
         trade_bars = bars[bars["trade_count"] > 0]
-        n = len(trade_bars)
+        n_trade = len(trade_bars)
+        total = len(bars)
         macro_target = max(self.min_feature_bars, 1)
-        macro_pct = min(100.0, (n / macro_target) * 100) if macro_target else 0.0
-        window = min(24, n)
+        macro_pct = min(100.0, (total / macro_target) * 100) if macro_target else 0.0
+        window = min(24, total)
         if window == 0:
             ob_density = 0.0
         else:
-            recent = trade_bars.tail(window)
+            recent = bars.tail(window)
             ob_density = (recent["ob_spread_mean"] > 0).sum() / window * 100
         return {
-            "bars": int(n),
+            "bars": int(n_trade),
+            "bars_total": int(total),
+            "bars_zero_trade": int(total - n_trade),
             "macro_pct": float(macro_pct),
             "ob_density_pct": float(ob_density),
             "trade_cont": float(self.continuous_trade_bars),
@@ -4445,7 +5051,9 @@ class LiveTradingV2:
             "uptime_sec": round(now - self.start_time, 2),
             "trade_enabled": self.trade_enabled,
             "dry_run": self.dry_run,
+            "signal_only": self.signal_only,
             "prediction": self.last_prediction,
+            "signal": self.last_signal,
             "feature_vector": self.last_feature_vector,
             "position": position_payload,
             "positions": positions_payload,
@@ -4537,9 +5145,7 @@ class LiveTradingV2:
                         trades_df = self.api.fetch_recent_trades(limit=1000)
                         if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
                             new_trades = self._filter_new_trades(trades_df)
-                    closed_times = self.bar_window.ingest_trades(new_trades, now)
-                    for bar_time in closed_times:
-                        self._process_bar(bar_time)
+                    self.bar_window.ingest_trades(new_trades, now, on_close=self._process_bar)
                     last_trade_poll = now
 
                 if self.tp_maker and (now - last_tp_fallback_check) >= 1.0:
@@ -4582,6 +5188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=str, default=str(CONF.data.data_dir))
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_BARS)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--signal-only", action="store_true", help="Emit model signals only (no orders)")
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--log-features", action="store_true", help="Log model feature vector each bar")
     parser.add_argument("--log-feature-z", action="store_true", help="Log per-feature z-scores each bar")
@@ -4646,9 +5253,10 @@ def parse_args() -> argparse.Namespace:
         "--fast-bootstrap",
         action="store_true",
         default=DEFAULT_FAST_BOOTSTRAP,
-        help="Skip continuity gate and fill missing recent bars from klines",
+        help="Bypass continuity gate and fill missing recent bars from klines",
     )
     parser.add_argument("--metrics-log-path", type=str, default=DEFAULT_METRICS_LOG_PATH)
+    parser.add_argument("--signal-log-path", type=str, default=DEFAULT_SIGNAL_LOG_PATH)
     parser.add_argument("--drift-window", type=int, default=DEFAULT_DRIFT_WINDOW)
     parser.add_argument("--drift-z", type=float, default=DEFAULT_DRIFT_Z)
     parser.add_argument(

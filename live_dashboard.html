@@ -74,6 +74,43 @@
       border-color: rgba(34,197,94,0.6);
       box-shadow: 0 0 0 2px rgba(34,197,94,0.2);
     }
+    .summary-card.signal-hot {
+      border-color: rgba(34,197,94,0.7);
+      box-shadow: 0 0 0 2px rgba(34,197,94,0.2), 0 0 18px rgba(34,197,94,0.18);
+    }
+    .summary-card.signal-hot.short {
+      border-color: rgba(239,68,68,0.7);
+      box-shadow: 0 0 0 2px rgba(239,68,68,0.2), 0 0 18px rgba(239,68,68,0.18);
+    }
+    .summary-symbol {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .signal-tag {
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.04);
+    }
+    .signal-tag.long { color: var(--accent); border-color: rgba(34,197,94,0.4); }
+    .signal-tag.short { color: var(--danger); border-color: rgba(239,68,68,0.4); }
+    .signal-tag.dual { color: #f8fafc; border-color: rgba(148,163,184,0.5); }
+    .signal-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 10px rgba(34,197,94,0.8);
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    .signal-dot.short {
+      background: var(--danger);
+      box-shadow: 0 0 10px rgba(239,68,68,0.8);
+    }
     .summary-title {
       display: flex;
       justify-content: space-between;
@@ -106,6 +143,10 @@
     .warn { color: var(--accent2); }
     .bad { color: var(--danger); }
     .muted { color: var(--muted); }
+    .pill.signal {
+      color: #38bdf8;
+      border-color: rgba(56,189,248,0.6);
+    }
     .detail-wrap {
       padding: 12px 32px 40px;
     }
@@ -164,6 +205,101 @@
       width: 100%;
       height: 80px;
       margin-top: 8px;
+    }
+    .signal-panel {
+      margin-top: 18px;
+    }
+    .signal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .signal-chart {
+      height: 360px;
+      margin-top: 10px;
+    }
+    .signal-btn {
+      border: 1px solid rgba(148,163,184,0.2);
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      padding: 6px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      transition: all 0.15s ease;
+    }
+    .signal-btn.active {
+      color: var(--text);
+      border-color: rgba(34,197,94,0.6);
+      box-shadow: 0 0 0 2px rgba(34,197,94,0.15);
+    }
+    .signal-list {
+      margin-top: 12px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      max-height: 280px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .signal-item {
+      border: 1px solid rgba(148,163,184,0.2);
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(15,23,42,0.55);
+      display: grid;
+      gap: 6px;
+      cursor: pointer;
+      transition: transform 0.15s ease, border 0.15s ease;
+    }
+    .signal-item:hover {
+      transform: translateY(-2px);
+      border-color: rgba(34,197,94,0.4);
+    }
+    .signal-item.short:hover {
+      border-color: rgba(239,68,68,0.4);
+    }
+    .signal-item.active {
+      border-color: rgba(34,197,94,0.8);
+      box-shadow: 0 0 0 2px rgba(34,197,94,0.15);
+    }
+    .signal-item.short.active {
+      border-color: rgba(239,68,68,0.8);
+      box-shadow: 0 0 0 2px rgba(239,68,68,0.15);
+    }
+    .signal-item.hidden {
+      display: none;
+    }
+    .signal-side {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .signal-side.long { color: var(--accent); }
+    .signal-side.short { color: var(--danger); }
+    .signal-meta {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .signal-values {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+      font-size: 12px;
+    }
+    .signal-values span {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    @keyframes pulse {
+      0% { transform: scale(0.9); opacity: 0.6; }
+      50% { transform: scale(1.2); opacity: 1; }
+      100% { transform: scale(0.9); opacity: 0.6; }
     }
     .chart-large {
       height: 300px;
@@ -475,6 +611,15 @@
           <div class="row"><span>Keys Profile</span><span id="keysProfile">--</span></div>
         </div>
         <div class="card">
+          <h3>Signal</h3>
+          <div class="value" id="signalStatus">--</div>
+          <div class="row"><span>Side</span><span id="signalSide">--</span></div>
+          <div class="row"><span>Entry Price</span><span id="signalEntry">--</span></div>
+          <div class="row"><span>TP Price</span><span id="signalTP">--</span></div>
+          <div class="row"><span>SL Price</span><span id="signalSL">--</span></div>
+          <div class="row"><span>Time</span><span id="signalTime">--</span></div>
+        </div>
+        <div class="card">
           <h3>Data Quality</h3>
           <div class="value" id="barsVal">--</div>
           <div class="row"><span>Macro %</span><span id="macroPct">--</span></div>
@@ -507,6 +652,17 @@
           <h3>Features</h3>
           <div class="feature-grid" id="featureList">--</div>
         </div>
+      </div>
+      <div class="card signal-panel">
+        <div class="signal-header">
+          <div>
+            <h3>Signal Stream</h3>
+            <div class="sub" id="signalSub">Waiting for signals...</div>
+          </div>
+          <button class="signal-btn" id="signalClear">Show All</button>
+        </div>
+        <div id="signalChart" class="signal-chart"></div>
+        <div class="signal-list" id="signalList">--</div>
       </div>
     </section>
   </section>
@@ -560,7 +716,17 @@
       balanceHistory: [],
       balanceFlowPct: 2.0,
       balancePlot: null,
-      balanceLatest: null
+      balanceLatest: null,
+      signalHistory: [],
+      signalCandles: [],
+      signalFocusId: null,
+      signalChart: null,
+      signalChartLoading: false,
+      signalSymbol: null,
+      signalLastCandleFetch: 0,
+      signalZoom: null,
+      signalZoomActive: false,
+      signalZoomBound: false
     };
 
     function sparkline(canvas, values, color) {
@@ -597,6 +763,122 @@
         if (ts) return ts;
       }
       return null;
+    }
+
+    function signalTimestampMs(signal) {
+      if (!signal) return null;
+      const tsMs = Number(signal.ts_ms || 0);
+      if (tsMs > 0) return tsMs;
+      if (signal.ts) {
+        const parsed = parseTs(String(signal.ts));
+        if (parsed) return parsed;
+      }
+      const barTime = Number(signal.bar_time || 0);
+      return barTime > 0 ? barTime * 1000 : null;
+    }
+
+    function formatSignalTime(signal) {
+      const ms = signalTimestampMs(signal);
+      if (!ms) return "--";
+      return new Date(ms).toLocaleString();
+    }
+
+    function signalSideKey(side) {
+      const val = (side || "").toString().toLowerCase();
+      if (val === "buy" || val === "long") return "long";
+      if (val === "sell" || val === "short") return "short";
+      return "";
+    }
+
+    function signalSideLabel(side) {
+      const key = signalSideKey(side);
+      if (key === "long") return "LONG";
+      if (key === "short") return "SHORT";
+      return "--";
+    }
+
+    function computeSignalTargets(signal, entry) {
+      const atr = Number((signal && signal.atr) || 0);
+      const tpAtr = Number((signal && signal.tp_atr) || 0);
+      const slAtr = Number((signal && signal.sl_atr) || 0);
+      if (entry <= 0 || atr <= 0 || tpAtr <= 0 || slAtr <= 0) {
+        return { tp: 0, sl: 0 };
+      }
+      const side = signalSideKey(signal && signal.side);
+      let tp = entry + (atr * tpAtr);
+      let sl = entry - (atr * slAtr);
+      if (side === "short") {
+        tp = entry - (atr * tpAtr);
+        sl = entry + (atr * slAtr);
+      }
+      const tick = Number((signal && signal.tick_size) || 0);
+      if (tick > 0) {
+        if (side === "short") {
+          tp = Math.floor(tp / tick) * tick;
+          sl = Math.ceil(sl / tick) * tick;
+        } else {
+          tp = Math.ceil(tp / tick) * tick;
+          sl = Math.floor(sl / tick) * tick;
+        }
+      }
+      return { tp, sl };
+    }
+
+    function computeSignalState(prediction) {
+      const predLong = Number(prediction?.pred_long || 0);
+      const predShort = Number(prediction?.pred_short || 0);
+      const threshold = Number(prediction?.threshold || 0);
+      const activeLong = predLong > threshold;
+      const activeShort = predShort > threshold;
+      let side = "";
+      if (activeLong && activeShort) {
+        side = "dual";
+      } else if (activeLong) {
+        side = "long";
+      } else if (activeShort) {
+        side = "short";
+      }
+      return {
+        active: activeLong || activeShort,
+        side,
+        predLong,
+        predShort,
+        threshold
+      };
+    }
+
+    function pickDominantSignal(signals) {
+      if (!Array.isArray(signals) || !signals.length) return null;
+      let best = signals[0];
+      let bestScore = Number(best.pred || 0);
+      for (let i = 1; i < signals.length; i++) {
+        const score = Number(signals[i].pred || 0);
+        if (score > bestScore) {
+          best = signals[i];
+          bestScore = score;
+        }
+      }
+      return best;
+    }
+
+    function tickDecimals(tick) {
+      const num = Number(tick);
+      if (!Number.isFinite(num) || num <= 0) return 6;
+      const text = num.toString();
+      if (text.includes("e-")) {
+        const exp = Number(text.split("e-")[1]);
+        return Number.isFinite(exp) ? exp : 6;
+      }
+      const dot = text.indexOf(".");
+      return dot === -1 ? 0 : (text.length - dot - 1);
+    }
+
+    function formatSignalPrice(value, tick) {
+      if (value === null || value === undefined) return "--";
+      const num = Number(value);
+      if (!Number.isFinite(num) || num === 0) return "--";
+      const decimals = tickDecimals(tick);
+      return fmt(num, decimals);
     }
 
     function drawBalanceChart(canvas, rawSeries, adjustedSeries, scaleMode, showRaw, showAdjusted) {
@@ -792,17 +1074,44 @@
       symbols.forEach(symbol => {
         const item = state.latestMap[symbol];
         const card = document.createElement("div");
-        card.className = "summary-card" + (symbol === state.selected ? " selected" : "");
+        const signalState = computeSignalState(item.prediction || {});
+        const signalClasses = [];
+        if (signalState.active) {
+          signalClasses.push("signal-hot");
+          if (signalState.side === "short") {
+            signalClasses.push("short");
+          }
+        }
+        card.className = ["summary-card", symbol === state.selected ? "selected" : "", ...signalClasses]
+          .filter(Boolean)
+          .join(" ");
         card.addEventListener("click", () => selectSymbol(symbol));
 
         const title = document.createElement("div");
         title.className = "summary-title";
-        const label = document.createElement("div");
+        const labelWrap = document.createElement("div");
+        labelWrap.className = "summary-symbol";
+        const label = document.createElement("span");
         label.textContent = symbol;
+        labelWrap.appendChild(label);
+        if (signalState.active) {
+          const dot = document.createElement("span");
+          dot.className = "signal-dot" + (signalState.side === "short" ? " short" : "");
+          labelWrap.appendChild(dot);
+          const tag = document.createElement("span");
+          tag.className = "signal-tag " + (signalState.side || "");
+          tag.textContent = signalState.side === "dual" ? "DUAL" : signalState.side.toUpperCase();
+          labelWrap.appendChild(tag);
+        }
         const badge = document.createElement("span");
-        badge.className = "badge " + (item.trade_enabled ? "ok" : "warn");
-        badge.textContent = item.trade_enabled ? "ON" : "OFF";
-        title.appendChild(label);
+        if (item.signal_only) {
+          badge.className = "badge ok";
+          badge.textContent = "SIGNAL";
+        } else {
+          badge.className = "badge " + (item.trade_enabled ? "ok" : "warn");
+          badge.textContent = item.trade_enabled ? "ON" : "OFF";
+        }
+        title.appendChild(labelWrap);
         title.appendChild(badge);
         card.appendChild(title);
 
@@ -811,10 +1120,22 @@
         equity.textContent = item.equity ? fmt(item.equity, 4) : "--";
         card.appendChild(equity);
 
+        let signalText = "None";
+        if (signalState.active) {
+          if (signalState.side === "long") {
+            signalText = `LONG ${fmt(signalState.predLong, 3)}`;
+          } else if (signalState.side === "short") {
+            signalText = `SHORT ${fmt(signalState.predShort, 3)}`;
+          } else {
+            const peak = Math.max(signalState.predLong, signalState.predShort);
+            signalText = `DUAL ${fmt(peak, 3)}`;
+          }
+        }
         const rows = [
           ["Daily PnL", fmt(item.daily_pnl, 4)],
           ["Position", formatPosition(item.position)],
           ["Health", item.health?.status || "--"],
+          ["Signal", signalText],
           ["OB Density", fmtPct(item.data_health?.ob_density_pct)],
           ["Lag Trade", fmtSec(item.latency?.lag_trade_sec)],
           ["Last Update", item.ts || "--"],
@@ -871,6 +1192,7 @@
         tabChart.classList.remove("active");
         if (state.selected) {
           fetchHistory(state.selected);
+          refreshSignals(state.selected);
         }
       }
     }
@@ -887,6 +1209,7 @@
       renderSummary(state.items);
       if (symbol) {
         fetchHistory(symbol);
+        refreshSignals(symbol);
       }
     }
 
@@ -906,8 +1229,14 @@
 
       document.getElementById("detailTitle").textContent = `Selected: ${data.symbol}`;
       document.getElementById("detailSub").textContent = `Startup: ${data.startup_time || "--"} | Uptime: ${Math.round(data.uptime_sec || 0)}s | Last: ${data.ts || "--"}`;
-      document.getElementById("detailStatus").textContent = data.trade_enabled ? "Trading Enabled" : "Trading Paused";
-      document.getElementById("detailStatus").className = "pill " + (data.trade_enabled ? "ok" : "warn");
+      const detailStatus = document.getElementById("detailStatus");
+      if (data.signal_only) {
+        detailStatus.textContent = "Signal Only";
+        detailStatus.className = "pill signal";
+      } else {
+        detailStatus.textContent = data.trade_enabled ? "Trading Enabled" : "Trading Paused";
+        detailStatus.className = "pill " + (data.trade_enabled ? "ok" : "warn");
+      }
 
       document.getElementById("equityVal").textContent = data.equity ? fmt(data.equity, 4) : "--";
       document.getElementById("dailyPnl").textContent = fmt(data.daily_pnl, 4);
@@ -924,7 +1253,7 @@
       healthEl.className = "value " + healthClass(health.status);
       document.getElementById("sentimentVal").textContent = health.sentiment || "--";
       document.getElementById("regimeVal").textContent = health.regime || "--";
-      document.getElementById("tradeEnabled").textContent = data.trade_enabled ? "Yes" : "No";
+      document.getElementById("tradeEnabled").textContent = data.signal_only ? "Signal Only" : (data.trade_enabled ? "Yes" : "No");
       const driftText = drift.alerts && drift.alerts.length ? drift.alerts.join(", ") : "None";
       document.getElementById("driftAlerts").textContent = driftText;
 
@@ -962,6 +1291,30 @@
       modelPathEl.title = modelPath;
       document.getElementById("keysProfile").textContent = model.keys_profile || "--";
 
+      const signalInfo = data.signal || {};
+      const signalItems = Array.isArray(signalInfo.signals) ? signalInfo.signals : [];
+      const normalizedSignals = normalizeSignals(signalItems);
+      const activeSignal = pickDominantSignal(normalizedSignals);
+      const signalStatusEl = document.getElementById("signalStatus");
+      if (activeSignal) {
+        const sideKey = signalSideKey(activeSignal.side);
+        signalStatusEl.textContent = sideKey === "short" ? "Signal Short" : "Signal Long";
+        signalStatusEl.className = "value " + (sideKey === "short" ? "bad" : "ok");
+        document.getElementById("signalSide").textContent = signalSideLabel(activeSignal.side);
+        document.getElementById("signalEntry").textContent = formatSignalPrice(activeSignal.entry_price || activeSignal.target, activeSignal.tick_size);
+        document.getElementById("signalTP").textContent = formatSignalPrice(activeSignal.tp, activeSignal.tick_size);
+        document.getElementById("signalSL").textContent = formatSignalPrice(activeSignal.sl, activeSignal.tick_size);
+        document.getElementById("signalTime").textContent = formatSignalTime(activeSignal);
+      } else {
+        signalStatusEl.textContent = "No Signal";
+        signalStatusEl.className = "value muted";
+        document.getElementById("signalSide").textContent = "--";
+        document.getElementById("signalEntry").textContent = "--";
+        document.getElementById("signalTP").textContent = "--";
+        document.getElementById("signalSL").textContent = "--";
+        document.getElementById("signalTime").textContent = "--";
+      }
+
       renderFeatures(featureVector);
     }
 
@@ -980,6 +1333,392 @@
         item.textContent = `${names[i]}: ${fmt(values[i], 6)}`;
         container.appendChild(item);
       }
+    }
+
+    function normalizeSignals(list) {
+      if (!Array.isArray(list)) return [];
+      return list.map(sig => {
+        const barTime = Number(sig.bar_time || 0);
+        const entry = Number(sig.entry_price || sig.target || 0);
+        const tickSize = Number(sig.tick_size || 0);
+        const rawTp = Number(sig.tp || 0);
+        const rawSl = Number(sig.sl || 0);
+        let tp = Number.isFinite(rawTp) ? rawTp : 0;
+        let sl = Number.isFinite(rawSl) ? rawSl : 0;
+        const needsTp = tp <= 0;
+        const needsSl = sl <= 0;
+        if ((needsTp || needsSl) && entry > 0) {
+          const computed = computeSignalTargets(sig, entry);
+          if (needsTp) tp = computed.tp;
+          if (needsSl) sl = computed.sl;
+        }
+        return {
+          ...sig,
+          id: sig.id || `${barTime}-${sig.side || ""}-${entry}`,
+          bar_time: barTime,
+          entry_price: entry,
+          tick_size: tickSize,
+          tp,
+          sl,
+          pred: Number(sig.pred || 0)
+        };
+      }).filter(sig => sig.bar_time > 0 && sig.entry_price > 0);
+    }
+
+    function normalizeCandles(payload) {
+      const list = Array.isArray(payload) ? payload : (payload?.candles || []);
+      return list.map(c => ({
+        time: Number(c.time || 0),
+        open: Number(c.open || 0),
+        high: Number(c.high || 0),
+        low: Number(c.low || 0),
+        close: Number(c.close || 0)
+      })).filter(c => c.time > 0 && c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0)
+        .sort((a, b) => a.time - b.time);
+    }
+
+    function loadSignalChartLib(callback) {
+      if (window.echarts) {
+        callback();
+        return;
+      }
+      if (state.signalChartLoading) {
+        setTimeout(() => loadSignalChartLib(callback), 200);
+        return;
+      }
+      state.signalChartLoading = true;
+      const script = document.createElement("script");
+      script.src = "/static/echarts.min.js";
+      script.onload = () => {
+        state.signalChartLoading = false;
+        callback();
+      };
+      script.onerror = () => {
+        state.signalChartLoading = false;
+        const sub = document.getElementById("signalSub");
+        if (sub) sub.textContent = "Signal chart library failed to load.";
+      };
+      document.head.appendChild(script);
+    }
+
+    function initSignalChart() {
+      if (!window.echarts) return false;
+      const container = document.getElementById("signalChart");
+      if (!container || container.clientWidth <= 0 || container.clientHeight <= 0) return false;
+      if (!state.signalChart) {
+        state.signalChart = window.echarts.init(container, null, { renderer: "canvas", useDirtyRect: true });
+        window.addEventListener("resize", () => {
+          if (state.signalChart) {
+            state.signalChart.resize();
+          }
+        });
+      }
+      if (state.signalChart && !state.signalZoomBound) {
+        state.signalChart.on("datazoom", (evt) => {
+          const batch = Array.isArray(evt?.batch) && evt.batch.length ? evt.batch[0] : evt;
+          const start = Number(batch?.start);
+          const end = Number(batch?.end);
+          if (Number.isFinite(start) && Number.isFinite(end)) {
+            state.signalZoom = { start, end };
+            state.signalZoomActive = true;
+          }
+        });
+        state.signalZoomBound = true;
+      }
+      return true;
+    }
+
+    function renderSignalChart() {
+      if (!state.selected) return;
+      if (!window.echarts) {
+        loadSignalChartLib(renderSignalChart);
+        return;
+      }
+      if (!initSignalChart()) return;
+
+      const candles = state.signalCandles || [];
+      const signals = state.signalHistory || [];
+      const sub = document.getElementById("signalSub");
+      if (!candles.length) {
+        if (sub) sub.textContent = "Waiting for candle data...";
+        state.signalChart.clear();
+        return;
+      }
+
+      const categories = [];
+      const candleData = [];
+      const indexMap = new Map();
+      candles.forEach((candle, idx) => {
+        indexMap.set(candle.time, idx);
+        const label = new Date(candle.time * 1000).toLocaleString();
+        categories.push(label);
+        candleData.push([candle.open, candle.close, candle.low, candle.high]);
+      });
+
+      const focusId = state.signalFocusId;
+      const visibleSignals = focusId ? signals.filter(sig => sig.id === focusId) : signals;
+      const longPoints = [];
+      const shortPoints = [];
+      visibleSignals.forEach(sig => {
+        const idx = indexMap.get(sig.bar_time);
+        if (idx === undefined) return;
+        const payload = {
+          value: [idx, sig.entry_price],
+          signal: sig
+        };
+        const side = signalSideKey(sig.side);
+        if (side === "short") {
+          shortPoints.push(payload);
+        } else {
+          longPoints.push(payload);
+        }
+      });
+
+      let focusSignal = null;
+      if (focusId) {
+        focusSignal = signals.find(sig => sig.id === focusId) || null;
+      }
+      const markLineData = [];
+      if (focusSignal) {
+        if (focusSignal.entry_price > 0) {
+          markLineData.push({ yAxis: focusSignal.entry_price, name: "Entry" });
+        }
+        if (focusSignal.tp > 0) {
+          markLineData.push({ yAxis: focusSignal.tp, name: "TP" });
+        }
+        if (focusSignal.sl > 0) {
+          markLineData.push({ yAxis: focusSignal.sl, name: "SL" });
+        }
+      }
+      const zoom = state.signalZoomActive ? state.signalZoom : null;
+      const zoomStart = Number.isFinite(zoom?.start) ? zoom.start : 70;
+      const zoomEnd = Number.isFinite(zoom?.end) ? zoom.end : 100;
+      const markTick = focusSignal ? focusSignal.tick_size : 0;
+
+      const option = {
+        backgroundColor: "transparent",
+        grid: { left: 50, right: 20, top: 20, bottom: 50 },
+        tooltip: {
+          trigger: "axis",
+          axisPointer: { type: "cross" },
+          formatter: (params) => {
+            const items = Array.isArray(params) ? params : [params];
+            let header = "";
+            let candleInfo = "";
+            let signalInfo = "";
+            items.forEach(item => {
+              if (item.seriesType === "candlestick") {
+                header = item.name || "";
+                const val = item.data || [];
+                candleInfo = `O:${fmt(val[0], 6)} H:${fmt(val[3], 6)} L:${fmt(val[2], 6)} C:${fmt(val[1], 6)}`;
+              }
+              if (item.data && item.data.signal) {
+                const sig = item.data.signal;
+                signalInfo = [
+                  `Signal: ${signalSideLabel(sig.side)} (${fmt(sig.pred, 3)})`,
+                  `Entry: ${formatSignalPrice(sig.entry_price, sig.tick_size)}`,
+                  `TP: ${formatSignalPrice(sig.tp, sig.tick_size)} | SL: ${formatSignalPrice(sig.sl, sig.tick_size)}`,
+                  `Time: ${formatSignalTime(sig)}`
+                ].join("<br/>");
+              }
+            });
+            return [header, candleInfo, signalInfo].filter(Boolean).join("<br/>");
+          }
+        },
+        xAxis: {
+          type: "category",
+          data: categories,
+          boundaryGap: true,
+          axisLine: { lineStyle: { color: "rgba(148,163,184,0.3)" } },
+          axisLabel: { color: "#94a3b8" }
+        },
+        yAxis: {
+          scale: true,
+          axisLine: { lineStyle: { color: "rgba(148,163,184,0.3)" } },
+          axisLabel: { color: "#94a3b8" },
+          splitLine: { lineStyle: { color: "rgba(148,163,184,0.12)" } }
+        },
+        dataZoom: [
+          { type: "inside", start: zoomStart, end: zoomEnd },
+          {
+            type: "slider",
+            start: zoomStart,
+            end: zoomEnd,
+            height: 20,
+            bottom: 12,
+            borderColor: "rgba(148,163,184,0.2)",
+            textStyle: { color: "#94a3b8" }
+          }
+        ],
+        series: [
+          {
+            name: "Price",
+            type: "candlestick",
+            data: candleData,
+            itemStyle: {
+              color: "#22c55e",
+              color0: "#ef4444",
+              borderColor: "#22c55e",
+              borderColor0: "#ef4444"
+            },
+            markLine: markLineData.length ? {
+              symbol: "none",
+              lineStyle: { color: "#38bdf8", type: "dashed", opacity: 0.8 },
+              label: {
+                color: "#e2e8f0",
+                formatter: (p) => `${p.name}: ${formatSignalPrice(p.value, markTick)}`
+              },
+              data: markLineData
+            } : undefined
+          },
+          {
+            name: "Signal Long",
+            type: "scatter",
+            data: longPoints,
+            symbol: "triangle",
+            symbolSize: 12,
+            itemStyle: { color: "#22c55e" },
+            label: {
+              show: Boolean(focusId),
+              formatter: (p) => formatSignalTime(p.data.signal),
+              color: "#e2e8f0",
+              fontSize: 10,
+              offset: [0, -12]
+            }
+          },
+          {
+            name: "Signal Short",
+            type: "scatter",
+            data: shortPoints,
+            symbol: "triangle",
+            symbolSize: 12,
+            symbolRotate: 180,
+            itemStyle: { color: "#ef4444" },
+            label: {
+              show: Boolean(focusId),
+              formatter: (p) => formatSignalTime(p.data.signal),
+              color: "#e2e8f0",
+              fontSize: 10,
+              offset: [0, 12]
+            }
+          }
+        ]
+      };
+
+      state.signalChart.setOption(option, { notMerge: true, lazyUpdate: true });
+      if (sub && state.signalSymbol) {
+        sub.textContent = `${state.signalSymbol} | Signals: ${signals.length} | Showing: ${visibleSignals.length}`;
+      }
+    }
+
+    function renderSignalList() {
+      const listEl = document.getElementById("signalList");
+      if (!listEl) return;
+      listEl.innerHTML = "";
+      const signals = state.signalHistory || [];
+      if (!signals.length) {
+        listEl.textContent = "--";
+        const clearBtn = document.getElementById("signalClear");
+        if (clearBtn) {
+          clearBtn.classList.remove("active");
+        }
+        return;
+      }
+      const focusId = state.signalFocusId;
+      const visible = focusId ? signals.filter(sig => sig.id === focusId) : signals;
+      if (!visible.length) {
+        listEl.textContent = "--";
+        return;
+      }
+      const sorted = [...visible].sort((a, b) => (signalTimestampMs(b) || 0) - (signalTimestampMs(a) || 0));
+      sorted.forEach(sig => {
+        const sideKey = signalSideKey(sig.side);
+        const item = document.createElement("div");
+        item.className = [
+          "signal-item",
+          sideKey === "short" ? "short" : "",
+          state.signalFocusId === sig.id ? "active" : ""
+        ].join(" ").trim();
+        item.addEventListener("click", () => {
+          if (state.signalFocusId === sig.id) {
+            state.signalFocusId = null;
+          } else {
+            state.signalFocusId = sig.id;
+          }
+          renderSignalList();
+          renderSignalChart();
+        });
+
+        const top = document.createElement("div");
+        top.className = "signal-side " + (sideKey || "long");
+        top.textContent = `${signalSideLabel(sig.side)} signal`;
+
+        const meta = document.createElement("div");
+        meta.className = "signal-meta";
+        meta.textContent = `${formatSignalTime(sig)} | Pred ${fmt(sig.pred, 3)}`;
+
+        const values = document.createElement("div");
+        values.className = "signal-values";
+        values.innerHTML = `
+          <div><strong>${formatSignalPrice(sig.entry_price, sig.tick_size)}</strong><span>Entry Price</span></div>
+          <div><strong>${formatSignalPrice(sig.tp, sig.tick_size)}</strong><span>TP Price</span></div>
+          <div><strong>${formatSignalPrice(sig.sl, sig.tick_size)}</strong><span>SL Price</span></div>
+        `;
+
+        item.appendChild(top);
+        item.appendChild(meta);
+        item.appendChild(values);
+        listEl.appendChild(item);
+      });
+
+      const clearBtn = document.getElementById("signalClear");
+      if (clearBtn) {
+        clearBtn.classList.toggle("active", Boolean(state.signalFocusId));
+      }
+    }
+
+    async function fetchSignals(symbol) {
+      if (!symbol) return;
+      const resp = await fetch(`/api/signals?symbol=${encodeURIComponent(symbol)}&limit=40`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      state.signalHistory = normalizeSignals(data || []);
+      renderSignalList();
+      if (state.signalCandles && state.signalCandles.length) {
+        renderSignalChart();
+      }
+    }
+
+    async function fetchSignalCandles(symbol) {
+      if (!symbol) return;
+      const resp = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&limit=500`);
+      if (!resp.ok) return;
+      const payload = await resp.json();
+      state.signalCandles = normalizeCandles(payload);
+      renderSignalChart();
+    }
+
+    function refreshSignals(symbol) {
+      if (!symbol) return;
+      if (state.signalSymbol !== symbol) {
+        state.signalSymbol = symbol;
+        state.signalFocusId = null;
+        state.signalCandles = [];
+        state.signalHistory = [];
+        state.signalZoom = null;
+        state.signalZoomActive = false;
+        if (state.signalChart) {
+          state.signalChart.clear();
+        }
+        const sub = document.getElementById("signalSub");
+        if (sub) sub.textContent = "Loading candle data...";
+      }
+      const now = Date.now();
+      if (!state.signalLastCandleFetch || (now - state.signalLastCandleFetch) > 20000) {
+        state.signalLastCandleFetch = now;
+        fetchSignalCandles(symbol);
+      }
+      fetchSignals(symbol);
     }
 
     function renderProfiles(list) {
@@ -1189,10 +1928,23 @@
         fetchHistory(state.selected);
       }
     }, 10000);
+    setInterval(() => {
+      if (state.selected) {
+        refreshSignals(state.selected);
+      }
+    }, 6000);
 
     document.getElementById("tabAccount").addEventListener("click", () => setView("account"));
     document.getElementById("tabTraders").addEventListener("click", () => setView("traders"));
     document.getElementById("tabChart").addEventListener("click", () => setView("chart"));
+    const signalClearBtn = document.getElementById("signalClear");
+    if (signalClearBtn) {
+      signalClearBtn.addEventListener("click", () => {
+        state.signalFocusId = null;
+        renderSignalList();
+        renderSignalChart();
+      });
+    }
 
     document.querySelectorAll("#balanceRange .range-btn").forEach(btn => {
       btn.addEventListener("click", () => {
