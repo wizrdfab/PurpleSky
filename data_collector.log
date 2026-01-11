@@ -921,3 +921,120 @@
 2026-01-11 10:47:13,610 - INFO - Stopping...
 2026-01-11 10:47:15,379 - WARNING - CLOSE frame received, closing websocket connection
 2026-01-11 10:47:16,373 - INFO - Stopped.
+2026-01-11 10:47:39,726 - INFO - Starting Robust Collector for 15 symbols...
+2026-01-11 10:47:41,216 - INFO - Opened file: data\NIGHTUSDT_Binance\Orderbook\2026-01-11_NIGHTUSDT_ob200.data
+2026-01-11 10:47:41,342 - INFO - Opened file: data\LYNUSDT_Binance\Trade\LYNUSDT2026-01-11.csv
+2026-01-11 10:47:41,415 - INFO - Opened file: data\LYNUSDT_Binance\Orderbook\2026-01-11_LYNUSDT_ob200.data
+2026-01-11 10:47:41,541 - INFO - Opened file: data\NIGHTUSDT_Binance\Trade\NIGHTUSDT2026-01-11.csv
+2026-01-11 10:47:41,595 - INFO - Opened file: data\CYSUSDT_Binance\Orderbook\2026-01-11_CYSUSDT_ob200.data
+2026-01-11 10:47:41,752 - INFO - Opened file: data\WLFIUSDT_Binance\Orderbook\2026-01-11_WLFIUSDT_ob200.data
+2026-01-11 10:47:42,076 - INFO - Opened file: data\MAGMAUSDT_Binance\Orderbook\2026-01-11_MAGMAUSDT_ob200.data
+2026-01-11 10:47:42,121 - INFO - Snapshot refreshed for NIGHTUSDT
+2026-01-11 10:47:42,256 - INFO - Opened file: data\LITUSDT_Binance\Orderbook\2026-01-11_LITUSDT_ob200.data
+2026-01-11 10:47:42,366 - INFO - Snapshot refreshed for LYNUSDT
+2026-01-11 10:47:42,413 - INFO - Opened file: data\ZKPUSDT_Binance\Orderbook\2026-01-11_ZKPUSDT_ob200.data
+2026-01-11 10:47:42,517 - INFO - Snapshot refreshed for ZKPUSDT
+2026-01-11 10:47:42,647 - INFO - Snapshot refreshed for CYSUSDT
+2026-01-11 10:47:42,708 - INFO - Snapshot refreshed for ZBTUSDT
+2026-01-11 10:47:42,709 - INFO - Opened file: data\ZBTUSDT_Binance\Orderbook\2026-01-11_ZBTUSDT_ob200.data
+2026-01-11 10:47:42,855 - INFO - Opened file: data\XPLUSDT_Binance\Orderbook\2026-01-11_XPLUSDT_ob200.data
+2026-01-11 10:47:42,892 - INFO - Snapshot refreshed for WLFIUSDT
+2026-01-11 10:47:42,910 - INFO - Snapshot refreshed for XPLUSDT
+2026-01-11 10:47:42,952 - INFO - Opened file: data\ZECUSDT_Binance\Trade\ZECUSDT2026-01-11.csv
+2026-01-11 10:47:42,980 - INFO - Opened file: data\ZECUSDT_Binance\Orderbook\2026-01-11_ZECUSDT_ob200.data
+2026-01-11 10:47:43,036 - INFO - Snapshot refreshed for MAGMAUSDT
+2026-01-11 10:47:43,111 - INFO - Opened file: data\ZBTUSDT_Binance\Trade\ZBTUSDT2026-01-11.csv
+2026-01-11 10:47:43,113 - INFO - Snapshot refreshed for ZECUSDT
+2026-01-11 10:47:43,146 - INFO - Snapshot refreshed for LITUSDT
+2026-01-11 10:47:43,184 - INFO - Opened file: data\PIEVERSEUSDT_Binance\Orderbook\2026-01-11_PIEVERSEUSDT_ob200.data
+2026-01-11 10:47:43,313 - INFO - Snapshot refreshed for PIEVERSEUSDT
+2026-01-11 10:47:43,371 - INFO - Opened file: data\PIEVERSEUSDT_Binance\Trade\PIEVERSEUSDT2026-01-11.csv
+2026-01-11 10:47:43,461 - INFO - Opened file: data\FARTCOINUSDT_Binance\Orderbook\2026-01-11_FARTCOINUSDT_ob200.data
+2026-01-11 10:47:43,529 - INFO - Snapshot refreshed for FARTCOINUSDT
+2026-01-11 10:47:43,567 - INFO - Opened file: data\MAGMAUSDT_Binance\Trade\MAGMAUSDT2026-01-11.csv
+2026-01-11 10:47:43,640 - INFO - Opened file: data\1000PEPEUSDT_Binance\Orderbook\2026-01-11_1000PEPEUSDT_ob200.data
+2026-01-11 10:47:43,703 - INFO - Opened file: data\FARTCOINUSDT_Binance\Trade\FARTCOINUSDT2026-01-11.csv
+2026-01-11 10:47:43,714 - INFO - Snapshot refreshed for 1000PEPEUSDT
+2026-01-11 10:47:43,766 - INFO - Opened file: data\SUIUSDT_Binance\Orderbook\2026-01-11_SUIUSDT_ob200.data
+2026-01-11 10:47:43,807 - INFO - Connected and Subscribed.
+2026-01-11 10:47:43,918 - INFO - Snapshot refreshed for SUIUSDT
+2026-01-11 10:47:44,121 - INFO - Snapshot refreshed for WIFUSDT
+2026-01-11 10:47:44,158 - INFO - Opened file: data\WIFUSDT_Binance\Orderbook\2026-01-11_WIFUSDT_ob200.data
+2026-01-11 10:47:44,159 - INFO - Opened file: data\SUIUSDT_Binance\Trade\SUIUSDT2026-01-11.csv
+2026-01-11 10:47:44,230 - INFO - Opened file: data\1000PEPEUSDT_Binance\Trade\1000PEPEUSDT2026-01-11.csv
+2026-01-11 10:47:44,400 - INFO - Opened file: data\WLFIUSDT_Binance\Trade\WLFIUSDT2026-01-11.csv
+2026-01-11 10:47:44,411 - INFO - Opened file: data\ZKPUSDT_Binance\Trade\ZKPUSDT2026-01-11.csv
+2026-01-11 10:47:46,204 - INFO - Opened file: data\LITUSDT_Binance\Trade\LITUSDT2026-01-11.csv
+2026-01-11 10:47:46,765 - INFO - Opened file: data\WIFUSDT_Binance\Trade\WIFUSDT2026-01-11.csv
+2026-01-11 10:47:46,973 - INFO - Opened file: data\CYSUSDT_Binance\Trade\CYSUSDT2026-01-11.csv
+2026-01-11 10:47:48,469 - INFO - Opened file: data\XPLUSDT_Binance\Trade\XPLUSDT2026-01-11.csv
+2026-01-11 11:47:47,631 - INFO - Snapshot refreshed for WLFIUSDT
+2026-01-11 11:47:47,670 - INFO - Snapshot refreshed for NIGHTUSDT
+2026-01-11 11:47:47,672 - INFO - Snapshot refreshed for MAGMAUSDT
+2026-01-11 11:47:47,696 - INFO - Snapshot refreshed for ZBTUSDT
+2026-01-11 11:47:47,703 - INFO - Snapshot refreshed for XPLUSDT
+2026-01-11 11:47:47,708 - INFO - Snapshot refreshed for FARTCOINUSDT
+2026-01-11 11:47:47,763 - INFO - Snapshot refreshed for 1000PEPEUSDT
+2026-01-11 11:47:47,981 - INFO - Snapshot refreshed for LYNUSDT
+2026-01-11 11:47:48,019 - INFO - Snapshot refreshed for CYSUSDT
+2026-01-11 11:47:48,109 - INFO - Snapshot refreshed for LITUSDT
+2026-01-11 11:47:48,118 - WARNING - Connection pool is full, discarding connection: fapi.binance.com. Connection pool size: 10
+2026-01-11 11:47:48,122 - INFO - Snapshot refreshed for ZKPUSDT
+2026-01-11 11:47:48,137 - WARNING - Connection pool is full, discarding connection: fapi.binance.com. Connection pool size: 10
+2026-01-11 11:47:48,141 - INFO - Snapshot refreshed for SUIUSDT
+2026-01-11 11:47:48,149 - WARNING - Connection pool is full, discarding connection: fapi.binance.com. Connection pool size: 10
+2026-01-11 11:47:48,154 - INFO - Snapshot refreshed for WIFUSDT
+2026-01-11 11:47:48,175 - WARNING - Connection pool is full, discarding connection: fapi.binance.com. Connection pool size: 10
+2026-01-11 11:47:48,179 - INFO - Snapshot refreshed for PIEVERSEUSDT
+2026-01-11 11:47:48,432 - WARNING - Connection pool is full, discarding connection: fapi.binance.com. Connection pool size: 10
+2026-01-11 11:47:48,437 - INFO - Snapshot refreshed for ZECUSDT
+2026-01-11 12:11:00,030 - INFO - Stopping...
+2026-01-11 12:11:00,477 - WARNING - CLOSE frame received, closing websocket connection
+2026-01-11 12:11:00,584 - INFO - Stopped.
+2026-01-11 12:11:05,158 - INFO - Starting Robust Collector for 15 symbols...
+2026-01-11 12:11:06,613 - INFO - Opened file: data\NIGHTUSDT_Binance\Orderbook\2026-01-11_NIGHTUSDT_ob200.data
+2026-01-11 12:11:06,874 - INFO - Opened file: data\LYNUSDT_Binance\Orderbook\2026-01-11_LYNUSDT_ob200.data
+2026-01-11 12:11:07,214 - INFO - Opened file: data\WLFIUSDT_Binance\Orderbook\2026-01-11_WLFIUSDT_ob200.data
+2026-01-11 12:11:07,324 - INFO - Opened file: data\CYSUSDT_Binance\Orderbook\2026-01-11_CYSUSDT_ob200.data
+2026-01-11 12:11:07,500 - INFO - Opened file: data\MAGMAUSDT_Binance\Orderbook\2026-01-11_MAGMAUSDT_ob200.data
+2026-01-11 12:11:07,541 - INFO - Opened file: data\NIGHTUSDT_Binance\Trade\NIGHTUSDT2026-01-11.csv
+2026-01-11 12:11:07,624 - INFO - Opened file: data\LITUSDT_Binance\Orderbook\2026-01-11_LITUSDT_ob200.data
+2026-01-11 12:11:07,649 - INFO - Opened file: data\LYNUSDT_Binance\Trade\LYNUSDT2026-01-11.csv
+2026-01-11 12:11:07,681 - INFO - Opened file: data\MAGMAUSDT_Binance\Trade\MAGMAUSDT2026-01-11.csv
+2026-01-11 12:11:07,785 - INFO - Opened file: data\ZKPUSDT_Binance\Trade\ZKPUSDT2026-01-11.csv
+2026-01-11 12:11:07,810 - INFO - Opened file: data\WLFIUSDT_Binance\Trade\WLFIUSDT2026-01-11.csv
+2026-01-11 12:11:07,945 - INFO - Opened file: data\ZKPUSDT_Binance\Orderbook\2026-01-11_ZKPUSDT_ob200.data
+2026-01-11 12:11:08,299 - INFO - Snapshot refreshed for NIGHTUSDT
+2026-01-11 12:11:08,388 - INFO - Opened file: data\XPLUSDT_Binance\Orderbook\2026-01-11_XPLUSDT_ob200.data
+2026-01-11 12:11:08,397 - INFO - Opened file: data\ZECUSDT_Binance\Trade\ZECUSDT2026-01-11.csv
+2026-01-11 12:11:08,433 - INFO - Opened file: data\ZBTUSDT_Binance\Orderbook\2026-01-11_ZBTUSDT_ob200.data
+2026-01-11 12:11:08,477 - INFO - Opened file: data\ZECUSDT_Binance\Orderbook\2026-01-11_ZECUSDT_ob200.data
+2026-01-11 12:11:08,592 - INFO - Opened file: data\PIEVERSEUSDT_Binance\Orderbook\2026-01-11_PIEVERSEUSDT_ob200.data
+2026-01-11 12:11:08,722 - INFO - Snapshot refreshed for LYNUSDT
+2026-01-11 12:11:08,724 - INFO - Opened file: data\PIEVERSEUSDT_Binance\Trade\PIEVERSEUSDT2026-01-11.csv
+2026-01-11 12:11:08,960 - INFO - Opened file: data\FARTCOINUSDT_Binance\Orderbook\2026-01-11_FARTCOINUSDT_ob200.data
+2026-01-11 12:11:09,056 - INFO - Opened file: data\1000PEPEUSDT_Binance\Trade\1000PEPEUSDT2026-01-11.csv
+2026-01-11 12:11:09,063 - INFO - Opened file: data\1000PEPEUSDT_Binance\Orderbook\2026-01-11_1000PEPEUSDT_ob200.data
+2026-01-11 12:11:09,145 - INFO - Snapshot refreshed for CYSUSDT
+2026-01-11 12:11:09,211 - INFO - Connected and Subscribed.
+2026-01-11 12:11:09,223 - INFO - Opened file: data\SUIUSDT_Binance\Orderbook\2026-01-11_SUIUSDT_ob200.data
+2026-01-11 12:11:09,237 - INFO - Opened file: data\LITUSDT_Binance\Trade\LITUSDT2026-01-11.csv
+2026-01-11 12:11:09,245 - INFO - Opened file: data\FARTCOINUSDT_Binance\Trade\FARTCOINUSDT2026-01-11.csv
+2026-01-11 12:11:09,363 - INFO - Opened file: data\SUIUSDT_Binance\Trade\SUIUSDT2026-01-11.csv
+2026-01-11 12:11:09,416 - INFO - Opened file: data\WIFUSDT_Binance\Orderbook\2026-01-11_WIFUSDT_ob200.data
+2026-01-11 12:11:09,568 - INFO - Snapshot refreshed for WLFIUSDT
+2026-01-11 12:11:09,990 - INFO - Snapshot refreshed for MAGMAUSDT
+2026-01-11 12:11:10,287 - INFO - Opened file: data\XPLUSDT_Binance\Trade\XPLUSDT2026-01-11.csv
+2026-01-11 12:11:10,414 - INFO - Snapshot refreshed for LITUSDT
+2026-01-11 12:11:10,590 - INFO - Opened file: data\WIFUSDT_Binance\Trade\WIFUSDT2026-01-11.csv
+2026-01-11 12:11:10,838 - INFO - Snapshot refreshed for ZKPUSDT
+2026-01-11 12:11:11,260 - INFO - Snapshot refreshed for ZBTUSDT
+2026-01-11 12:11:11,533 - INFO - Opened file: data\CYSUSDT_Binance\Trade\CYSUSDT2026-01-11.csv
+2026-01-11 12:11:11,682 - INFO - Snapshot refreshed for XPLUSDT
+2026-01-11 12:11:12,106 - INFO - Snapshot refreshed for ZECUSDT
+2026-01-11 12:11:12,528 - INFO - Snapshot refreshed for PIEVERSEUSDT
+2026-01-11 12:11:12,652 - INFO - Opened file: data\ZBTUSDT_Binance\Trade\ZBTUSDT2026-01-11.csv
+2026-01-11 12:11:12,950 - INFO - Snapshot refreshed for FARTCOINUSDT
+2026-01-11 12:11:13,374 - INFO - Snapshot refreshed for 1000PEPEUSDT
+2026-01-11 12:11:13,795 - INFO - Snapshot refreshed for SUIUSDT
+2026-01-11 12:11:14,218 - INFO - Snapshot refreshed for WIFUSDT

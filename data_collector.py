@@ -153,9 +153,11 @@ class RobustDataCollector:
         self.ws_client = None
         self.file_manager = FileManager(self.data_dir)
         self.write_queue = queue.Queue(maxsize=50000) # Max 50k items buffer
+        self.snapshot_queue = queue.Queue(maxsize=100) # Queue for REST requests
         
         self.running = False
         self.writer_thread = None
+        self.snapshot_thread = None
         self.monitor_thread = None
         
         self.last_msg_time = time.time()
@@ -173,6 +175,10 @@ class RobustDataCollector:
         # Writer Thread
         self.writer_thread = threading.Thread(target=self.writer_loop, daemon=True)
         self.writer_thread.start()
+        
+        # Snapshot Worker Thread
+        self.snapshot_thread = threading.Thread(target=self.snapshot_worker_loop, daemon=True)
+        self.snapshot_thread.start()
         
         # Connect
         self._connect_and_subscribe()
@@ -213,6 +219,8 @@ class RobustDataCollector:
             self.ws_client.stop()
         if self.writer_thread:
             self.writer_thread.join(timeout=5)
+        if self.snapshot_thread:
+            self.snapshot_thread.join(timeout=5)
         self.file_manager.close_all()
         logger.info("Stopped.")
 
@@ -251,18 +259,28 @@ class RobustDataCollector:
         self._connect_and_subscribe()
 
     def _fetch_snapshot(self, symbol):
-        def _job():
+        try:
+            self.snapshot_queue.put(symbol, block=False)
+        except queue.Full:
+            logger.warning(f"Snapshot queue full! Skipping snapshot for {symbol}")
+
+    def snapshot_worker_loop(self):
+        while self.running:
             try:
-                # Limit 500 for better parity with "ob200"
-                depth = self.rest_client.depth(symbol=symbol, limit=500)
-                snapshot_obj = self._transform_snapshot(symbol, depth)
-                self.write_queue.put(('orderbook', symbol, snapshot_obj))
-                logger.info(f"Snapshot refreshed for {symbol}")
+                symbol = self.snapshot_queue.get(timeout=1)
+                try:
+                    # Limit 500 for better parity with "ob200"
+                    depth = self.rest_client.depth(symbol=symbol, limit=500)
+                    snapshot_obj = self._transform_snapshot(symbol, depth)
+                    self.write_queue.put(('orderbook', symbol, snapshot_obj))
+                    logger.info(f"Snapshot refreshed for {symbol}")
+                    time.sleep(0.1) # Small delay to be gentle on API limits
+                except Exception as e:
+                    logger.error(f"Snapshot failed for {symbol}: {e}")
+            except queue.Empty:
+                continue
             except Exception as e:
-                logger.error(f"Snapshot failed for {symbol}: {e}")
-        
-        # Run in thread to not block main loop
-        threading.Thread(target=_job, daemon=True).start()
+                logger.error(f"Snapshot Worker Error: {e}")
 
     def on_ws_message(self, _, message):
         self.last_msg_time = time.time()
