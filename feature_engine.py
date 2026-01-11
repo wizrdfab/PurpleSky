@@ -24,6 +24,10 @@ class FeatureEngine:
         )
         df['atr'] = df['tr'].ewm(span=self.config.atr_period, adjust=False).mean()
         
+        # Normalized ATR (Percentage Volatility)
+        # Used for Regime Detection to be price-agnostic
+        df['natr'] = df['atr'] / df['close']
+        
         # 2. EMAs
         for p in self.config.ema_periods:
             df[f'ema_{p}'] = df['close'].ewm(span=p).mean()
@@ -159,20 +163,21 @@ class FeatureEngine:
 
         # 8. Volatility Regimes (Expansion/Compression)
         # Volatility Z-Score (Shock detection)
-        atr_mean = df['atr'].rolling(24).mean()
-        atr_std = df['atr'].rolling(24).std().replace(0, np.nan)
-        df['atr_z'] = (df['atr'] - atr_mean) / atr_std
+        # Using NATR to be price-invariant
+        atr_mean = df['natr'].rolling(24).mean()
+        atr_std = df['natr'].rolling(24).std().replace(0, np.nan)
+        df['atr_z'] = (df['natr'] - atr_mean) / atr_std
         
         # Volatility Regime (Intraday vs Daily)
         # Ratio > 1.0 = Expanding/High Vol -> Trend Risk
         # Ratio < 1.0 = Compressing/Low Vol -> Breakout Risk or Mean Reversion
-        atr_1h = df['atr'].rolling(12).mean()
-        atr_24h = df['atr'].rolling(288).mean()
+        atr_1h = df['natr'].rolling(12).mean()
+        atr_24h = df['natr'].rolling(288).mean()
         df['atr_regime'] = atr_1h / atr_24h.replace(0, 1)
         
         # Macro Volatility (Secular Trend)
         # Is the market waking up from a long slumber?
-        atr_30d = df['atr'].rolling(8640, min_periods=288).mean()
+        atr_30d = df['natr'].rolling(8640, min_periods=288).mean()
         df['atr_macro'] = atr_24h / atr_30d.replace(0, 1)
 
         cols_to_drop = ['tr0', 'tr1', 'tr2', 'tr', 'up_move', 'down_move', 'plus_dm', 'minus_dm', 'price_chg', 'imb_chg', 'vol_buy', 'vol_sell', 'volume', 'vwap_4h', 'vwap_24h', 'dollar_val']

@@ -861,6 +861,36 @@
       return best;
     }
 
+    function clamp01(val) {
+      if (!Number.isFinite(val)) return 0;
+      return Math.max(0, Math.min(1, val));
+    }
+
+    function signalStrength(pred) {
+      return clamp01(Number(pred || 0));
+    }
+
+    function signalMarkerStyle(side, pred) {
+      const strength = signalStrength(pred);
+      const base = side === "short" ? [239, 68, 68] : [34, 197, 94];
+      const alpha = 0.35 + strength * 0.65;
+      const glow = 0.2 + strength * 0.5;
+      const color = `rgba(${base[0]},${base[1]},${base[2]},${alpha})`;
+      const shadowColor = `rgba(${base[0]},${base[1]},${base[2]},${glow})`;
+      let borderColor = "rgba(0,0,0,0)";
+      let borderWidth = 0;
+      if (strength >= 0.9) {
+        borderColor = "#f59e0b";
+        borderWidth = 2;
+      } else if (strength >= 0.8) {
+        borderColor = "rgba(248,250,252,0.6)";
+        borderWidth = 1;
+      }
+      const size = 8 + strength * 12;
+      const shadowBlur = 6 + strength * 10;
+      return { color, borderColor, borderWidth, size, shadowColor, shadowBlur };
+    }
+
     function tickDecimals(tick) {
       const num = Number(tick);
       if (!Number.isFinite(num) || num <= 0) return 6;
@@ -1462,11 +1492,20 @@
       visibleSignals.forEach(sig => {
         const idx = indexMap.get(sig.bar_time);
         if (idx === undefined) return;
+        const side = signalSideKey(sig.side);
+        const style = signalMarkerStyle(side === "short" ? "short" : "long", sig.pred);
         const payload = {
           value: [idx, sig.entry_price],
-          signal: sig
+          signal: sig,
+          symbolSize: style.size,
+          itemStyle: {
+            color: style.color,
+            borderColor: style.borderColor,
+            borderWidth: style.borderWidth,
+            shadowBlur: style.shadowBlur,
+            shadowColor: style.shadowColor
+          }
         };
-        const side = signalSideKey(sig.side);
         if (side === "short") {
           shortPoints.push(payload);
         } else {
@@ -1576,7 +1615,7 @@
             type: "scatter",
             data: longPoints,
             symbol: "triangle",
-            symbolSize: 12,
+            symbolSize: (val, params) => (params && params.data && params.data.symbolSize) ? params.data.symbolSize : 12,
             itemStyle: { color: "#22c55e" },
             label: {
               show: Boolean(focusId),
@@ -1591,7 +1630,7 @@
             type: "scatter",
             data: shortPoints,
             symbol: "triangle",
-            symbolSize: 12,
+            symbolSize: (val, params) => (params && params.data && params.data.symbolSize) ? params.data.symbolSize : 12,
             symbolRotate: 180,
             itemStyle: { color: "#ef4444" },
             label: {
@@ -1679,7 +1718,7 @@
 
     async function fetchSignals(symbol) {
       if (!symbol) return;
-      const resp = await fetch(`/api/signals?symbol=${encodeURIComponent(symbol)}&limit=40`);
+      const resp = await fetch(`/api/signals?symbol=${encodeURIComponent(symbol)}&limit=80`);
       if (!resp.ok) return;
       const data = await resp.json();
       state.signalHistory = normalizeSignals(data || []);

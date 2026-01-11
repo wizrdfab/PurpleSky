@@ -3108,6 +3108,213 @@ class DiscordNotifier:
             time.sleep(self.poll_sec)
 
 
+class SignalNotifier:
+    def __init__(
+        self,
+        webhook_url: str,
+        telegram_token: str,
+        telegram_chat_id: str,
+        metrics_dir: Path,
+        poll_sec: float = 5.0,
+        min_pred: float = 0.9,
+        fixed_files=None,
+        symbols_filter=None,
+        max_seen: int = 200,
+    ):
+        self.webhook_url = webhook_url
+        self.telegram_token = telegram_token
+        self.telegram_chat_id = telegram_chat_id
+        self.metrics_dir = metrics_dir
+        self.poll_sec = poll_sec
+        self.min_pred = max(0.0, float(min_pred))
+        self.fixed_files = fixed_files
+        self.symbols_filter = symbols_filter
+        self.max_seen = max(20, int(max_seen))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._bootstrapped = False
+        self._seen = {}
+        self._seen_set = {}
+
+    def start(self):
+        if self.webhook_url or (self.telegram_token and self.telegram_chat_id):
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _send_discord(self, content: str) -> None:
+        if not self.webhook_url:
+            return
+        payload = json.dumps({"content": content}).encode("utf-8")
+        req = Request(
+            self.webhook_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "live-dashboard/1.0",
+            },
+        )
+        try:
+            with urlopen(req, timeout=10) as resp:
+                resp.read()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            print(f"Signal notify (discord) failed: HTTP {exc.code} {exc.reason} {detail}")
+        except URLError as exc:
+            print(f"Signal notify (discord) failed: {exc}")
+        except Exception as exc:
+            print(f"Signal notify (discord) error: {exc}")
+
+    def _send_telegram(self, content: str) -> None:
+        if not self.telegram_token or not self.telegram_chat_id:
+            return
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        payload = json.dumps({"chat_id": self.telegram_chat_id, "text": content}).encode("utf-8")
+        req = Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "live-dashboard/1.0",
+            },
+        )
+        try:
+            with urlopen(req, timeout=10) as resp:
+                resp.read()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            print(f"Signal notify (telegram) failed: HTTP {exc.code} {exc.reason} {detail}")
+        except URLError as exc:
+            print(f"Signal notify (telegram) failed: {exc}")
+        except Exception as exc:
+            print(f"Signal notify (telegram) error: {exc}")
+
+    def _send(self, content: str) -> None:
+        self._send_discord(content)
+        self._send_telegram(content)
+
+    def _tick_decimals(self, tick: float) -> int:
+        if tick <= 0:
+            return 6
+        text = f"{tick}".lower()
+        if "e-" in text:
+            parts = text.split("e-")
+            if len(parts) == 2:
+                try:
+                    return int(parts[1])
+                except Exception:
+                    return 6
+        if "." in text:
+            return len(text.split(".", 1)[1])
+        return 0
+
+    def _fmt_price(self, value, tick) -> str:
+        val = safe_float(value, 0.0)
+        if val <= 0:
+            return "n/a"
+        decimals = self._tick_decimals(safe_float(tick, 0.0))
+        return f"{val:.{decimals}f}"
+
+    def _signal_key(self, signal: dict) -> Optional[str]:
+        key = signal.get("id")
+        if key:
+            return str(key)
+        bar_time = signal.get("bar_time")
+        side = signal.get("side")
+        if bar_time and side:
+            return f"{bar_time}-{side}"
+        return None
+
+    def _remember_signal(self, symbol: str, signal_id: str) -> None:
+        history = self._seen.setdefault(symbol, deque(maxlen=self.max_seen))
+        seen = self._seen_set.setdefault(symbol, set())
+        if signal_id in seen:
+            return
+        if len(history) >= self.max_seen:
+            oldest = history.popleft()
+            if oldest in seen:
+                seen.remove(oldest)
+        history.append(signal_id)
+        seen.add(signal_id)
+
+    def _seen_signal(self, symbol: str, signal_id: str) -> bool:
+        return signal_id in self._seen_set.get(symbol, set())
+
+    def _format_signal_message(self, symbol: str, signal: dict) -> str:
+        side_raw = str(signal.get("side") or "").lower()
+        side = "LONG" if side_raw == "buy" else "SHORT" if side_raw == "sell" else side_raw.upper() or "SIGNAL"
+        pred = safe_float(signal.get("pred"), 0.0)
+        tick = safe_float(signal.get("tick_size"), 0.0)
+        entry = self._fmt_price(signal.get("entry_price") or signal.get("target"), tick)
+        tp = self._fmt_price(signal.get("tp"), tick)
+        sl = self._fmt_price(signal.get("sl"), tick)
+        ts = signal.get("ts") or ""
+        timeframe = signal.get("timeframe") or ""
+        mode = signal.get("mode") or ""
+        lines = [
+            f"{symbol} {side} signal {pred:.3f} (>= {self.min_pred:.2f})",
+            f"Entry {entry} | TP {tp} | SL {sl}",
+        ]
+        if ts:
+            lines.append(f"Time: {ts}")
+        if timeframe:
+            lines.append(f"TF: {timeframe}")
+        if mode:
+            lines.append(f"Mode: {mode}")
+        return "\n".join(lines)
+
+    def _prime_seen(self, symbol: str) -> None:
+        signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+        signals = tail_jsonl(signals_path, limit=self.max_seen, max_bytes=256 * 1024)
+        for signal in signals:
+            signal_id = self._signal_key(signal)
+            if signal_id:
+                self._remember_signal(symbol, signal_id)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.fixed_files:
+                file_map = self.fixed_files
+            else:
+                file_map = discover_metrics_files(self.metrics_dir, self.symbols_filter)
+            symbols = list(file_map.keys())
+            if not self._bootstrapped:
+                for symbol in symbols:
+                    self._prime_seen(symbol)
+                self._bootstrapped = True
+                time.sleep(self.poll_sec)
+                continue
+            for symbol in symbols:
+                signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+                signals = tail_jsonl(signals_path, limit=40, max_bytes=256 * 1024)
+                if not signals:
+                    continue
+                sorted_signals = sorted(
+                    signals,
+                    key=lambda s: safe_int(s.get("ts_ms") or 0) or safe_int(s.get("bar_time") or 0),
+                )
+                for signal in sorted_signals:
+                    pred = safe_float(signal.get("pred"), 0.0)
+                    if pred < self.min_pred:
+                        continue
+                    signal_id = self._signal_key(signal)
+                    if not signal_id or self._seen_signal(symbol, signal_id):
+                        continue
+                    message = self._format_signal_message(symbol, signal)
+                    self._send(message)
+                    self._remember_signal(symbol, signal_id)
+            time.sleep(self.poll_sec)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Live Trading Dashboard")
     parser.add_argument("--metrics-dir", type=str, default=".")
@@ -3124,10 +3331,13 @@ def main():
     parser.add_argument("--balance-flow-pct", type=float, default=2.0)
     parser.add_argument("--closed-pnl-poll-sec", type=float, default=60.0)
     parser.add_argument("--discord-webhook", type=str, default="")
+    parser.add_argument("--telegram-token", type=str, default="")
+    parser.add_argument("--telegram-chat-id", type=str, default="")
     parser.add_argument("--notify-offline-sec", type=float, default=120.0)
     parser.add_argument("--notify-poll-sec", type=float, default=5.0)
     parser.add_argument("--notify-cooldown-sec", type=float, default=60.0)
     parser.add_argument("--notify-drawdown-pct", type=float, default=10.0)
+    parser.add_argument("--notify-signal-threshold", type=float, default=0.9)
     parser.add_argument("--reset-stats", action="store_true")
     args = parser.parse_args()
 
@@ -3181,6 +3391,12 @@ def main():
     closed_pnl_monitor.start()
 
     webhook = args.discord_webhook or os.getenv("DISCORD_WEBHOOK_URL", "")
+    telegram_token = args.telegram_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id = args.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
+    signal_threshold = args.notify_signal_threshold
+    env_threshold = os.getenv("SIGNAL_NOTIFY_THRESHOLD", "")
+    if env_threshold:
+        signal_threshold = safe_float(env_threshold, signal_threshold)
     notifier = DiscordNotifier(
         webhook_url=webhook,
         metrics_dir=MetricsHandler.metrics_dir,
@@ -3192,6 +3408,17 @@ def main():
         symbols_filter=MetricsHandler.symbols_filter,
     )
     notifier.start()
+    signal_notifier = SignalNotifier(
+        webhook_url=webhook,
+        telegram_token=telegram_token,
+        telegram_chat_id=telegram_chat_id,
+        metrics_dir=MetricsHandler.metrics_dir,
+        poll_sec=args.notify_poll_sec,
+        min_pred=signal_threshold,
+        fixed_files=MetricsHandler.fixed_files,
+        symbols_filter=MetricsHandler.symbols_filter,
+    )
+    signal_notifier.start()
 
     server = HTTPServer((args.host, args.port), MetricsHandler)
     print(f"Dashboard running on http://{args.host}:{args.port}")

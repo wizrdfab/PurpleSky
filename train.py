@@ -189,13 +189,13 @@ class AutoML:
                     'vol_delta', 'buy_vol', 'vol_sell', 'trade_count', 'sell_vol', 'dollar_val', 'total_val',
                     'ob_imbalance_last', 'ob_spread_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean',
                     'ob_micro_dev_std', 'ob_micro_dev_last', 'ob_micro_dev_mean', 'ob_imbalance_mean',
-                    'target_dir_long', 'target_dir_short', 'pred_dir_long', 'pred_dir_short']
+                    'target_dir_long', 'target_dir_short', 'pred_dir_long', 'pred_dir_short', 'atr']
         ob_whitelist = ['ob_imbalance_z', 'ob_spread_ratio', 'ob_bid_impulse', 'ob_ask_impulse', 'ob_depth_ratio', 'ob_spread_bps', 'ob_depth_log_ratio', 'price_liq_div', 'liq_dominance', 'micro_dev_vol', 'ob_imb_trend', 'micro_pressure', 'bid_depth_chg', 'ask_depth_chg', 'spread_z', 'ob_slope_ratio', 'bid_slope_z', 'ob_bid_elasticity', 'ob_ask_elasticity', 'ob_bid_integrity_mean', 'ob_ask_integrity_mean', 'ob_integrity_skew', 'bid_integrity_chg', 'ask_integrity_chg']
         
         all_features = [c for c in df.columns if (c not in excludes and not c.startswith('ob_')) or c in ob_whitelist]
         
         if self.args.microstructure_only:
-            tech_blacklist = ['ema_', 'dist_ema_', 'rsi', 'atr']
+            tech_blacklist = ['ema_', 'dist_ema_', 'rsi', 'atr', 'natr']
             filtered = [f for f in all_features if not any(b in f for b in tech_blacklist)]
             
             print(f"[Research] Microstructure Only: Reduced features from {len(all_features)} to {len(filtered)}")
@@ -212,7 +212,7 @@ class AutoML:
         leaves = trial.suggest_int('num_leaves', 8, 24)
         min_child = 40
         
-        thresh = trial.suggest_float('model_threshold', 0.60, 0.85)
+        thresh = trial.suggest_float('model_threshold', 0.60, 0.93)
         
         conf = copy.deepcopy(CONF)
         conf.strategy.base_limit_offset_atr, conf.strategy.take_profit_atr, conf.strategy.stop_loss_atr = offset, tp, sl

@@ -1,193 +1,382 @@
-import time
 import logging
+import time
 import json
 import os
 import threading
-from datetime import datetime, timezone
+import queue
+import signal
+import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
+from binance.um_futures import UMFutures
+from binance.error import ClientError
 
-# Configure Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("data_collector.log"),
-        logging.StreamHandler()
-    ]
-)
+# --- Configuration ---
+SNAPSHOT_INTERVAL = 3600  # Refresh snapshot every 1 hour (3600s) to self-heal
+WATCHDOG_TIMEOUT = 60     # Reconnect if no data for 60 seconds
+FLUSH_INTERVAL = 5        # Flush file buffers every 5 seconds
+BUFFER_SIZE = 100         # Or flush after 100 lines
+
+# --- Logging Setup ---
+# Log to file AND console
+log_file = "data_collector.log"
+
+# Root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Formatter
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# File Handler
+file_handler = logging.FileHandler(log_file)
+file_handler.setFormatter(formatter)
+root_logger.addHandler(file_handler)
+
+# Console Handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+root_logger.addHandler(console_handler)
+
+# Specific Logger for this script
 logger = logging.getLogger("DataCollector")
 
-class BinanceDataCollector:
-    def __init__(self, symbol: str, data_dir: str = "data"):
-        self.symbol = symbol.upper()
-        self.base_dir = Path(data_dir) / self.symbol
-        self.trade_dir = self.base_dir / "trades"
-        self.ob_dir = self.base_dir / "orderbook"
-        
-        self.trade_dir.mkdir(parents=True, exist_ok=True)
-        self.ob_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.ws_client = UMFuturesWebsocketClient(on_message=self.on_message)
-        
-        self.trade_buffer = []
-        self.ob_buffer = []
-        self.buffer_lock = threading.Lock()
-        
+# Silence noisy libraries if needed (optional)
+# logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+class FileManager:
+    """
+    Manages open file handles to avoid opening/closing on every message.
+    Handles daily rotation and buffering.
+    """
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
+        self.files = {} # Key: (symbol, data_type, date_str) -> file_handle
+        self.buffers = {} # Key: file_handle -> list of strings
+        self.lock = threading.Lock()
         self.last_flush = time.time()
-        self.flush_interval = 5.0 # Flush every 5 seconds
+
+    def write(self, symbol, dtype, data, timestamp_s):
+        """
+        timestamp_s: float (unix timestamp)
+        """
+        # Determine Date from Timestamp
+        dt = datetime.fromtimestamp(timestamp_s, tz=timezone.utc)
+        date_str = dt.strftime("%Y-%m-%d")
+        
+        key = (symbol, dtype)
+        
+        with self.lock:
+            # Check if we have an open file for this (symbol, dtype)
+            # We need to check if the DATE matches the current open file's date.
+            # To simplify, we track the current open file's date in a separate dict or just key by date too.
+            # Keying by date implies we might have multiple days open at crossing, which is fine.
+            
+            full_key = (symbol, dtype, date_str)
+            
+            if full_key not in self.files:
+                # Close *previous* day's file for this symbol/type if exists to save resources?
+                # For simplicity, we can just iterate and close old dates, or rely on OS to handle a few open files.
+                # Better: Close any file for (symbol, dtype) that isn't `date_str`.
+                self._close_old_files(symbol, dtype, date_str)
+                self._open_file(symbol, dtype, date_str)
+            
+            f = self.files[full_key]
+            
+            # Format Data
+            line = ""
+            if dtype == 'trade':
+                # CSV Format
+                # timestamp,symbol,side,size,price,...
+                line = f"{data['timestamp']},{data['symbol']},{data['side']},{data['size']},{data['price']},{data['tickDirection']},{data['trdMatchID']},{data['grossValue']},{data['homeNotional']},{data['foreignNotional']},{data['RPI']}\n"
+            elif dtype == 'orderbook':
+                # JSONL Format
+                line = json.dumps(data) + "\n"
+                
+            f.write(line)
+            
+            # Auto-Flush logic handled in periodic loop or by buffer size?
+            # Python's file object is already buffered. We just ensure we flush periodically.
+            
+    def _open_file(self, symbol, dtype, date_str):
+        base_dir = self.data_dir / f"{symbol}_Binance"
+        
+        if dtype == 'trade':
+            path = base_dir / "Trade"
+            fname = path / f"{symbol}{date_str}.csv"
+            exists = fname.exists()
+            f = open(fname, 'a', buffering=8192, encoding='utf-8') # 8kb buffer
+            if not exists:
+                f.write("timestamp,symbol,side,size,price,tickDirection,trdMatchID,grossValue,homeNotional,foreignNotional,RPI\n")
+        else:
+            path = base_dir / "Orderbook"
+            fname = path / f"{date_str}_{symbol}_ob200.data"
+            f = open(fname, 'a', buffering=8192, encoding='utf-8')
+
+        self.files[(symbol, dtype, date_str)] = f
+        logger.info(f"Opened file: {fname}")
+
+    def _close_old_files(self, symbol, dtype, current_date_str):
+        # Find keys that match symbol/dtype but NOT current_date_str
+        to_close = []
+        for k in self.files:
+            s, t, d = k
+            if s == symbol and t == dtype and d != current_date_str:
+                to_close.append(k)
+        
+        for k in to_close:
+            logger.info(f"Rotated/Closed file for {k}")
+            self.files[k].close()
+            del self.files[k]
+
+    def flush_all(self):
+        with self.lock:
+            for f in self.files.values():
+                try:
+                    f.flush()
+                except Exception as e:
+                    logger.error(f"Flush error: {e}")
+
+    def close_all(self):
+        with self.lock:
+            for f in self.files.values():
+                f.close()
+            self.files.clear()
+
+
+class RobustDataCollector:
+    def __init__(self, symbols, data_dir="data"):
+        self.symbols = [s.upper() for s in symbols]
+        self.data_dir = Path(data_dir)
+        self.rest_client = UMFutures()
+        self.ws_client = None
+        self.file_manager = FileManager(self.data_dir)
+        self.write_queue = queue.Queue(maxsize=50000) # Max 50k items buffer
+        
         self.running = False
+        self.writer_thread = None
+        self.monitor_thread = None
+        
+        self.last_msg_time = time.time()
+        self.last_snapshot_time = {} # symbol -> timestamp
+        
+        # Ensure Dirs
+        for s in self.symbols:
+            (self.data_dir / f"{s}_Binance" / "Trade").mkdir(parents=True, exist_ok=True)
+            (self.data_dir / f"{s}_Binance" / "Orderbook").mkdir(parents=True, exist_ok=True)
 
     def start(self):
-        logger.info(f"Starting Data Collector for {self.symbol}...")
-        
-        # Subscribe to Agg Trades and Depth (Level 2)
-        # @aggTrade: Aggregate trades
-        # @depth20@100ms: Top 20 bids/asks, 100ms update speed
-        self.ws_client.agg_trade(symbol=self.symbol.lower())
-        self.ws_client.partial_book_depth(
-            symbol=self.symbol.lower(), 
-            level=20, 
-            speed=100
-        )
-        
         self.running = True
-        self.flush_thread = threading.Thread(target=self._flush_loop)
-        self.flush_thread.daemon = True
-        self.flush_thread.start()
+        logger.info(f"Starting Robust Collector for {len(self.symbols)} symbols...")
         
-        logger.info("Websocket connected and subscribed.")
-
-    def on_message(self, _, msg):
+        # Writer Thread
+        self.writer_thread = threading.Thread(target=self.writer_loop, daemon=True)
+        self.writer_thread.start()
+        
+        # Connect
+        self._connect_and_subscribe()
+        
+        # Monitor Loop (Main Thread)
         try:
-            data = json.loads(msg)
-            event_type = data.get('e')
-            
-            if event_type == 'aggTrade':
-                self._handle_trade(data)
-            elif event_type == 'depthUpdate':
-                # partial_book_depth returns 'depthUpdate' event?
-                # Actually for partial depth, the event type is often just the payload or specific event.
-                # Let's check the payload structure for partial depth.
-                # Standard partial depth stream payload doesn't always have 'e'.
-                # It usually looks like: { "e": "depthUpdate", ... } is for Diff Depth.
-                # Partial depth usually: { "lastUpdateId": ..., "bids": [], "asks": [] }
-                self._handle_depth(data)
-            else:
-                # Check for Partial Depth (no event type, just bids/asks)
-                if 'b' in data and 'a' in data:
-                    self._handle_depth(data)
-                    
+            while self.running:
+                now = time.time()
+                
+                # 1. Watchdog
+                if now - self.last_msg_time > WATCHDOG_TIMEOUT:
+                    logger.warning(f"WATCHDOG: No data for {WATCHDOG_TIMEOUT}s. Reconnecting...")
+                    self._reconnect()
+                    self.last_msg_time = now # Reset to avoid loop
+                
+                # 2. Periodic Snapshots (Self-Healing)
+                for symbol in self.symbols:
+                    last_snap = self.last_snapshot_time.get(symbol, 0)
+                    if now - last_snap > SNAPSHOT_INTERVAL:
+                        self._fetch_snapshot(symbol)
+                        self.last_snapshot_time[symbol] = now
+                
+                # 3. Flush Files
+                self.file_manager.flush_all()
+                
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            self.stop()
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
-
-    def _handle_trade(self, data):
-        # Map Binance AggTrade to CSV format
-        # data_loader expects: timestamp, price, size, side
-        # Binance: T (time), p (price), q (qty), m (isBuyerMaker)
-        
-        ts = int(data['T']) / 1000.0 # Convert ms to seconds
-        price = data['p']
-        size = data['q']
-        is_buyer_maker = data['m']
-        
-        # If Buyer is Maker, then Aggressor was Seller -> Side = Sell
-        side = "Sell" if is_buyer_maker else "Buy"
-        
-        row = f"{ts},{price},{size},{side}"
-        
-        with self.buffer_lock:
-            self.trade_buffer.append(row)
-
-    def _handle_depth(self, data):
-        # Map Binance Depth to JSONL format
-        # data_loader expects: {"type": "snapshot", "ts": ..., "data": {"b": [...], "a": [...]}}
-        # Binance Partial: { "e": "depthUpdate", "E": 123, "T": 123, "b": [], "a": [] } OR just { "b": [], "a": [] }
-        
-        # Use 'E' (Event Time) or 'T' (Transaction Time) or current time
-        ts = data.get('E') or data.get('T') or int(time.time() * 1000)
-        
-        bids = data.get('b', [])
-        asks = data.get('a', [])
-        
-        # Format for data_loader
-        # It expects "snapshot" type for full replacements
-        payload = {
-            "type": "snapshot",
-            "ts": ts,
-            "data": {
-                "b": bids,
-                "a": asks
-            }
-        }
-        
-        with self.buffer_lock:
-            self.ob_buffer.append(json.dumps(payload))
-
-    def _flush_loop(self):
-        while self.running:
-            time.sleep(self.flush_interval)
-            self._flush()
-
-    def _flush(self):
-        with self.buffer_lock:
-            t_buf = self.trade_buffer[:]
-            o_buf = self.ob_buffer[:]
-            self.trade_buffer.clear()
-            self.ob_buffer.clear()
-            
-        if not t_buf and not o_buf:
-            return
-
-        now = datetime.now(timezone.utc)
-        date_str = now.strftime("%Y%m%d")
-        
-        # Write Trades
-        if t_buf:
-            file_path = self.trade_dir / f"trades_{date_str}.csv"
-            # specific format: timestamp,price,size,side
-            # Add header if new file? data_loader checks has_side by reading first row?
-            # data_loader: preview = pd.read_csv(f, nrows=1) -> check columns
-            # We should add header if file doesn't exist.
-            
-            new_file = not file_path.exists()
-            try:
-                with open(file_path, "a") as f:
-                    if new_file:
-                        f.write("timestamp,price,size,side\n")
-                    for row in t_buf:
-                        f.write(row + "\n")
-                logger.info(f"Flushed {len(t_buf)} trades.")
-            except Exception as e:
-                logger.error(f"Failed to write trades: {e}")
-
-        # Write Orderbook
-        if o_buf:
-            file_path = self.ob_dir / f"orderbook_{date_str}.jsonl"
-            try:
-                with open(file_path, "a") as f:
-                    for row in o_buf:
-                        f.write(row + "\n")
-                logger.info(f"Flushed {len(o_buf)} OB snapshots.")
-            except Exception as e:
-                logger.error(f"Failed to write OB: {e}")
+            logger.critical(f"CRITICAL ERROR in Main Loop: {e}", exc_info=True)
+            self.stop()
 
     def stop(self):
+        logger.info("Stopping...")
         self.running = False
-        self.ws_client.stop()
-        self._flush()
-        logger.info("Collector stopped.")
+        if self.ws_client:
+            self.ws_client.stop()
+        if self.writer_thread:
+            self.writer_thread.join(timeout=5)
+        self.file_manager.close_all()
+        logger.info("Stopped.")
+
+    def _connect_and_subscribe(self):
+        try:
+            if self.ws_client:
+                self.ws_client.stop()
+                
+            self.ws_client = UMFuturesWebsocketClient(on_message=self.on_ws_message, on_error=self.on_ws_error)
+            
+            for symbol in self.symbols:
+                # Subscribe
+                self.ws_client.agg_trade(symbol=symbol)
+                self.ws_client.diff_book_depth(symbol=symbol, speed=100)
+                time.sleep(0.2) # Rate limit protection
+                
+                # Initial Snapshot
+                if symbol not in self.last_snapshot_time: # Only if never fetched
+                    self._fetch_snapshot(symbol)
+                    self.last_snapshot_time[symbol] = time.time()
+            
+            self.last_msg_time = time.time()
+            logger.info("Connected and Subscribed.")
+            
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
+            time.sleep(5) # Backoff
+
+    def _reconnect(self):
+        logger.info("Reconnecting...")
+        try:
+            self.ws_client.stop()
+        except:
+            pass
+        time.sleep(2)
+        self._connect_and_subscribe()
+
+    def _fetch_snapshot(self, symbol):
+        def _job():
+            try:
+                # Limit 500 for better parity with "ob200"
+                depth = self.rest_client.depth(symbol=symbol, limit=500)
+                snapshot_obj = self._transform_snapshot(symbol, depth)
+                self.write_queue.put(('orderbook', symbol, snapshot_obj))
+                logger.info(f"Snapshot refreshed for {symbol}")
+            except Exception as e:
+                logger.error(f"Snapshot failed for {symbol}: {e}")
+        
+        # Run in thread to not block main loop
+        threading.Thread(target=_job, daemon=True).start()
+
+    def on_ws_message(self, _, message):
+        self.last_msg_time = time.time()
+        try:
+            if isinstance(message, str):
+                msg = json.loads(message)
+            else:
+                msg = message
+
+            event_type = msg.get('e')
+            
+            if event_type == 'aggTrade':
+                self._handle_trade(msg)
+            elif event_type == 'depthUpdate':
+                self._handle_depth(msg)
+                
+        except Exception as e:
+            logger.error(f"Parse error: {e}")
+
+    def on_ws_error(self, _, error):
+        logger.error(f"WebSocket Error: {error}")
+
+    def _handle_trade(self, msg):
+        symbol = msg['s']
+        price = float(msg['p'])
+        size = float(msg['q'])
+        timestamp_ms = msg['T']
+        is_maker = msg['m']
+        side = "Sell" if is_maker else "Buy"
+        
+        row = {
+            'timestamp': timestamp_ms / 1000.0,
+            'symbol': symbol,
+            'side': side,
+            'size': size,
+            'price': price,
+            'tickDirection': 'ZeroPlusTick', 
+            'trdMatchID': msg['a'],
+            'grossValue': price * size,
+            'homeNotional': size,
+            'foreignNotional': price * size,
+            'RPI': 0
+        }
+        try:
+            self.write_queue.put(('trade', symbol, row), block=False)
+        except queue.Full:
+            logger.warning("Queue FULL! Dropping trade data.")
+
+    def _handle_depth(self, msg):
+        symbol = msg['s']
+        out = {
+            "topic": f"orderbook.200.{symbol}",
+            "type": "delta",
+            "ts": msg['T'],
+            "data": {"s": symbol, "b": msg.get('b', []), "a": msg.get('a', [])},
+            "u": msg.get('u'),
+            "seq": msg.get('U'),
+            "cts": msg.get('E')
+        }
+        try:
+            self.write_queue.put(('orderbook', symbol, out), block=False)
+        except queue.Full:
+            logger.warning("Queue FULL! Dropping depth data.")
+
+    def _transform_snapshot(self, symbol, depth_data):
+        ts = depth_data.get('T', int(time.time() * 1000))
+        return {
+            "topic": f"orderbook.200.{symbol}",
+            "type": "snapshot",
+            "ts": ts,
+            "data": {"s": symbol, "b": depth_data.get('bids', []), "a": depth_data.get('asks', [])},
+            "u": depth_data.get('lastUpdateId'),
+            "seq": depth_data.get('lastUpdateId'),
+            "cts": depth_data.get('E', ts)
+        }
+
+    def writer_loop(self):
+        while self.running or not self.write_queue.empty():
+            try:
+                item = self.write_queue.get(timeout=1)
+                dtype, symbol, data = item
+                
+                # Use Timestamp from data to determine file date
+                if dtype == 'trade':
+                    ts = data['timestamp']
+                else:
+                    ts = data['ts'] / 1000.0
+                
+                self.file_manager.write(symbol, dtype, data, ts)
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Writer Error: {e}")
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", type=str, default="FARTCOINUSDT", help="Symbol to collect")
-    args = parser.parse_args()
-    
-    collector = BinanceDataCollector(args.symbol)
+    # Auto-detect symbols from existing folder structure if not provided
+    DEFAULT_SYMBOLS = []
     try:
-        collector.start()
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        collector.stop()
+        data_path = Path("data")
+        if data_path.exists():
+            for d in data_path.iterdir():
+                if d.is_dir() and not d.name.endswith("_Binance") and "USDT" in d.name:
+                    DEFAULT_SYMBOLS.append(d.name)
+    except Exception:
+        pass
+    
+    if not DEFAULT_SYMBOLS:
+        DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+
+    symbols = sys.argv[1:] if len(sys.argv) > 1 else DEFAULT_SYMBOLS
+    
+    print(f"Starting ROBUST Data Collector for: {symbols}")
+    print(f"Logs: {log_file}")
+    
+    collector = RobustDataCollector(symbols)
+    collector.start()
