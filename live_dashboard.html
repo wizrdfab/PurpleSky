@@ -25,6 +25,83 @@
                   linear-gradient(160deg, var(--bg1), var(--bg2));
       min-height: 100vh;
     }
+    .signal-strip {
+      position: sticky;
+      top: 0;
+      z-index: 60;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 24px;
+      background: rgba(2, 6, 23, 0.9);
+      border-bottom: 1px solid rgba(148,163,184,0.12);
+      backdrop-filter: blur(8px);
+      box-shadow: 0 8px 24px rgba(2, 6, 23, 0.45);
+    }
+    .signal-strip__label {
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: rgba(148,163,184,0.9);
+      white-space: nowrap;
+    }
+    .signal-strip__items {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      flex: 1;
+      justify-content: center;
+    }
+    .signal-chip {
+      --glow1: rgba(148,163,184,0.35);
+      --glow2: rgba(148,163,184,0.2);
+      border: 1px solid rgba(148,163,184,0.3);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: transform 0.15s ease, border 0.15s ease, box-shadow 0.15s ease;
+      box-shadow: 0 0 12px var(--glow1), 0 0 26px var(--glow2);
+      text-shadow: 0 0 6px var(--glow1);
+      animation: signalGlow 4.2s ease-in-out infinite;
+    }
+    .signal-chip.long {
+      --glow1: rgba(34,197,94,0.6);
+      --glow2: rgba(34,197,94,0.35);
+    }
+    .signal-chip.short {
+      --glow1: rgba(239,68,68,0.6);
+      --glow2: rgba(239,68,68,0.35);
+    }
+    .signal-chip.dual {
+      --glow1: rgba(148,163,184,0.6);
+      --glow2: rgba(148,163,184,0.35);
+    }
+    .signal-chip.aggressive {
+      --glow1: rgba(245,158,11,0.85);
+      --glow2: rgba(245,158,11,0.55);
+      animation: signalGlowAgg 3.4s ease-in-out infinite;
+    }
+    .signal-chip__icon {
+      display: inline-block;
+      width: 10px;
+      height: 14px;
+      margin-right: 6px;
+      background: linear-gradient(180deg, #fde047, #f59e0b);
+      clip-path: polygon(40% 0%, 72% 0%, 54% 38%, 82% 38%, 28% 100%, 42% 60%, 16% 60%);
+      filter: drop-shadow(0 0 4px rgba(245,158,11,0.7));
+      vertical-align: -1px;
+    }
+    .signal-chip:hover {
+      transform: translateY(-1px);
+    }
+    .signal-chip.long { color: var(--accent); border-color: rgba(34,197,94,0.5); }
+    .signal-chip.short { color: var(--danger); border-color: rgba(239,68,68,0.5); }
+    .signal-chip.dual { color: #e2e8f0; border-color: rgba(148,163,184,0.6); }
     header {
       padding: 28px 32px 10px;
       display: flex;
@@ -158,6 +235,12 @@
       margin-bottom: 10px;
       gap: 12px;
     }
+    .detail-actions {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+    }
     .rename-controls {
       margin-top: 8px;
       display: flex;
@@ -231,12 +314,20 @@
     }
     .signal-panel {
       margin-top: 18px;
+      grid-column: 1 / -1;
     }
     .signal-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 12px;
+    }
+    .signal-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      justify-content: flex-end;
     }
     .signal-chart {
       height: 360px;
@@ -267,6 +358,75 @@
       max-height: 280px;
       overflow-y: auto;
       padding-right: 4px;
+    }
+    #tradersSection.signal-mode .grid {
+      grid-template-columns: minmax(340px, 1.4fr) minmax(340px, 1.4fr) minmax(260px, 1fr);
+      align-items: start;
+    }
+    #tradersSection.signal-mode .grid > .card {
+      grid-column: auto;
+      grid-row: auto;
+    }
+    #tradersSection.signal-mode .grid > .card.card-model {
+      grid-column: 3;
+      grid-row: 1;
+    }
+    #tradersSection.signal-mode .grid > .card.card-signal {
+      grid-column: 3;
+      grid-row: 2;
+    }
+    #tradersSection.signal-mode .grid > .card.card-health {
+      grid-column: 3;
+      grid-row: 3;
+    }
+    #tradersSection.signal-mode .grid > .card.card-data {
+      grid-column: 3;
+      grid-row: 4;
+    }
+    #tradersSection.signal-mode .grid > .card.card-latency {
+      grid-column: 3;
+      grid-row: 5;
+    }
+    #tradersSection.signal-mode .grid > .card.card-errors {
+      grid-column: 3;
+      grid-row: 6;
+    }
+    #tradersSection.signal-mode .grid > .card.card-features {
+      grid-column: 3;
+      grid-row: 7;
+    }
+    #tradersSection.signal-mode .grid > .card.signal-panel {
+      grid-column: 1 / span 2;
+      grid-row: 1 / span 7;
+      margin-top: 0;
+    }
+    #tradersSection.signal-mode .card-equity,
+    #tradersSection.signal-mode .card-position,
+    #tradersSection.signal-mode .card-orders {
+      display: none;
+    }
+    @media (max-width: 1100px) {
+      #tradersSection.signal-mode .grid {
+        grid-template-columns: 1fr;
+      }
+      #tradersSection.signal-mode .grid > .card {
+        grid-column: 1 / -1;
+        grid-row: auto;
+      }
+      #tradersSection.signal-mode .grid > .card.card-model,
+      #tradersSection.signal-mode .grid > .card.card-signal,
+      #tradersSection.signal-mode .grid > .card.card-health,
+      #tradersSection.signal-mode .grid > .card.card-data,
+      #tradersSection.signal-mode .grid > .card.card-latency,
+      #tradersSection.signal-mode .grid > .card.card-errors,
+      #tradersSection.signal-mode .grid > .card.card-features,
+      #tradersSection.signal-mode .grid > .card.signal-panel {
+        grid-column: 1 / -1;
+        grid-row: auto;
+      }
+      #tradersSection.signal-mode .grid > .card.signal-panel {
+        margin-top: 18px;
+      }
     }
     .signal-item {
       border: 1px solid rgba(148,163,184,0.2);
@@ -323,6 +483,30 @@
       0% { transform: scale(0.9); opacity: 0.6; }
       50% { transform: scale(1.2); opacity: 1; }
       100% { transform: scale(0.9); opacity: 0.6; }
+    }
+    @keyframes signalGlow {
+      0%, 100% {
+        box-shadow: 0 0 12px var(--glow1), 0 0 26px var(--glow2);
+        text-shadow: 0 0 6px var(--glow1);
+        color: rgba(229,231,235,0.85);
+      }
+      50% {
+        box-shadow: 0 0 26px var(--glow1), 0 0 56px var(--glow2);
+        text-shadow: 0 0 12px var(--glow1);
+        color: rgba(248,250,252,1);
+      }
+    }
+    @keyframes signalGlowAgg {
+      0%, 100% {
+        box-shadow: 0 0 16px var(--glow1), 0 0 34px var(--glow2);
+        text-shadow: 0 0 8px var(--glow1);
+        color: rgba(254,249,195,0.9);
+      }
+      50% {
+        box-shadow: 0 0 34px var(--glow1), 0 0 70px var(--glow2);
+        text-shadow: 0 0 16px var(--glow1);
+        color: rgba(255,255,255,1);
+      }
     }
     .chart-large {
       height: 300px;
@@ -493,6 +677,10 @@
   </style>
 </head>
 <body>
+  <div class="signal-strip" id="signalStrip">
+    <div class="signal-strip__label">Active Signals</div>
+    <div class="signal-strip__items" id="signalStripItems"></div>
+  </div>
   <header>
     <div>
       <h1>Live Trading Dashboard</h1>
@@ -602,17 +790,23 @@
             <button class="signal-btn" id="aliasClear">Reset</button>
           </div>
         </div>
-        <div class="pill" id="detailStatus">--</div>
+        <div class="detail-actions">
+          <div class="toggle-group" id="traderModeToggle">
+            <button class="toggle-btn" data-mode="signal">Signal Mode</button>
+            <button class="toggle-btn" data-mode="auto">Automated Mode</button>
+          </div>
+          <div class="pill" id="detailStatus">--</div>
+        </div>
       </div>
       <div class="grid">
-        <div class="card">
+        <div class="card card-equity">
           <h3>Equity and PnL</h3>
           <div class="value" id="equityVal">--</div>
           <div class="row"><span>Daily PnL</span><span id="dailyPnl">--</span></div>
           <div class="row"><span>Unrealized</span><span id="unrealPnl">--</span></div>
           <canvas id="equityChart"></canvas>
         </div>
-        <div class="card">
+        <div class="card card-position">
           <h3>Position</h3>
           <div class="value" id="posSide">--</div>
           <div class="row"><span>Size</span><span id="posSize">--</span></div>
@@ -620,7 +814,7 @@
           <div class="row"><span>Mark</span><span id="posMark">--</span></div>
           <div class="row"><span>TP / SL</span><span id="posTPSL">--</span></div>
         </div>
-        <div class="card">
+        <div class="card card-health">
           <h3>Health</h3>
           <div class="value" id="healthVal">--</div>
           <div class="row"><span>Sentiment</span><span id="sentimentVal">--</span></div>
@@ -628,7 +822,7 @@
           <div class="row"><span>Trade Enabled</span><span id="tradeEnabled">--</span></div>
           <div class="row"><span>Drift Alerts</span><span id="driftAlerts">--</span></div>
         </div>
-        <div class="card">
+        <div class="card card-model">
           <h3>Model</h3>
           <div class="value" id="modelPred">--</div>
           <div class="row"><span>Pred Long</span><span id="predLong">--</span></div>
@@ -643,7 +837,7 @@
           <div class="row"><span>Model Path</span><span class="truncate" id="modelPath">--</span></div>
           <div class="row"><span>Keys Profile</span><span id="keysProfile">--</span></div>
         </div>
-        <div class="card">
+        <div class="card card-signal">
           <h3>Signal</h3>
           <div class="value" id="signalStatus">--</div>
           <div class="row"><span>Side</span><span id="signalSide">--</span></div>
@@ -652,7 +846,7 @@
           <div class="row"><span>SL Price</span><span id="signalSL">--</span></div>
           <div class="row"><span>Time</span><span id="signalTime">--</span></div>
         </div>
-        <div class="card">
+        <div class="card card-data">
           <h3>Data Quality</h3>
           <div class="value" id="barsVal">--</div>
           <div class="row"><span>Macro %</span><span id="macroPct">--</span></div>
@@ -660,7 +854,7 @@
           <div class="row"><span>Trade Continuity</span><span id="tradeCont">--</span></div>
           <div class="row"><span>Lag Trade / Bar</span><span id="lagTradeBar">--</span></div>
         </div>
-        <div class="card">
+        <div class="card card-latency">
           <h3>Latency</h3>
           <div class="value" id="restLatency">--</div>
           <div class="row"><span>WS Trade</span><span id="wsTrade">--</span></div>
@@ -668,34 +862,42 @@
           <div class="row"><span>OB Lag</span><span id="obLag">--</span></div>
           <canvas id="latencyChart"></canvas>
         </div>
-        <div class="card">
+        <div class="card card-orders">
           <h3>Orders</h3>
           <div class="value" id="openOrders">--</div>
           <div class="row"><span>Last Reconcile</span><span id="lastReconcile">--</span></div>
           <div class="row"><span>Source</span><span id="reconcileSource">--</span></div>
           <div class="row"><span>Protective</span><span id="protectiveCount">--</span></div>
         </div>
-        <div class="card">
+        <div class="card card-errors">
           <h3>Errors</h3>
           <div class="value" id="errorCount">--</div>
           <div class="row"><span>Last Runtime</span><span id="lastRuntime">--</span></div>
           <div class="row"><span>Last API</span><span id="lastApi">--</span></div>
         </div>
-        <div class="card">
+        <div class="card card-features">
           <h3>Features</h3>
           <div class="feature-grid" id="featureList">--</div>
         </div>
-      </div>
-      <div class="card signal-panel">
-        <div class="signal-header">
-          <div>
-            <h3>Signal Stream</h3>
-            <div class="sub" id="signalSub">Waiting for signals...</div>
+        <div class="card signal-panel">
+          <div class="signal-header">
+            <div>
+              <h3>Signal Stream</h3>
+              <div class="sub" id="signalSub">Waiting for signals...</div>
+            </div>
+            <div class="signal-actions">
+              <div class="toggle-group" id="signalLegend">
+                <button class="toggle-btn active" data-indicator="signals">Signals</button>
+                <button class="toggle-btn active" data-indicator="direction">Dir</button>
+                <button class="toggle-btn active" data-indicator="aggressive">Agg</button>
+                <button class="toggle-btn active" data-indicator="levels">Levels</button>
+              </div>
+              <button class="signal-btn" id="signalClear">Show All</button>
+            </div>
           </div>
-          <button class="signal-btn" id="signalClear">Show All</button>
+          <div id="signalChart" class="signal-chart"></div>
+          <div class="signal-list" id="signalList">--</div>
         </div>
-        <div id="signalChart" class="signal-chart"></div>
-        <div class="signal-list" id="signalList">--</div>
       </div>
     </section>
   </section>
@@ -723,6 +925,12 @@
             <button class="range-btn" data-range="6h">6H</button>
             <button class="range-btn" data-range="24h">24H</button>
             <button class="range-btn" data-range="1d">1D</button>
+          </div>
+          <div class="toggle-group" id="chartLegend">
+            <button class="toggle-btn active" data-legend="pred">Pred</button>
+            <button class="toggle-btn active" data-legend="dir">Dir</button>
+            <button class="toggle-btn active" data-legend="gate">Gate</button>
+            <button class="toggle-btn active" data-legend="orders">Orders</button>
           </div>
         </div>
       </div>
@@ -758,6 +966,43 @@
         return;
       }
     };
+    const SIGNAL_LEGEND_KEY = "dash_signal_legend_v1";
+    const defaultSignalLegend = { signals: true, direction: true, aggressive: true, levels: true };
+    const loadSignalLegend = () => {
+      try {
+        const raw = localStorage.getItem(SIGNAL_LEGEND_KEY);
+        if (!raw) return {};
+        const data = JSON.parse(raw);
+        return data && typeof data === "object" ? data : {};
+      } catch (err) {
+        return {};
+      }
+    };
+    const saveSignalLegend = (legend) => {
+      try {
+        localStorage.setItem(SIGNAL_LEGEND_KEY, JSON.stringify(legend || {}));
+      } catch (err) {
+        return;
+      }
+    };
+    const TRADER_MODE_KEY = "dash_trader_mode_v1";
+    const loadTraderMode = () => {
+      try {
+        const raw = localStorage.getItem(TRADER_MODE_KEY);
+        if (!raw) return "auto";
+        const mode = String(raw);
+        return mode === "signal" ? "signal" : "auto";
+      } catch (err) {
+        return "auto";
+      }
+    };
+    const saveTraderMode = (mode) => {
+      try {
+        localStorage.setItem(TRADER_MODE_KEY, mode || "auto");
+      } catch (err) {
+        return;
+      }
+    };
 
     const state = {
       selected: null,
@@ -787,9 +1032,13 @@
       signalZoomActive: false,
       signalZoomBound: false,
       signalCache: {},
+      signalLegend: Object.assign({}, defaultSignalLegend, loadSignalLegend()),
+      lastBarByKey: {},
+      lastLatestFetchByKey: {},
       directionHistory: [],
       directionKey: null,
-      aliases: loadAliases()
+      aliases: loadAliases(),
+      traderMode: loadTraderMode()
     };
 
     function sparkline(canvas, values, color) {
@@ -818,6 +1067,25 @@
       const iso = ts.replace(" ", "T") + "Z";
       const ms = Date.parse(iso);
       return Number.isNaN(ms) ? null : ms;
+    }
+
+    function resolveBarTimeMs(item) {
+      if (!item) return null;
+      const pred = item.prediction || item.health?.last_prediction || {};
+      const dir = item.direction || {};
+      const market = item.market || {};
+      const barTime = pred.bar_time || dir.bar_time || market.last_bar_time || item.bar_time;
+      if (barTime !== null && barTime !== undefined && barTime !== "") {
+        const num = Number(barTime);
+        if (Number.isFinite(num) && num > 0) {
+          return num > 1e12 ? Math.floor(num) : Math.floor(num * 1000);
+        }
+      }
+      if (item.ts) {
+        const parsed = parseTs(String(item.ts));
+        if (parsed) return parsed;
+      }
+      return null;
     }
 
     function latestTimestamp(history) {
@@ -900,6 +1168,8 @@
       const shortGateOk = !gateEnabled || dirShort > dirThreshold;
       const activeLong = predLong > threshold && longGateOk;
       const activeShort = predShort > threshold && shortGateOk;
+      const aggressiveLong = gateEnabled && dirLong >= aggressiveThreshold;
+      const aggressiveShort = gateEnabled && dirShort >= aggressiveThreshold;
       let side = "";
       if (activeLong && activeShort) {
         side = "dual";
@@ -908,9 +1178,18 @@
       } else if (activeShort) {
         side = "short";
       }
+      let aggressiveSide = "";
+      if (activeLong && aggressiveLong && activeShort && aggressiveShort) {
+        aggressiveSide = "dual";
+      } else if (activeLong && aggressiveLong) {
+        aggressiveSide = "long";
+      } else if (activeShort && aggressiveShort) {
+        aggressiveSide = "short";
+      }
       return {
         active: activeLong || activeShort,
         side,
+        aggressiveSide,
         predLong,
         predShort,
         threshold
@@ -1228,6 +1507,50 @@
       input.value = alias;
     }
 
+    function isSignalIndicatorEnabled(key) {
+      if (!key) return true;
+      const legend = state.signalLegend || {};
+      return legend[key] !== false;
+    }
+
+    function syncSignalLegendButtons() {
+      const wrap = document.getElementById("signalLegend");
+      if (!wrap) return;
+      wrap.querySelectorAll("[data-indicator]").forEach(btn => {
+        const key = (btn.dataset.indicator || "").toLowerCase();
+        if (!key) return;
+        btn.classList.toggle("active", isSignalIndicatorEnabled(key));
+      });
+    }
+
+    function syncTraderModeButtons() {
+      const wrap = document.getElementById("traderModeToggle");
+      if (!wrap) return;
+      wrap.querySelectorAll("[data-mode]").forEach(btn => {
+        const mode = (btn.dataset.mode || "").toLowerCase();
+        if (!mode) return;
+        btn.classList.toggle("active", mode === state.traderMode);
+      });
+    }
+
+    function applyTraderMode(mode) {
+      const section = document.getElementById("tradersSection");
+      if (!section) return;
+      const nextMode = (mode || state.traderMode || "auto").toString().toLowerCase();
+      state.traderMode = nextMode === "signal" ? "signal" : "auto";
+      section.classList.toggle("signal-mode", state.traderMode === "signal");
+      section.classList.toggle("auto-mode", state.traderMode !== "signal");
+      syncTraderModeButtons();
+      if (state.signalChart) {
+        setTimeout(() => {
+          if (state.signalChart) {
+            state.signalChart.resize();
+            renderSignalChart();
+          }
+        }, 0);
+      }
+    }
+
     function stripQuoteSymbol(symbol) {
       if (!symbol) return "";
       const upper = symbol.toUpperCase();
@@ -1263,6 +1586,61 @@
       return "--";
     }
 
+    function renderSignalStrip(entries) {
+      const strip = document.getElementById("signalStrip");
+      const items = document.getElementById("signalStripItems");
+      if (!strip || !items) return;
+      const active = [];
+      (entries || []).forEach(item => {
+        const key = entryKey(item);
+        if (!key) return;
+        const signalState = computeSignalState(item.prediction || {}, item.direction || {});
+        if (!signalState.active) return;
+        const symbol = item.symbol || key || "--";
+        const displayName = displayNameFor(key, symbol);
+        active.push({
+          key,
+          displayName,
+          side: signalState.side,
+          aggressiveSide: signalState.aggressiveSide || ""
+        });
+      });
+      if (!active.length) {
+        strip.style.display = "none";
+        items.innerHTML = "";
+        return;
+      }
+      strip.style.display = "flex";
+      items.innerHTML = "";
+      active.forEach(entry => {
+        const chip = document.createElement("button");
+        const aggressiveSide = entry.aggressiveSide;
+        const isAggressive = Boolean(aggressiveSide);
+        const side = (aggressiveSide || entry.side || "dual").toLowerCase();
+        let sideLabel = "";
+        if (aggressiveSide) {
+          const aggLabel = aggressiveSide === "dual" ? "Dual" : aggressiveSide;
+          sideLabel = `Aggressive ${aggLabel}`;
+        } else if (side === "dual") {
+          sideLabel = "Dual";
+        } else {
+          sideLabel = side;
+        }
+        chip.type = "button";
+        chip.className = `signal-chip ${side}${isAggressive ? " aggressive" : ""}`;
+        if (isAggressive) {
+          const icon = document.createElement("span");
+          icon.className = "signal-chip__icon";
+          chip.appendChild(icon);
+        }
+        const text = document.createElement("span");
+        text.textContent = `${entry.displayName} ${sideLabel}`;
+        chip.appendChild(text);
+        chip.addEventListener("click", () => selectSymbol(entry.key));
+        items.appendChild(chip);
+      });
+    }
+
     function renderSummary(items) {
       state.items = items || [];
       state.latestMap = {};
@@ -1286,6 +1664,7 @@
       if (subline) {
         subline.textContent = `Active models: ${entries.length} | Updated: ${new Date().toLocaleTimeString()}`;
       }
+      renderSignalStrip(entries);
       if (!state.selected || !state.latestMap[state.selected]) {
         state.selected = entries.length ? entryKey(entries[0]) : null;
       }
@@ -1382,7 +1761,20 @@
         grid.appendChild(card);
       });
       if (state.selected && state.latestMap[state.selected]) {
-        updateDetail(state.latestMap[state.selected]);
+        const selectedItem = state.latestMap[state.selected];
+        updateDetail(selectedItem);
+        const barTimeMs = resolveBarTimeMs(selectedItem);
+        if (barTimeMs) {
+          const lastBar = state.lastBarByKey[state.selected] || 0;
+          if (barTimeMs > lastBar) {
+            state.lastBarByKey[state.selected] = barTimeMs;
+            if (state.view === "traders") {
+              refreshSignals(state.selected, state.selectedLabel || state.selectedSymbol, true);
+            }
+          } else if (!lastBar) {
+            state.lastBarByKey[state.selected] = barTimeMs;
+          }
+        }
       }
     }
 
@@ -1726,6 +2118,10 @@
 
       const focusId = state.signalFocusId;
       const visibleSignals = focusId ? signals.filter(sig => sig.id === focusId) : signals;
+      const showSignals = isSignalIndicatorEnabled("signals");
+      const showDirection = isSignalIndicatorEnabled("direction");
+      const showAggressive = showDirection && isSignalIndicatorEnabled("aggressive");
+      const showLevels = isSignalIndicatorEnabled("levels");
       const longPoints = [];
       const shortPoints = [];
       const directionPoints = [];
@@ -1744,7 +2140,10 @@
       };
       const addDirectionPoint = (side, pred, threshold, aggressiveThreshold, barTime) => {
         if (!Number.isFinite(pred) || !Number.isFinite(threshold) || !Number.isFinite(aggressiveThreshold)) return;
+        if (!showDirection && !showAggressive) return;
         const aggressive = pred >= aggressiveThreshold;
+        if (aggressive && !showAggressive) return;
+        if (!aggressive && !showDirection) return;
         const normal = pred >= threshold;
         if (!normal && !aggressive) return;
         const idx = findBarIndex(barTime);
@@ -1811,40 +2210,44 @@
         }, 0);
       }
 
-      dirEntries.forEach(entry => {
-        addDirectionPoint("long", entry.predLong, entry.threshold, entry.aggressiveThreshold, entry.barTime);
-        addDirectionPoint("short", entry.predShort, entry.threshold, entry.aggressiveThreshold, entry.barTime);
-      });
-      visibleSignals.forEach(sig => {
-        const idx = indexMap.get(sig.bar_time);
-        if (idx === undefined) return;
-        const side = signalSideKey(sig.side);
-        const style = signalMarkerStyle(side === "short" ? "short" : "long", sig.pred);
-        const payload = {
-          value: [idx, sig.entry_price],
-          signal: sig,
-          symbolSize: style.size,
-          itemStyle: {
-            color: style.color,
-            borderColor: style.borderColor,
-            borderWidth: style.borderWidth,
-            shadowBlur: style.shadowBlur,
-            shadowColor: style.shadowColor
+      if (showDirection || showAggressive) {
+        dirEntries.forEach(entry => {
+          addDirectionPoint("long", entry.predLong, entry.threshold, entry.aggressiveThreshold, entry.barTime);
+          addDirectionPoint("short", entry.predShort, entry.threshold, entry.aggressiveThreshold, entry.barTime);
+        });
+      }
+      if (showSignals) {
+        visibleSignals.forEach(sig => {
+          const idx = indexMap.get(sig.bar_time);
+          if (idx === undefined) return;
+          const side = signalSideKey(sig.side);
+          const style = signalMarkerStyle(side === "short" ? "short" : "long", sig.pred);
+          const payload = {
+            value: [idx, sig.entry_price],
+            signal: sig,
+            symbolSize: style.size,
+            itemStyle: {
+              color: style.color,
+              borderColor: style.borderColor,
+              borderWidth: style.borderWidth,
+              shadowBlur: style.shadowBlur,
+              shadowColor: style.shadowColor
+            }
+          };
+          if (side === "short") {
+            shortPoints.push(payload);
+          } else {
+            longPoints.push(payload);
           }
-        };
-        if (side === "short") {
-          shortPoints.push(payload);
-        } else {
-          longPoints.push(payload);
-        }
-      });
+        });
+      }
 
       let focusSignal = null;
       if (focusId) {
         focusSignal = signals.find(sig => sig.id === focusId) || null;
       }
       const markLineData = [];
-      if (focusSignal) {
+      if (focusSignal && showLevels) {
         if (focusSignal.entry_price > 0) {
           markLineData.push({ yAxis: focusSignal.entry_price, name: "Entry" });
         }
@@ -1945,7 +2348,7 @@
           {
             name: "Direction",
             type: "scatter",
-            data: directionPoints,
+            data: (showDirection || showAggressive) ? directionPoints : [],
             symbol: "circle",
             symbolSize: (val, params) => (params && params.data && params.data.symbolSize) ? params.data.symbolSize : 10,
             itemStyle: { color: "#38bdf8" },
@@ -1954,12 +2357,12 @@
           {
             name: "Signal Long",
             type: "scatter",
-            data: longPoints,
+            data: showSignals ? longPoints : [],
             symbol: "triangle",
             symbolSize: (val, params) => (params && params.data && params.data.symbolSize) ? params.data.symbolSize : 12,
             itemStyle: { color: "#22c55e" },
             label: {
-              show: Boolean(focusId),
+              show: Boolean(focusId) && showSignals,
               formatter: (p) => formatSignalTime(p.data.signal),
               color: "#e2e8f0",
               fontSize: 10,
@@ -1969,13 +2372,13 @@
           {
             name: "Signal Short",
             type: "scatter",
-            data: shortPoints,
+            data: showSignals ? shortPoints : [],
             symbol: "triangle",
             symbolSize: (val, params) => (params && params.data && params.data.symbolSize) ? params.data.symbolSize : 12,
             symbolRotate: 180,
             itemStyle: { color: "#ef4444" },
             label: {
-              show: Boolean(focusId),
+              show: Boolean(focusId) && showSignals,
               formatter: (p) => formatSignalTime(p.data.signal),
               color: "#e2e8f0",
               fontSize: 10,
@@ -2116,7 +2519,7 @@
       stashSignalCache(state.signalKey);
     }
 
-    function refreshSignals(key, symbol) {
+    function refreshSignals(key, symbol, forceCandles = false) {
       if (!key) return;
       if (state.signalKey !== key) {
         if (state.signalKey) {
@@ -2144,11 +2547,20 @@
         }
       }
       const now = Date.now();
-      if (!state.signalLastCandleFetch || (now - state.signalLastCandleFetch) > 20000) {
+      if (forceCandles || !state.signalLastCandleFetch || (now - state.signalLastCandleFetch) > 20000) {
         state.signalLastCandleFetch = now;
         fetchSignalCandles(key);
       }
       fetchSignals(key);
+      const shouldUpdateDetail = state.view === "traders" && state.selected === key;
+      if (shouldUpdateDetail) {
+        const lastLatest = (state.lastLatestFetchByKey && state.lastLatestFetchByKey[key]) || 0;
+        if (forceCandles || (now - lastLatest) > 4000) {
+          if (!state.lastLatestFetchByKey) state.lastLatestFetchByKey = {};
+          state.lastLatestFetchByKey[key] = now;
+          fetchLatestDetail(key);
+        }
+      }
     }
 
     function renderProfiles(list) {
@@ -2334,6 +2746,20 @@
       renderSummary(items || []);
     }
 
+    async function fetchLatestDetail(key) {
+      if (!key) return;
+      const resp = await fetch(`/api/latest?key=${encodeURIComponent(key)}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data || typeof data !== "object") return;
+      const entry = entryKey(data) || key;
+      if (!state.latestMap) state.latestMap = {};
+      state.latestMap[entry] = data;
+      if (state.selected === entry) {
+        updateDetail(data);
+      }
+    }
+
     async function fetchHistory(key) {
       if (!key) return;
       const resp = await fetch(`/api/metrics?key=${encodeURIComponent(key)}&limit=200`);
@@ -2412,6 +2838,36 @@
         renderSignalChart();
       });
     }
+    const signalLegend = document.getElementById("signalLegend");
+    if (signalLegend) {
+      signalLegend.querySelectorAll(".toggle-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const key = (btn.dataset.indicator || "").toLowerCase();
+          if (!key) return;
+          const legend = state.signalLegend || {};
+          const next = !isSignalIndicatorEnabled(key);
+          legend[key] = next;
+          state.signalLegend = legend;
+          btn.classList.toggle("active", next);
+          saveSignalLegend(legend);
+          renderSignalChart();
+        });
+      });
+      syncSignalLegendButtons();
+    }
+    const traderModeToggle = document.getElementById("traderModeToggle");
+    if (traderModeToggle) {
+      traderModeToggle.querySelectorAll(".toggle-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const mode = (btn.dataset.mode || "").toLowerCase();
+          if (!mode) return;
+          state.traderMode = mode === "signal" ? "signal" : "auto";
+          saveTraderMode(state.traderMode);
+          applyTraderMode(state.traderMode);
+        });
+      });
+      syncTraderModeButtons();
+    }
 
     document.querySelectorAll("#balanceRange .range-btn").forEach(btn => {
       btn.addEventListener("click", () => {
@@ -2442,6 +2898,7 @@
       });
     });
 
+    applyTraderMode(state.traderMode);
     setView(state.view);
   </script>
 </body>

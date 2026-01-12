@@ -1867,6 +1867,44 @@ EXTRA_SCRIPT = """
   let chartDirectionLastFetch = 0;
   let chartDirectionFetchInFlight = false;
   const chartStateCache = {};
+  const CHART_LEGEND_KEY = "dash_chart_legend_v1";
+  const defaultChartLegend = { pred: true, dir: true, gate: true, orders: true };
+  let chartLegend = Object.assign({}, defaultChartLegend, loadChartLegend());
+  let chartLegendBound = false;
+
+  function loadChartLegend() {
+    try {
+      const raw = localStorage.getItem(CHART_LEGEND_KEY);
+      if (!raw) return {};
+      const data = JSON.parse(raw);
+      return data && typeof data === "object" ? data : {};
+    } catch (err) {
+      return {};
+    }
+  }
+
+  function saveChartLegend() {
+    try {
+      localStorage.setItem(CHART_LEGEND_KEY, JSON.stringify(chartLegend || {}));
+    } catch (err) {
+      return;
+    }
+  }
+
+  function isLegendEnabled(key) {
+    if (!key) return true;
+    return chartLegend[key] !== false;
+  }
+
+  function syncChartLegendButtons() {
+    const wrap = document.getElementById("chartLegend");
+    if (!wrap) return;
+    wrap.querySelectorAll("[data-legend]").forEach(btn => {
+      const key = (btn.dataset.legend || "").toLowerCase();
+      if (!key) return;
+      btn.classList.toggle("active", isLegendEnabled(key));
+    });
+  }
 
   function ensureChartSection() {
     if (document.getElementById("icebergChart")) return;
@@ -2283,6 +2321,7 @@ EXTRA_SCRIPT = """
     if (!seriesList.some(s => s.id === "primary")) return;
     const lines = [];
     (chartOverlay.lines || []).forEach(item => {
+      if (item.group && !isLegendEnabled(item.group)) return;
       const price = Number(item.price || 0);
       if (!Number.isFinite(price) || price <= 0) return;
       lines.push({
@@ -2303,6 +2342,7 @@ EXTRA_SCRIPT = """
     }
     const markers = (chartOverlay.markers || [])
       .filter(m => Number.isFinite(m.time) && Number.isFinite(m.price))
+      .filter(m => !m.group || isLegendEnabled(m.group))
       .map(m => ({
         coord: [m.time, m.price],
         name: m.title || "",
@@ -2546,35 +2586,35 @@ EXTRA_SCRIPT = """
     const markers = [];
     const ice = data.iceberg || {};
     const tp = data.iceberg_tp || {};
-    const pushMarker = (time, price, color, title, symbol, symbolSize, labelColor) => {
+    const pushMarker = (time, price, color, title, symbol, symbolSize, labelColor, group) => {
       const t = Number(time || 0);
       const p = Number(price || 0);
       if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(p) || p <= 0) return;
-      markers.push({ time: t, price: p, color, title, symbol, symbolSize, labelColor });
+      markers.push({ time: t, price: p, color, title, symbol, symbolSize, labelColor, group });
     };
     if (ice.buy && ice.buy.active) {
       const time = resolveMarkerTime(ice.buy.last_post_ts || ice.buy.created_ts);
       const price = Number(ice.buy.last_price || ice.buy.target_price || 0);
       const info = ice.buy.last_post_ts ? icebergClipLabel(ice.buy) : icebergEntryLabel(ice.buy);
       const label = ice.buy.last_post_ts ? "Buy Clip" : "Buy Entry";
-      pushMarker(time, price, "#22c55e", lineTitle(label, info));
+      pushMarker(time, price, "#22c55e", lineTitle(label, info), undefined, undefined, undefined, "orders");
     }
     if (ice.sell && ice.sell.active) {
       const time = resolveMarkerTime(ice.sell.last_post_ts || ice.sell.created_ts);
       const price = Number(ice.sell.last_price || ice.sell.target_price || 0);
       const info = ice.sell.last_post_ts ? icebergClipLabel(ice.sell) : icebergEntryLabel(ice.sell);
       const label = ice.sell.last_post_ts ? "Sell Clip" : "Sell Entry";
-      pushMarker(time, price, "#f97316", lineTitle(label, info));
+      pushMarker(time, price, "#f97316", lineTitle(label, info), undefined, undefined, undefined, "orders");
     }
     if (tp.long && (tp.long.active || tp.long.paused)) {
       const time = resolveMarkerTime(tp.long.tp_order_ts || tp.long.created_ts);
       const price = Number(tp.long.tp_order_price || tp.long.tp_target || 0);
-      pushMarker(time, price, "#60a5fa", lineTitle("TP Long", tpInfoLabel(tp.long)));
+      pushMarker(time, price, "#60a5fa", lineTitle("TP Long", tpInfoLabel(tp.long)), undefined, undefined, undefined, "orders");
     }
     if (tp.short && (tp.short.active || tp.short.paused)) {
       const time = resolveMarkerTime(tp.short.tp_order_ts || tp.short.created_ts);
       const price = Number(tp.short.tp_order_price || tp.short.tp_target || 0);
-      pushMarker(time, price, "#f59e0b", lineTitle("TP Short", tpInfoLabel(tp.short)));
+      pushMarker(time, price, "#f59e0b", lineTitle("TP Short", tpInfoLabel(tp.short)), undefined, undefined, undefined, "orders");
     }
     const prediction = data.prediction || data.health?.last_prediction || {};
     const predThreshold = numOrNaN(prediction.threshold);
@@ -2657,13 +2697,13 @@ EXTRA_SCRIPT = """
             const strength = strengthRatio(entry.predLong, entry.predThreshold);
             const size = 14 + Math.round(strength * 12);
             const label = `PL ${entry.predLong.toFixed(2)}`;
-            pushMarker(time, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220");
+            pushMarker(time, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220", "pred");
           }
           if (Number.isFinite(entry.predShort) && entry.predShort >= entry.predThreshold) {
             const strength = strengthRatio(entry.predShort, entry.predThreshold);
             const size = 14 + Math.round(strength * 12);
             const label = `PS ${entry.predShort.toFixed(2)}`;
-            pushMarker(time, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220");
+            pushMarker(time, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220", "pred");
           }
         }
         if (Number.isFinite(entry.dirThreshold) && Number.isFinite(entry.dirAggressive)) {
@@ -2673,7 +2713,7 @@ EXTRA_SCRIPT = """
             const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
             const label = `${aggressive ? "AGG " : ""}DL ${entry.dirLong.toFixed(2)}`;
             const color = aggressive ? "#0ea5e9" : "#38bdf8";
-            pushMarker(time, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+            pushMarker(time, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220", "dir");
           }
           if (Number.isFinite(entry.dirShort) && entry.dirShort >= entry.dirThreshold) {
             const strength = strengthRatio(entry.dirShort, entry.dirThreshold);
@@ -2681,7 +2721,7 @@ EXTRA_SCRIPT = """
             const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
             const label = `${aggressive ? "AGG " : ""}DS ${entry.dirShort.toFixed(2)}`;
             const color = aggressive ? "#ec4899" : "#f472b6";
-            pushMarker(time, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+            pushMarker(time, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220", "dir");
           }
         }
         const gateEnabled = Number.isFinite(entry.dirThreshold) && Number.isFinite(entry.dirAggressive);
@@ -2698,7 +2738,7 @@ EXTRA_SCRIPT = """
             );
             const size = 18 + Math.round(strength * 12);
             const label = `GL ${entry.predLong.toFixed(2)}`;
-            pushMarker(time, pos.long.gate, "#facc15", label, "pin", size, "#0b1220");
+            pushMarker(time, pos.long.gate, "#facc15", label, "pin", size, "#0b1220", "gate");
           }
           if (
             Number.isFinite(entry.predShort)
@@ -2712,7 +2752,7 @@ EXTRA_SCRIPT = """
             );
             const size = 18 + Math.round(strength * 12);
             const label = `GS ${entry.predShort.toFixed(2)}`;
-            pushMarker(time, pos.short.gate, "#f97316", label, "pin", size, "#0b1220");
+            pushMarker(time, pos.short.gate, "#f97316", label, "pin", size, "#0b1220", "gate");
           }
         }
       });
@@ -2726,13 +2766,13 @@ EXTRA_SCRIPT = """
             const strength = strengthRatio(predLong, predThreshold);
             const size = 14 + Math.round(strength * 12);
             const label = `PL ${predLong.toFixed(2)}`;
-            pushMarker(predTime, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220");
+            pushMarker(predTime, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220", "pred");
           }
           if (Number.isFinite(predShort) && predShort >= predThreshold) {
             const strength = strengthRatio(predShort, predThreshold);
             const size = 14 + Math.round(strength * 12);
             const label = `PS ${predShort.toFixed(2)}`;
-            pushMarker(predTime, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220");
+            pushMarker(predTime, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220", "pred");
           }
         }
       }
@@ -2747,7 +2787,7 @@ EXTRA_SCRIPT = """
             const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
             const label = `${aggressive ? "AGG " : ""}DL ${dirLong.toFixed(2)}`;
             const color = aggressive ? "#0ea5e9" : "#38bdf8";
-            pushMarker(dirTime, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+            pushMarker(dirTime, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220", "dir");
           }
           if (Number.isFinite(dirShort) && dirShort >= dirThreshold) {
             const strength = strengthRatio(dirShort, dirThreshold);
@@ -2755,7 +2795,7 @@ EXTRA_SCRIPT = """
             const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
             const label = `${aggressive ? "AGG " : ""}DS ${dirShort.toFixed(2)}`;
             const color = aggressive ? "#ec4899" : "#f472b6";
-            pushMarker(dirTime, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+            pushMarker(dirTime, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220", "dir");
           }
         }
       }
@@ -2768,13 +2808,13 @@ EXTRA_SCRIPT = """
             const strength = Math.min(strengthRatio(predLong, predThreshold), strengthRatio(dirLong, dirThreshold));
             const size = 18 + Math.round(strength * 12);
             const label = `GL ${predLong.toFixed(2)}`;
-            pushMarker(predTime, pos.long.gate, "#facc15", label, "pin", size, "#0b1220");
+            pushMarker(predTime, pos.long.gate, "#facc15", label, "pin", size, "#0b1220", "gate");
           }
           if (Number.isFinite(predShort) && Number.isFinite(dirShort) && predShort >= predThreshold && dirShort >= dirThreshold) {
             const strength = Math.min(strengthRatio(predShort, predThreshold), strengthRatio(dirShort, dirThreshold));
             const size = 18 + Math.round(strength * 12);
             const label = `GS ${predShort.toFixed(2)}`;
-            pushMarker(predTime, pos.short.gate, "#f97316", label, "pin", size, "#0b1220");
+            pushMarker(predTime, pos.short.gate, "#f97316", label, "pin", size, "#0b1220", "gate");
           }
         }
       }
@@ -2813,7 +2853,10 @@ EXTRA_SCRIPT = """
       if (tp.short.sl_target) levels.push({ price: tp.short.sl_target, color: "#ef4444", title: priceTitle("SL Short", tp.short.sl_target, "") });
       if (tp.short.tp_order_price) levels.push({ price: tp.short.tp_order_price, color: "#d97706", title: priceTitle("TP Clip", tp.short.tp_order_price, tpInfoLabel(tp.short)) });
     }
-    chartOverlay.lines = levels.filter(level => Number(level.price) > 0);
+    chartOverlay.lines = levels.filter(level => Number(level.price) > 0).map(level => {
+      if (level.group) return level;
+      return Object.assign({ group: "orders" }, level);
+    });
     applyChartOverlay();
   }
 
@@ -2895,6 +2938,26 @@ EXTRA_SCRIPT = """
       });
     });
     chartControlsBound = true;
+  }
+
+  function bindChartLegendControls() {
+    const wrap = document.getElementById("chartLegend");
+    if (!wrap) return;
+    if (!chartLegendBound) {
+      wrap.querySelectorAll(".toggle-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const key = (btn.dataset.legend || "").toLowerCase();
+          if (!key) return;
+          const next = !isLegendEnabled(key);
+          chartLegend[key] = next;
+          btn.classList.toggle("active", next);
+          saveChartLegend();
+          applyChartOverlay();
+        });
+      });
+      chartLegendBound = true;
+    }
+    syncChartLegendButtons();
   }
 
   function formatOrders(list) {
@@ -3028,6 +3091,7 @@ EXTRA_SCRIPT = """
     ensureChartSection();
     bindIcebergControls();
     bindChartRangeControls();
+    bindChartLegendControls();
     const dashKey = data.dash_key || data.symbol;
     if (dashKey) {
       window.__dashKey = dashKey;
