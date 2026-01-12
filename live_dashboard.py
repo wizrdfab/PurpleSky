@@ -133,6 +133,16 @@ def safe_int(value, default=0):
         return default
 
 
+def latest_bar_time_from_csv(path: Path) -> int:
+    rows = tail_csv_dicts(path, limit=3, max_bytes=64 * 1024)
+    latest = 0
+    for row in rows:
+        bar_time = safe_int(row.get("bar_time"), 0)
+        if bar_time > latest:
+            latest = bar_time
+    return latest
+
+
 def safe_bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -1852,6 +1862,10 @@ EXTRA_SCRIPT = """
   let chartUserZoom = false;
   let chartZoomState = null;
   let chartOverlay = { lines: [], markers: [], livePrice: null };
+  let chartDirectionHistory = [];
+  let chartDirectionKey = null;
+  let chartDirectionLastFetch = 0;
+  let chartDirectionFetchInFlight = false;
   const chartStateCache = {};
 
   function ensureChartSection() {
@@ -2341,6 +2355,13 @@ EXTRA_SCRIPT = """
     return Math.min(20000, Math.max(300, desired));
   }
 
+  function computeDirectionLimit() {
+    const sampleSec = window.__dashMetricsIntervalSec || 2;
+    const targetRange = chartRangeSec || (24 * 60 * 60);
+    const desired = Math.ceil(targetRange / sampleSec) + 200;
+    return Math.min(10000, Math.max(300, desired));
+  }
+
   function filterCandles(candles) {
     if (!chartRangeSec || !candles.length) return candles;
     const last = candles[candles.length - 1];
@@ -2409,6 +2430,33 @@ EXTRA_SCRIPT = """
     applyPricePrecision(last.value);
     const label = chartRangeLabel || "All";
     setChartMeta(`Range ${label} | Points ${filtered.length} | Last ${fmtPrice(last.value)} | Metrics feed`);
+  }
+
+  async function fetchDirectionHistory(force = false) {
+    if (!chartInitialized) return;
+    const key = window.__dashKey || window.__dashSymbol;
+    if (!key || chartDirectionFetchInFlight) return;
+    const now = Date.now();
+    if (!force && chartDirectionKey === key && (now - chartDirectionLastFetch) < 8000) {
+      return;
+    }
+    chartDirectionFetchInFlight = true;
+    chartDirectionLastFetch = now;
+    const currentKey = key;
+    try {
+      const limit = computeDirectionLimit();
+      const resp = await fetch(`/api/metrics?key=${encodeURIComponent(key)}&limit=${limit}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!Array.isArray(data)) return;
+      if (currentKey !== (window.__dashKey || window.__dashSymbol)) return;
+      chartDirectionHistory = data;
+      chartDirectionKey = currentKey;
+    } catch (_err) {
+      return;
+    } finally {
+      chartDirectionFetchInFlight = false;
+    }
   }
 
   async function fetchChartHistory(force = false) {
@@ -2540,7 +2588,6 @@ EXTRA_SCRIPT = """
     const dirTime = resolveMarkerTime(direction.bar_time || prediction.bar_time || data.market?.last_bar_time || data.ts);
     const dirLong = numOrNaN(direction.pred_long);
     const dirShort = numOrNaN(direction.pred_short);
-    const gateEnabled = Number.isFinite(dirThreshold) && Number.isFinite(dirAggressive);
 
     const cuePositions = (price) => {
       const baseOffset = price > 0 ? price * 0.0012 : 0;
@@ -2559,63 +2606,176 @@ EXTRA_SCRIPT = """
       };
     };
 
-    if (predTime && Number.isFinite(predThreshold)) {
-      const basePrice = resolveMarkerPrice(predTime, resolveLivePrice(data));
-      if (basePrice > 0) {
-        const pos = cuePositions(basePrice);
-        if (Number.isFinite(predLong) && predLong >= predThreshold) {
-          const strength = strengthRatio(predLong, predThreshold);
-          const size = 14 + Math.round(strength * 12);
-          const label = `PL ${predLong.toFixed(2)}`;
-          pushMarker(predTime, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220");
+    const historyKey = window.__dashKey || window.__dashSymbol;
+    const metricsHistory = (chartDirectionKey === historyKey && Array.isArray(chartDirectionHistory))
+      ? chartDirectionHistory
+      : [];
+    const useHistory = metricsHistory.length > 0;
+    const barKeyFrom = (value) => {
+      if (value === null || value === undefined || value === "") return null;
+      const num = Number(value);
+      if (Number.isFinite(num) && num > 0) {
+        return num > 1e12 ? Math.floor(num / 1000) : Math.floor(num);
+      }
+      const parsed = parseTs(value);
+      return parsed ? Math.floor(parsed / 1000) : null;
+    };
+
+    if (useHistory) {
+      const byBar = new Map();
+      metricsHistory.forEach(item => {
+        const pred = item.prediction || item.health?.last_prediction || {};
+        const dir = item.direction || {};
+        if (!dir && !pred) return;
+        const barKey = barKeyFrom(dir.bar_time || pred.bar_time || item.market?.last_bar_time || item.bar_time || item.ts);
+        if (!barKey) return;
+        const tsMs = item.ts ? (parseTs(String(item.ts)) || 0) : 0;
+        const existing = byBar.get(barKey);
+        if (!existing || (tsMs && tsMs >= (existing.tsMs || 0))) {
+          byBar.set(barKey, {
+            barKey,
+            tsMs,
+            predLong: numOrNaN(pred.pred_long),
+            predShort: numOrNaN(pred.pred_short),
+            predThreshold: numOrNaN(pred.threshold),
+            dirLong: numOrNaN(dir.pred_long),
+            dirShort: numOrNaN(dir.pred_short),
+            dirThreshold: numOrNaN(dir.threshold),
+            dirAggressive: numOrNaN(dir.aggressive_threshold),
+          });
         }
-        if (Number.isFinite(predShort) && predShort >= predThreshold) {
-          const strength = strengthRatio(predShort, predThreshold);
-          const size = 14 + Math.round(strength * 12);
-          const label = `PS ${predShort.toFixed(2)}`;
-          pushMarker(predTime, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220");
+      });
+
+      byBar.forEach(entry => {
+        const time = resolveMarkerTime(entry.barKey);
+        if (!time) return;
+        const basePrice = resolveMarkerPrice(time, resolveLivePrice(data));
+        if (basePrice <= 0) return;
+        const pos = cuePositions(basePrice);
+        if (Number.isFinite(entry.predThreshold)) {
+          if (Number.isFinite(entry.predLong) && entry.predLong >= entry.predThreshold) {
+            const strength = strengthRatio(entry.predLong, entry.predThreshold);
+            const size = 14 + Math.round(strength * 12);
+            const label = `PL ${entry.predLong.toFixed(2)}`;
+            pushMarker(time, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220");
+          }
+          if (Number.isFinite(entry.predShort) && entry.predShort >= entry.predThreshold) {
+            const strength = strengthRatio(entry.predShort, entry.predThreshold);
+            const size = 14 + Math.round(strength * 12);
+            const label = `PS ${entry.predShort.toFixed(2)}`;
+            pushMarker(time, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220");
+          }
+        }
+        if (Number.isFinite(entry.dirThreshold)) {
+          if (Number.isFinite(entry.dirLong) && entry.dirLong >= entry.dirThreshold) {
+            const strength = strengthRatio(entry.dirLong, entry.dirThreshold);
+            const aggressive = Number.isFinite(entry.dirAggressive) && entry.dirLong >= entry.dirAggressive;
+            const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
+            const label = `${aggressive ? "AGG " : ""}DL ${entry.dirLong.toFixed(2)}`;
+            const color = aggressive ? "#0ea5e9" : "#38bdf8";
+            pushMarker(time, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+          }
+          if (Number.isFinite(entry.dirShort) && entry.dirShort >= entry.dirThreshold) {
+            const strength = strengthRatio(entry.dirShort, entry.dirThreshold);
+            const aggressive = Number.isFinite(entry.dirAggressive) && entry.dirShort >= entry.dirAggressive;
+            const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
+            const label = `${aggressive ? "AGG " : ""}DS ${entry.dirShort.toFixed(2)}`;
+            const color = aggressive ? "#ec4899" : "#f472b6";
+            pushMarker(time, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+          }
+        }
+        const gateEnabled = Number.isFinite(entry.dirThreshold) && Number.isFinite(entry.dirAggressive);
+        if (gateEnabled && Number.isFinite(entry.predThreshold)) {
+          if (
+            Number.isFinite(entry.predLong)
+            && Number.isFinite(entry.dirLong)
+            && entry.predLong >= entry.predThreshold
+            && entry.dirLong >= entry.dirThreshold
+          ) {
+            const strength = Math.min(
+              strengthRatio(entry.predLong, entry.predThreshold),
+              strengthRatio(entry.dirLong, entry.dirThreshold)
+            );
+            const size = 18 + Math.round(strength * 12);
+            const label = `GL ${entry.predLong.toFixed(2)}`;
+            pushMarker(time, pos.long.gate, "#facc15", label, "pin", size, "#0b1220");
+          }
+          if (
+            Number.isFinite(entry.predShort)
+            && Number.isFinite(entry.dirShort)
+            && entry.predShort >= entry.predThreshold
+            && entry.dirShort >= entry.dirThreshold
+          ) {
+            const strength = Math.min(
+              strengthRatio(entry.predShort, entry.predThreshold),
+              strengthRatio(entry.dirShort, entry.dirThreshold)
+            );
+            const size = 18 + Math.round(strength * 12);
+            const label = `GS ${entry.predShort.toFixed(2)}`;
+            pushMarker(time, pos.short.gate, "#f97316", label, "pin", size, "#0b1220");
+          }
+        }
+      });
+    } else {
+      const gateEnabled = Number.isFinite(dirThreshold) && Number.isFinite(dirAggressive);
+      if (predTime && Number.isFinite(predThreshold)) {
+        const basePrice = resolveMarkerPrice(predTime, resolveLivePrice(data));
+        if (basePrice > 0) {
+          const pos = cuePositions(basePrice);
+          if (Number.isFinite(predLong) && predLong >= predThreshold) {
+            const strength = strengthRatio(predLong, predThreshold);
+            const size = 14 + Math.round(strength * 12);
+            const label = `PL ${predLong.toFixed(2)}`;
+            pushMarker(predTime, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220");
+          }
+          if (Number.isFinite(predShort) && predShort >= predThreshold) {
+            const strength = strengthRatio(predShort, predThreshold);
+            const size = 14 + Math.round(strength * 12);
+            const label = `PS ${predShort.toFixed(2)}`;
+            pushMarker(predTime, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220");
+          }
         }
       }
-    }
 
-    if (dirTime && Number.isFinite(dirThreshold)) {
-      const basePrice = resolveMarkerPrice(dirTime, resolveLivePrice(data));
-      if (basePrice > 0) {
-        const pos = cuePositions(basePrice);
-        if (Number.isFinite(dirLong) && dirLong >= dirThreshold) {
-          const strength = strengthRatio(dirLong, dirThreshold);
-          const aggressive = Number.isFinite(dirAggressive) && dirLong >= dirAggressive;
-          const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
-          const label = `${aggressive ? "AGG " : ""}DL ${dirLong.toFixed(2)}`;
-          const color = aggressive ? "#0ea5e9" : "#38bdf8";
-          pushMarker(dirTime, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
-        }
-        if (Number.isFinite(dirShort) && dirShort >= dirThreshold) {
-          const strength = strengthRatio(dirShort, dirThreshold);
-          const aggressive = Number.isFinite(dirAggressive) && dirShort >= dirAggressive;
-          const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
-          const label = `${aggressive ? "AGG " : ""}DS ${dirShort.toFixed(2)}`;
-          const color = aggressive ? "#ec4899" : "#f472b6";
-          pushMarker(dirTime, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+      if (dirTime && Number.isFinite(dirThreshold)) {
+        const basePrice = resolveMarkerPrice(dirTime, resolveLivePrice(data));
+        if (basePrice > 0) {
+          const pos = cuePositions(basePrice);
+          if (Number.isFinite(dirLong) && dirLong >= dirThreshold) {
+            const strength = strengthRatio(dirLong, dirThreshold);
+            const aggressive = Number.isFinite(dirAggressive) && dirLong >= dirAggressive;
+            const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
+            const label = `${aggressive ? "AGG " : ""}DL ${dirLong.toFixed(2)}`;
+            const color = aggressive ? "#0ea5e9" : "#38bdf8";
+            pushMarker(dirTime, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+          }
+          if (Number.isFinite(dirShort) && dirShort >= dirThreshold) {
+            const strength = strengthRatio(dirShort, dirThreshold);
+            const aggressive = Number.isFinite(dirAggressive) && dirShort >= dirAggressive;
+            const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
+            const label = `${aggressive ? "AGG " : ""}DS ${dirShort.toFixed(2)}`;
+            const color = aggressive ? "#ec4899" : "#f472b6";
+            pushMarker(dirTime, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+          }
         }
       }
-    }
 
-    if (predTime && Number.isFinite(predThreshold) && gateEnabled) {
-      const basePrice = resolveMarkerPrice(predTime, resolveLivePrice(data));
-      if (basePrice > 0) {
-        const pos = cuePositions(basePrice);
-        if (Number.isFinite(predLong) && Number.isFinite(dirLong) && predLong >= predThreshold && dirLong >= dirThreshold) {
-          const strength = Math.min(strengthRatio(predLong, predThreshold), strengthRatio(dirLong, dirThreshold));
-          const size = 18 + Math.round(strength * 12);
-          const label = `GL ${predLong.toFixed(2)}`;
-          pushMarker(predTime, pos.long.gate, "#facc15", label, "pin", size, "#0b1220");
-        }
-        if (Number.isFinite(predShort) && Number.isFinite(dirShort) && predShort >= predThreshold && dirShort >= dirThreshold) {
-          const strength = Math.min(strengthRatio(predShort, predThreshold), strengthRatio(dirShort, dirThreshold));
-          const size = 18 + Math.round(strength * 12);
-          const label = `GS ${predShort.toFixed(2)}`;
-          pushMarker(predTime, pos.short.gate, "#f97316", label, "pin", size, "#0b1220");
+      if (predTime && Number.isFinite(predThreshold) && gateEnabled) {
+        const basePrice = resolveMarkerPrice(predTime, resolveLivePrice(data));
+        if (basePrice > 0) {
+          const pos = cuePositions(basePrice);
+          if (Number.isFinite(predLong) && Number.isFinite(dirLong) && predLong >= predThreshold && dirLong >= dirThreshold) {
+            const strength = Math.min(strengthRatio(predLong, predThreshold), strengthRatio(dirLong, dirThreshold));
+            const size = 18 + Math.round(strength * 12);
+            const label = `GL ${predLong.toFixed(2)}`;
+            pushMarker(predTime, pos.long.gate, "#facc15", label, "pin", size, "#0b1220");
+          }
+          if (Number.isFinite(predShort) && Number.isFinite(dirShort) && predShort >= predThreshold && dirShort >= dirThreshold) {
+            const strength = Math.min(strengthRatio(predShort, predThreshold), strengthRatio(dirShort, dirThreshold));
+            const size = 18 + Math.round(strength * 12);
+            const label = `GS ${predShort.toFixed(2)}`;
+            pushMarker(predTime, pos.short.gate, "#f97316", label, "pin", size, "#0b1220");
+          }
         }
       }
     }
@@ -2998,9 +3158,16 @@ EXTRA_SCRIPT = """
       updateLivePriceLine(resolveLivePrice(data));
       if (!chartTimer) {
         fetchChartHistory(true);
-        chartTimer = setInterval(fetchChartHistory, 10000);
+        fetchDirectionHistory(true);
+        chartTimer = setInterval(() => {
+          fetchChartHistory();
+          fetchDirectionHistory();
+        }, 10000);
       } else if (keyChanged) {
-        fetchChartHistory(!restored);
+        if (!restored || !chartFullCandles.length) {
+          fetchChartHistory(true);
+        }
+        fetchDirectionHistory(true);
       }
     });
   }
@@ -3009,6 +3176,7 @@ EXTRA_SCRIPT = """
     loadChartLib(() => {
       initChart();
       fetchChartHistory(!chartFullCandles.length);
+      fetchDirectionHistory(true);
     });
   };
 
@@ -3543,10 +3711,30 @@ class MetricsHandler(BaseHTTPRequestHandler):
             latest = read_latest(file_map[entry_key])
             symbol = resolve_latest_symbol(latest, entry_key)
             key_candles = self.metrics_dir / f"data_history_{entry_key}.csv"
-            if key_candles.exists() and key_candles.stat().st_size > 0:
+            symbol_candles = self.metrics_dir / f"data_history_{symbol}.csv"
+            key_exists = key_candles.exists() and key_candles.stat().st_size > 0
+            symbol_exists = symbol_candles.exists() and symbol_candles.stat().st_size > 0
+            if key_exists and symbol_exists:
+                key_last = latest_bar_time_from_csv(key_candles)
+                symbol_last = latest_bar_time_from_csv(symbol_candles)
+                if key_last and symbol_last:
+                    candles_path = symbol_candles if symbol_last >= key_last else key_candles
+                elif symbol_last:
+                    candles_path = symbol_candles
+                elif key_last:
+                    candles_path = key_candles
+                else:
+                    try:
+                        key_mtime = key_candles.stat().st_mtime
+                        symbol_mtime = symbol_candles.stat().st_mtime
+                    except Exception:
+                        key_mtime = 0.0
+                        symbol_mtime = 0.0
+                    candles_path = symbol_candles if symbol_mtime >= key_mtime else key_candles
+            elif key_exists:
                 candles_path = key_candles
             else:
-                candles_path = self.metrics_dir / f"data_history_{symbol}.csv"
+                candles_path = symbol_candles
             rows = tail_csv_dicts(candles_path, limit=limit, max_bytes=max_bytes)
             candles = []
             for row in rows:

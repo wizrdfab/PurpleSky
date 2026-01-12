@@ -734,7 +734,10 @@
       signalLastCandleFetch: 0,
       signalZoom: null,
       signalZoomActive: false,
-      signalZoomBound: false
+      signalZoomBound: false,
+      signalCache: {},
+      directionHistory: [],
+      directionKey: null
     };
 
     function sparkline(canvas, values, color) {
@@ -1598,6 +1601,94 @@
       const visibleSignals = focusId ? signals.filter(sig => sig.id === focusId) : signals;
       const longPoints = [];
       const shortPoints = [];
+      const directionPoints = [];
+      const normalizeBarTime = (value) => {
+        const num = Number(value || 0);
+        if (!Number.isFinite(num) || num <= 0) return null;
+        return num > 1e12 ? Math.floor(num / 1000) : Math.floor(num);
+      };
+      const findBarIndex = (barTime) => {
+        if (!barTime || !candles.length) return null;
+        if (indexMap.has(barTime)) return indexMap.get(barTime);
+        for (let i = candles.length - 1; i >= 0; i--) {
+          if (candles[i].time <= barTime) return i;
+        }
+        return null;
+      };
+      const addDirectionPoint = (side, pred, threshold, aggressiveThreshold, barTime) => {
+        if (!Number.isFinite(pred) || !Number.isFinite(threshold)) return;
+        const aggressiveOk = Number.isFinite(aggressiveThreshold);
+        const aggressive = aggressiveOk && pred >= aggressiveThreshold;
+        const normal = pred >= threshold;
+        if (!normal && !aggressive) return;
+        const idx = findBarIndex(barTime);
+        if (idx === null || idx === undefined) return;
+        const candle = candles[idx] || {};
+        const basePrice = Number(candle.close || candle.open || 0);
+        if (!Number.isFinite(basePrice) || basePrice <= 0) return;
+        const offset = basePrice * 0.0015;
+        const price = side === "short" ? basePrice - offset : basePrice + offset;
+        const baseThreshold = aggressive && aggressiveOk ? aggressiveThreshold : threshold;
+        const span = Number.isFinite(baseThreshold) ? Math.max(0.0001, 1 - baseThreshold) : 1;
+        const strength = Number.isFinite(baseThreshold) ? Math.max(0, Math.min(1, (pred - baseThreshold) / span)) : 0;
+        const size = 10 + Math.round(strength * 10) + (aggressive ? 8 : 0);
+        const color = aggressive
+          ? (side === "short" ? "#ec4899" : "#0ea5e9")
+          : (side === "short" ? "#f472b6" : "#38bdf8");
+        directionPoints.push({
+          value: [idx, price],
+          direction: {
+            side,
+            pred,
+            aggressive
+          },
+          symbol: aggressive ? "diamond" : "circle",
+          symbolSize: size,
+          itemStyle: {
+            color
+          }
+        });
+      };
+
+      const directionHistory = (state.directionKey === state.signalKey) ? (state.directionHistory || []) : [];
+      const dirEntries = new Map();
+      const recordDirection = (barTime, payload, tsMs) => {
+        if (!barTime) return;
+        const existing = dirEntries.get(barTime);
+        if (!existing || (tsMs && tsMs >= (existing.tsMs || 0))) {
+          dirEntries.set(barTime, { ...payload, barTime, tsMs: tsMs || 0 });
+        }
+      };
+
+      if (Array.isArray(directionHistory) && directionHistory.length) {
+        directionHistory.forEach(item => {
+          const dir = item && item.direction ? item.direction : {};
+          if (!dir) return;
+          const barTime = normalizeBarTime(dir.bar_time || item.market?.last_bar_time || item.bar_time);
+          const tsMs = item.ts ? (parseTs(String(item.ts)) || 0) : 0;
+          recordDirection(barTime, {
+            predLong: Number(dir.pred_long),
+            predShort: Number(dir.pred_short),
+            threshold: Number(dir.threshold),
+            aggressiveThreshold: Number(dir.aggressive_threshold)
+          }, tsMs);
+        });
+      } else {
+        const latestItem = state.latestMap ? state.latestMap[state.selected] : null;
+        const direction = latestItem && latestItem.direction ? latestItem.direction : {};
+        const barTime = normalizeBarTime(direction.bar_time);
+        recordDirection(barTime, {
+          predLong: Number(direction.pred_long),
+          predShort: Number(direction.pred_short),
+          threshold: Number(direction.threshold),
+          aggressiveThreshold: Number(direction.aggressive_threshold)
+        }, 0);
+      }
+
+      dirEntries.forEach(entry => {
+        addDirectionPoint("long", entry.predLong, entry.threshold, entry.aggressiveThreshold, entry.barTime);
+        addDirectionPoint("short", entry.predShort, entry.threshold, entry.aggressiveThreshold, entry.barTime);
+      });
       visibleSignals.forEach(sig => {
         const idx = indexMap.get(sig.bar_time);
         if (idx === undefined) return;
@@ -1654,6 +1745,7 @@
             let header = "";
             let candleInfo = "";
             let signalInfo = "";
+            let directionInfo = "";
             items.forEach(item => {
               if (item.seriesType === "candlestick") {
                 header = item.name || "";
@@ -1669,8 +1761,13 @@
                   `Time: ${formatSignalTime(sig)}`
                 ].join("<br/>");
               }
+              if (item.data && item.data.direction) {
+                const dir = item.data.direction;
+                const tag = dir.aggressive ? "AGG" : "DIR";
+                directionInfo = `${tag} ${signalSideLabel(dir.side)} (${fmt(dir.pred, 3)})`;
+              }
             });
-            return [header, candleInfo, signalInfo].filter(Boolean).join("<br/>");
+            return [header, candleInfo, signalInfo, directionInfo].filter(Boolean).join("<br/>");
           }
         },
         xAxis: {
@@ -1718,6 +1815,15 @@
               },
               data: markLineData
             } : undefined
+          },
+          {
+            name: "Direction",
+            type: "scatter",
+            data: directionPoints,
+            symbol: "circle",
+            symbolSize: (val, params) => (params && params.data && params.data.symbolSize) ? params.data.symbolSize : 10,
+            itemStyle: { color: "#38bdf8" },
+            label: { show: false }
           },
           {
             name: "Signal Long",
@@ -1831,6 +1937,7 @@
       if (!resp.ok) return;
       const data = await resp.json();
       state.signalHistory = normalizeSignals(data || []);
+      syncSignalCache();
       renderSignalList();
       if (state.signalCandles && state.signalCandles.length) {
         renderSignalChart();
@@ -1843,24 +1950,72 @@
       if (!resp.ok) return;
       const payload = await resp.json();
       state.signalCandles = normalizeCandles(payload);
+      syncSignalCache();
       renderSignalChart();
+    }
+
+    function stashSignalCache(key) {
+      if (!key) return;
+      state.signalCache[key] = {
+        signalHistory: Array.isArray(state.signalHistory) ? [...state.signalHistory] : [],
+        signalCandles: Array.isArray(state.signalCandles) ? [...state.signalCandles] : [],
+        signalFocusId: state.signalFocusId,
+        signalZoom: state.signalZoom ? { ...state.signalZoom } : null,
+        signalZoomActive: state.signalZoomActive,
+        signalZoomBound: state.signalZoomBound,
+        signalLastCandleFetch: state.signalLastCandleFetch,
+        directionHistory: Array.isArray(state.directionHistory) ? [...state.directionHistory] : [],
+        directionKey: state.directionKey
+      };
+    }
+
+    function restoreSignalCache(key) {
+      if (!key) return false;
+      const cached = state.signalCache[key];
+      if (!cached) return false;
+      state.signalHistory = cached.signalHistory || [];
+      state.signalCandles = cached.signalCandles || [];
+      state.signalFocusId = cached.signalFocusId || null;
+      state.signalZoom = cached.signalZoom || null;
+      state.signalZoomActive = Boolean(cached.signalZoomActive);
+      state.signalZoomBound = Boolean(cached.signalZoomBound);
+      state.signalLastCandleFetch = cached.signalLastCandleFetch || 0;
+      state.directionHistory = cached.directionHistory || [];
+      state.directionKey = cached.directionKey || key;
+      return true;
+    }
+
+    function syncSignalCache() {
+      if (!state.signalKey) return;
+      stashSignalCache(state.signalKey);
     }
 
     function refreshSignals(key, symbol) {
       if (!key) return;
       if (state.signalKey !== key) {
+        if (state.signalKey) {
+          stashSignalCache(state.signalKey);
+        }
         state.signalKey = key;
         state.signalSymbol = symbol || key;
-        state.signalFocusId = null;
-        state.signalCandles = [];
-        state.signalHistory = [];
-        state.signalZoom = null;
-        state.signalZoomActive = false;
-        if (state.signalChart) {
-          state.signalChart.clear();
+        const restored = restoreSignalCache(key);
+        if (!restored) {
+          state.signalFocusId = null;
+          state.signalCandles = [];
+          state.signalHistory = [];
+          state.signalZoom = null;
+          state.signalZoomActive = false;
+          state.signalZoomBound = false;
+          state.directionHistory = [];
+          state.directionKey = null;
+          if (state.signalChart) {
+            state.signalChart.clear();
+          }
+          const sub = document.getElementById("signalSub");
+          if (sub) sub.textContent = "Loading candle data...";
+        } else {
+          renderSignalChart();
         }
-        const sub = document.getElementById("signalSub");
-        if (sub) sub.textContent = "Loading candle data...";
       }
       const now = Date.now();
       if (!state.signalLastCandleFetch || (now - state.signalLastCandleFetch) > 20000) {
@@ -2058,6 +2213,11 @@
       const resp = await fetch(`/api/metrics?key=${encodeURIComponent(key)}&limit=200`);
       if (!resp.ok) return;
       const data = await resp.json();
+      if (Array.isArray(data)) {
+        state.directionHistory = data;
+        state.directionKey = key;
+        syncSignalCache();
+      }
       const equity = data.map(x => Number(x.equity || 0));
       const latency = data.map(x => Number(x.latency?.rest_avg_ms || 0));
       sparkline(document.getElementById("equityChart"), equity, "#22c55e");

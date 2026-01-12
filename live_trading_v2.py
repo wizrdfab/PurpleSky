@@ -981,6 +981,19 @@ class SafeExchange:
             side, price, qty, tp, sl, reduce_only, position_idx, order_link_id
         )
 
+    def place_market_order(
+        self,
+        side: str,
+        qty: float,
+        reduce_only: bool = False,
+        position_idx: Optional[int] = None,
+        order_link_id: Optional[str] = None,
+    ) -> Dict:
+        return self._call(
+            "place_market_order",
+            self.exchange.place_market_order,
+            side, qty, reduce_only, position_idx, order_link_id,
+        )
 
     def fetch_recent_trades(self, limit: int) -> pd.DataFrame:
         return self._call("fetch_recent_trades", self.exchange.fetch_recent_trades, limit)
@@ -1144,6 +1157,7 @@ class LiveTradingV2:
 
         self.tf_seconds = timeframe_to_seconds(self.config.features.base_timeframe)
         self.window_size = args.window
+        self.history_writer = args.history_writer
         self.poll_trades_sec = args.trade_poll_sec
         self.poll_ob_sec = args.ob_poll_sec
         self.reconcile_sec = args.reconcile_sec
@@ -1218,6 +1232,8 @@ class LiveTradingV2:
         self.ws_private_equity: Optional[float] = None
         self.ws_trade_last_ingest_ts = 0.0
         self.ws_ob_last_ingest_ts = 0.0
+        self.ws_restart_cooldown_sec = max(self.data_lag_error, 30.0)
+        self.ws_last_restart_ts = 0.0
         self.api_key: Optional[str] = None
         self.api_secret: Optional[str] = None
         self.start_time = time.time()
@@ -1233,8 +1249,8 @@ class LiveTradingV2:
         self.last_health: Optional[str] = None
         self.last_prediction: Dict[str, object] = {}
         self.last_direction: Dict[str, object] = {}
-        self.direction_gate_signals = False
-        self.direction_threshold_set = False
+        self.direction_gate_signals = True
+        self.direction_threshold_set = True
         self.aggressive_threshold_set = False
         self.last_signal: Dict[str, object] = {}
         self.last_feature_vector: Optional[Dict[str, object]] = None
@@ -1468,7 +1484,7 @@ class LiveTradingV2:
             self.logger.error(f"Failed to load params.json: {exc}")
             return
 
-        self.direction_threshold_set = "direction_threshold" in params
+        self.direction_threshold_set = True
         self.aggressive_threshold_set = "aggressive_threshold" in params
 
         self.config.strategy.base_limit_offset_atr = safe_float(params.get("limit_offset_atr"), self.config.strategy.base_limit_offset_atr)
@@ -1485,7 +1501,7 @@ class LiveTradingV2:
                 params.get("aggressive_threshold"),
                 self.config.model.aggressive_threshold,
             )
-        self.direction_gate_signals = self.direction_threshold_set and self.aggressive_threshold_set
+        self.direction_gate_signals = self.direction_threshold_set
         self._validate_model_metadata(params)
 
     def _validate_model_metadata(self, params: Dict) -> None:
@@ -2213,10 +2229,56 @@ class LiveTradingV2:
         except Exception as exc:
             self.logger.error(f"Failed to load history: {exc}")
 
+    def _latest_history_bar_time(self) -> int:
+        path = self.history_path
+        try:
+            if not path.exists() or path.stat().st_size <= 0:
+                return 0
+        except Exception:
+            return 0
+        try:
+            size = path.stat().st_size
+        except Exception:
+            return 0
+        block = min(size, 64 * 1024)
+        try:
+            with open(path, "rb") as f:
+                if size > block:
+                    f.seek(-block, os.SEEK_END)
+                data = f.read(block)
+        except Exception:
+            return 0
+        lines = data.splitlines()
+        if size > block and lines:
+            lines = lines[1:]
+        for raw in reversed(lines):
+            try:
+                text = raw.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            if not text or text.startswith("bar_time"):
+                continue
+            parts = text.split(",", 1)
+            if not parts:
+                continue
+            try:
+                return int(float(parts[0]))
+            except Exception:
+                continue
+        return 0
+
     def _save_history(self) -> None:
+        if not self.history_writer:
+            return
         if self.bar_window.bars.empty:
             return
         try:
+            latest_bar = self.bar_window.latest_bar_time()
+            if latest_bar is None:
+                return
+            disk_bar = self._latest_history_bar_time()
+            if disk_bar >= latest_bar:
+                return
             save_df = self.bar_window.bars.tail(self.window_size).copy()
             save_df = save_df.drop_duplicates(subset=["bar_time"], keep="last").sort_values("bar_time")
             save_df.to_csv(self.history_path, index=False)
@@ -2693,6 +2755,38 @@ class LiveTradingV2:
             self.logger.error(f"Failed to start private WebSocket: {exc}")
             self.use_ws_private = False
             self.ws_private = None
+
+    def _restart_websockets(self, reason: str) -> None:
+        if not (self.use_ws_trades or self.use_ws_ob or self.use_ws_private):
+            return
+        now = time.time()
+        if now - self.ws_last_restart_ts < self.ws_restart_cooldown_sec:
+            return
+        self.ws_last_restart_ts = now
+        self.logger.warning(f"Restarting WebSocket streams ({reason}).")
+        if self.ws is not None:
+            try:
+                if hasattr(self.ws, "exit"):
+                    self.ws.exit()
+            except Exception as exc:
+                self.logger.warning(f"WS exit failed: {exc}")
+        if self.ws_private is not None:
+            try:
+                if hasattr(self.ws_private, "exit"):
+                    self.ws_private.exit()
+            except Exception as exc:
+                self.logger.warning(f"WS private exit failed: {exc}")
+        self.ws = None
+        self.ws_private = None
+        self.ws_trade_queue.clear()
+        self.ws_ob_queue.clear()
+        self.ws_ob_book = {"b": {}, "a": {}}
+        self.ws_ob_initialized = False
+        self.ws_trade_last_ts = 0.0
+        self.ws_ob_last_ts = 0.0
+        self.ws_trade_last_ingest_ts = 0.0
+        self.ws_ob_last_ingest_ts = 0.0
+        self._init_websockets()
 
     def _on_ws_trade(self, message: Dict) -> None:
         data = message.get("data", [])
@@ -3310,6 +3404,7 @@ class LiveTradingV2:
             f"Tick Size: {self.instrument.tick_size} | Min Notional: {self.instrument.min_notional}"
         )
         self.logger.info(f"History File: {self.history_path}")
+        self.logger.info(f"History Writer: {self.history_writer}")
         self.logger.info("=" * 60)
 
     def _filter_new_trades(self, trades_df: pd.DataFrame) -> List[Dict]:
@@ -3691,10 +3786,16 @@ class LiveTradingV2:
         self.state.state["metrics"] = metrics
         self.logger.info(f"Closed PnL update: {total_pnl:.4f} ({len(new_records)} fills)")
 
-    def _compute_tp_sl_targets(self, side: str, entry_price: float, atr: float) -> Tuple[float, float]:
+    def _compute_tp_sl_targets(
+        self,
+        side: str,
+        entry_price: float,
+        atr: float,
+        tp_mult: float = 1.0,
+    ) -> Tuple[float, float]:
         if entry_price <= 0 or atr <= 0:
             return 0.0, 0.0
-        tp_atr = self.config.strategy.take_profit_atr
+        tp_atr = self.config.strategy.take_profit_atr * max(tp_mult, 0.0)
         sl_atr = self.config.strategy.stop_loss_atr
         tick = self.instrument.tick_size
 
@@ -3740,8 +3841,11 @@ class LiveTradingV2:
             atr = safe_float(intent.get("atr_at_entry"))
             tp = safe_float(intent.get("tp"))
             sl = safe_float(intent.get("sl"))
+            tp_mult = safe_float(intent.get("tp_mult"), 1.0)
+            if tp_mult <= 0:
+                tp_mult = 1.0
             if atr > 0 and entry_price > 0:
-                tp, sl = self._compute_tp_sl_targets(side, entry_price, atr)
+                tp, sl = self._compute_tp_sl_targets(side, entry_price, atr, tp_mult=tp_mult)
             if tp > 0:
                 pos["tp_target"] = tp
             if sl > 0:
@@ -4252,8 +4356,6 @@ class LiveTradingV2:
                 pos = positions.get(key, {})
                 if not pos:
                     continue
-                if not safe_bool(pos.get("entry_verified")):
-                    continue
                 entry_bar = pos.get("entry_bar_time")
                 if entry_bar is None:
                     continue
@@ -4279,8 +4381,6 @@ class LiveTradingV2:
 
         pos = self.state.state.get("position", {})
         if not pos:
-            return
-        if not safe_bool(pos.get("entry_verified")):
             return
         entry_bar = pos.get("entry_bar_time")
         if entry_bar is None:
@@ -4405,16 +4505,9 @@ class LiveTradingV2:
         else:
             self.last_signal = {}
 
-    def _place_order(self, side: str, latest_row: pd.Series, equity: float) -> Optional[str]:
-        atr = safe_float(latest_row.get("atr"))
-        close = safe_float(latest_row.get("close"))
-        if atr <= 0 or close <= 0:
-            return None
-
-        price = self._calc_entry_price(side, close, atr)
-        if price <= 0:
-            return None
-
+    def _calc_order_qty(self, price: float, atr: float, equity: float) -> float:
+        if price <= 0 or atr <= 0 or equity <= 0:
+            return 0.0
         stop_dist = atr * self.config.strategy.stop_loss_atr
         risk_dollars = equity * self.config.strategy.risk_per_trade
         qty = risk_dollars / stop_dist if stop_dist > 0 else 0.0
@@ -4447,7 +4540,7 @@ class LiveTradingV2:
 
         if max_qty_allowed > 0 and min_qty_req > max_qty_allowed:
             self.logger.warning("Min size exceeds max allowed; order blocked.")
-            return None
+            return 0.0
 
         if max_qty_allowed > 0 and qty > max_qty_allowed:
             if max_qty_allowed >= min_qty_req:
@@ -4469,10 +4562,24 @@ class LiveTradingV2:
                     self.logger.warning("Min size exceeds max cap after rounding; using min size.")
                     qty = round_up(min_qty_req, qty_step)
 
-        # Final guard
         if qty <= 0:
             self.logger.warning("Qty quantized to 0; order blocked.")
-            return None      	
+            return 0.0
+        return qty
+
+    def _place_order(self, side: str, latest_row: pd.Series, equity: float) -> Optional[str]:
+        atr = safe_float(latest_row.get("atr"))
+        close = safe_float(latest_row.get("close"))
+        if atr <= 0 or close <= 0:
+            return None
+
+        price = self._calc_entry_price(side, close, atr)
+        if price <= 0:
+            return None
+
+        qty = self._calc_order_qty(price, atr, equity)
+        if qty <= 0:
+            return None
         
         self.logger.info(f"Placing {side} limit: price={price:.6f} qty={qty:.6f}")
         if self.dry_run:
@@ -4584,6 +4691,68 @@ class LiveTradingV2:
             "tp": tp,
             "sl": sl,
             "atr_at_entry": atr,
+            "created_bar_time": self.state.state.get("last_bar_time"),
+            "created_ts": utc_now_str(),
+        }
+        self.state.state["entry_intent"] = intents
+        self.state.save()
+
+        return order_id
+
+    def _place_market_order(
+        self,
+        side: str,
+        latest_row: pd.Series,
+        equity: float,
+        tp_mult: float = 1.0,
+    ) -> Optional[str]:
+        atr = safe_float(latest_row.get("atr"))
+        close = safe_float(latest_row.get("close"))
+        if atr <= 0 or close <= 0:
+            return None
+
+        price = close
+        qty = self._calc_order_qty(price, atr, equity)
+        if qty <= 0:
+            return None
+
+        tp, sl = self._compute_tp_sl_targets(side, price, atr, tp_mult=tp_mult)
+        self.logger.info(f"Aggressive {side} market: price={price:.6f} qty={qty:.6f} tp={tp:.6f} sl={sl:.6f}")
+        if self.dry_run:
+            return "dry_run"
+
+        order_link_id = self._new_order_link_id("A", side)
+        position_idx = 1 if self.hedge_mode and side == "Buy" else 2 if self.hedge_mode else None
+        resp = self.api.place_market_order(
+            side,
+            qty,
+            reduce_only=False,
+            position_idx=position_idx,
+            order_link_id=order_link_id,
+        )
+        if resp is None:
+            self.logger.error("place_market_order returned None (exception / transport failure).")
+            return None
+
+        ret_code = resp.get("retCode")
+        ret_msg = resp.get("retMsg")
+        if ret_code != 0:
+            self.logger.error(f"Bybit rejected market order: retCode={ret_code} retMsg={ret_msg}")
+            self.api.record_error(f"Market order rejected: {ret_msg}", status_code=ret_code)
+            return None
+
+        order_id = (resp.get("result") or {}).get("orderId")
+        intents = self._entry_intents()
+        intents[side] = {
+            "order_id": order_id,
+            "order_link_id": order_link_id,
+            "price": price,
+            "qty": qty,
+            "tp": tp,
+            "sl": sl,
+            "atr_at_entry": atr,
+            "tp_mult": tp_mult,
+            "aggressive": True,
             "created_bar_time": self.state.state.get("last_bar_time"),
             "created_ts": utc_now_str(),
         }
@@ -4881,6 +5050,13 @@ class LiveTradingV2:
             has_long = long_size > 0
             has_short = short_size > 0
             has_position = has_long or has_short
+            max_positions = safe_int(self.config.strategy.max_positions, 1)
+            if max_positions <= 0:
+                max_positions = 1
+            if self.hedge_mode:
+                position_count = (1 if has_long else 0) + (1 if has_short else 0)
+            else:
+                position_count = 1 if has_position else 0
             daily_pnl = safe_float(self.state.state.get("daily", {}).get("realized_pnl"))
             drawdown_limit = -equity * self.config.live.max_daily_drawdown_pct
             if daily_pnl < drawdown_limit:
@@ -4923,7 +5099,8 @@ class LiveTradingV2:
                     if self.state.state.get("active_orders"):
                         self._cancel_active_orders("position_open")
                     self._ensure_tp_sl(latest)
-                return
+                if not self.hedge_mode or position_count >= max_positions:
+                    return
 
             if external_present:
                 self.logger.warning("External position present. Pausing new entries.")
@@ -4941,15 +5118,47 @@ class LiveTradingV2:
             has_buy = any(info.get("side") == "Buy" for info in orders.values())
             has_sell = any(info.get("side") == "Sell" for info in orders.values())
 
+            aggressive_long = False
+            aggressive_short = False
+            if self.aggressive_threshold_set and aggressive_threshold is not None and dir_source != "pass":
+                aggressive_long = dir_pred_long > aggressive_threshold
+                aggressive_short = dir_pred_short > aggressive_threshold
+
+            if aggressive_long or aggressive_short:
+                if not self.hedge_mode and aggressive_long and aggressive_short:
+                    if dir_pred_long >= dir_pred_short:
+                        aggressive_short = False
+                    else:
+                        aggressive_long = False
+                if has_long:
+                    aggressive_long = False
+                if has_short:
+                    aggressive_short = False
+                sides = []
+                if aggressive_long:
+                    sides.append("Buy")
+                if aggressive_short:
+                    sides.append("Sell")
+                if sides:
+                    self._cancel_orders_for_sides(sides, "aggressive_override")
+                if aggressive_long:
+                    self._place_market_order("Buy", latest, equity, tp_mult=10.0)
+                if aggressive_short:
+                    self._place_market_order("Sell", latest, equity, tp_mult=10.0)
+                self.last_regime = regime
+                self.last_sentiment = sentiment
+                self.last_health = self.health.check_health()
+                return
+
             long_ok = True
             short_ok = True
             if gate_signals and dir_threshold is not None:
                 long_ok = dir_pred_long > dir_threshold
                 short_ok = dir_pred_short > dir_threshold
 
-            if pred_long > threshold and long_ok and not has_buy:
+            if pred_long > threshold and long_ok and not has_buy and not has_long:
                 self._place_order("Buy", latest, equity)
-            if pred_short > threshold and short_ok and not has_sell:
+            if pred_short > threshold and short_ok and not has_sell and not has_short:
                 self._place_order("Sell", latest, equity)
             self.last_regime = regime
             self.last_sentiment = sentiment
@@ -5271,8 +5480,16 @@ class LiveTradingV2:
                         snapshot = self._drain_ws_orderbook()
                         if snapshot:
                             self.bar_window.ingest_orderbook(snapshot)
-                        elif self.ws_ob_last_ts > 0 and (now - self.ws_ob_last_ts) > self.data_lag_warn:
-                            self.logger.warning("WS orderbook stream lagging.")
+                        else:
+                            ob_lag = (now - self.ws_ob_last_ts) if self.ws_ob_last_ts > 0 else None
+                            if ob_lag is not None and ob_lag > self.data_lag_error:
+                                self.logger.warning("WS orderbook stale; fetching REST snapshot.")
+                                ob = self.api.fetch_orderbook(limit=self.config.data.ob_levels)
+                                if isinstance(ob, dict) and ob:
+                                    self.bar_window.ingest_orderbook(ob)
+                                self._restart_websockets("orderbook_lag")
+                            elif ob_lag is not None and ob_lag > self.data_lag_warn:
+                                self.logger.warning("WS orderbook stream lagging.")
                     else:
                         ob = self.api.fetch_orderbook(limit=self.config.data.ob_levels)
                         if isinstance(ob, dict) and ob:
@@ -5283,6 +5500,13 @@ class LiveTradingV2:
                     new_trades: List[Dict] = []
                     if self.use_ws_trades:
                         new_trades = self._drain_ws_trades()
+                        trade_lag = (now - self.ws_trade_last_ts) if self.ws_trade_last_ts > 0 else None
+                        if (not new_trades) and trade_lag is not None and trade_lag > self.data_lag_error:
+                            self.logger.warning("WS trade stream stale; fetching REST trades.")
+                            trades_df = self.api.fetch_recent_trades(limit=1000)
+                            if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                                new_trades = self._filter_new_trades(trades_df)
+                            self._restart_websockets("trade_lag")
                     else:
                         trades_df = self.api.fetch_recent_trades(limit=1000)
                         if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
@@ -5391,6 +5615,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-z-window", type=int, default=DEFAULT_FEATURE_Z_WINDOW)
     parser.add_argument("--feature-z-threshold", type=float, default=DEFAULT_FEATURE_Z_THRESHOLD)
     parser.add_argument("--bootstrap-klines-days", type=float, default=DEFAULT_BOOTSTRAP_KLINES_DAYS)
+    parser.add_argument(
+        "--history-writer",
+        dest="history_writer",
+        action="store_true",
+        help="Write shared history CSV (default).",
+    )
+    parser.add_argument(
+        "--no-history-writer",
+        dest="history_writer",
+        action="store_false",
+        help="Disable history CSV writes for this process.",
+    )
+    parser.set_defaults(history_writer=True)
     parser.add_argument(
         "--fast-bootstrap",
         action="store_true",
