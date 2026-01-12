@@ -2666,7 +2666,7 @@ EXTRA_SCRIPT = """
             pushMarker(time, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220");
           }
         }
-        if (Number.isFinite(entry.dirThreshold)) {
+        if (Number.isFinite(entry.dirThreshold) && Number.isFinite(entry.dirAggressive)) {
           if (Number.isFinite(entry.dirLong) && entry.dirLong >= entry.dirThreshold) {
             const strength = strengthRatio(entry.dirLong, entry.dirThreshold);
             const aggressive = Number.isFinite(entry.dirAggressive) && entry.dirLong >= entry.dirAggressive;
@@ -2737,7 +2737,7 @@ EXTRA_SCRIPT = """
         }
       }
 
-      if (dirTime && Number.isFinite(dirThreshold)) {
+      if (dirTime && Number.isFinite(dirThreshold) && Number.isFinite(dirAggressive)) {
         const basePrice = resolveMarkerPrice(dirTime, resolveLivePrice(data));
         if (basePrice > 0) {
           const pos = cuePositions(basePrice);

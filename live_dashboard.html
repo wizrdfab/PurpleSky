@@ -158,6 +158,28 @@
       margin-bottom: 10px;
       gap: 12px;
     }
+    .rename-controls {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .rename-input {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(148,163,184,0.25);
+      color: var(--text);
+      padding: 6px 10px;
+      border-radius: 10px;
+      font-size: 12px;
+      min-width: 200px;
+    }
+    .rename-input::placeholder { color: var(--muted); }
+    .rename-input:disabled,
+    .signal-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -574,6 +596,11 @@
         <div>
           <h2 id="detailTitle">Select a model</h2>
           <div class="sub" id="detailSub">No data loaded</div>
+          <div class="rename-controls">
+            <input class="rename-input" id="aliasInput" type="text" placeholder="Display name" autocomplete="off"/>
+            <button class="signal-btn" id="aliasSave">Save</button>
+            <button class="signal-btn" id="aliasClear">Reset</button>
+          </div>
         </div>
         <div class="pill" id="detailStatus">--</div>
       </div>
@@ -708,10 +735,34 @@
     const fmtPct = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}%`;
     const fmtSec = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}s`;
     const fmtMs = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}ms`;
+    const numOrNaN = (value) => {
+      if (value === null || value === undefined || value === "") return NaN;
+      const num = Number(value);
+      return Number.isFinite(num) ? num : NaN;
+    };
+    const ALIAS_STORAGE_KEY = "dash_aliases_v1";
+    const loadAliases = () => {
+      try {
+        const raw = localStorage.getItem(ALIAS_STORAGE_KEY);
+        if (!raw) return {};
+        const data = JSON.parse(raw);
+        return data && typeof data === "object" ? data : {};
+      } catch (err) {
+        return {};
+      }
+    };
+    const saveAliases = (aliases) => {
+      try {
+        localStorage.setItem(ALIAS_STORAGE_KEY, JSON.stringify(aliases || {}));
+      } catch (err) {
+        return;
+      }
+    };
 
     const state = {
       selected: null,
       selectedSymbol: null,
+      selectedLabel: null,
       latestMap: {},
       items: [],
       lastHistoryKey: null,
@@ -737,7 +788,8 @@
       signalZoomBound: false,
       signalCache: {},
       directionHistory: [],
-      directionKey: null
+      directionKey: null,
+      aliases: loadAliases()
     };
 
     function sparkline(canvas, values, color) {
@@ -835,12 +887,19 @@
       return { tp, sl };
     }
 
-    function computeSignalState(prediction) {
+    function computeSignalState(prediction, direction) {
       const predLong = Number(prediction?.pred_long || 0);
       const predShort = Number(prediction?.pred_short || 0);
       const threshold = Number(prediction?.threshold || 0);
-      const activeLong = predLong > threshold;
-      const activeShort = predShort > threshold;
+      const dirLong = Number(direction?.pred_long || 0);
+      const dirShort = Number(direction?.pred_short || 0);
+      const dirThreshold = numOrNaN(direction?.threshold);
+      const aggressiveThreshold = numOrNaN(direction?.aggressive_threshold);
+      const gateEnabled = Number.isFinite(dirThreshold) && Number.isFinite(aggressiveThreshold);
+      const longGateOk = !gateEnabled || dirLong > dirThreshold;
+      const shortGateOk = !gateEnabled || dirShort > dirThreshold;
+      const activeLong = predLong > threshold && longGateOk;
+      const activeShort = predShort > threshold && shortGateOk;
       let side = "";
       if (activeLong && activeShort) {
         side = "dual";
@@ -1118,6 +1177,57 @@
       return item.dash_key || item.symbol || null;
     }
 
+    function normalizeAlias(value) {
+      if (value === null || value === undefined) return "";
+      return String(value).trim();
+    }
+
+    function aliasForKey(key) {
+      if (!key) return "";
+      const alias = state.aliases ? state.aliases[key] : "";
+      return normalizeAlias(alias);
+    }
+
+    function displayNameFor(key, symbol) {
+      const alias = aliasForKey(key);
+      if (alias) return alias;
+      if (symbol) return symbol;
+      return key || "--";
+    }
+
+    function setAliasForKey(key, value) {
+      if (!key) return;
+      const alias = normalizeAlias(value);
+      if (!state.aliases) state.aliases = {};
+      if (alias) {
+        state.aliases[key] = alias;
+      } else {
+        delete state.aliases[key];
+      }
+      saveAliases(state.aliases);
+    }
+
+    function syncAliasControls(key, symbol) {
+      const input = document.getElementById("aliasInput");
+      const saveBtn = document.getElementById("aliasSave");
+      const clearBtn = document.getElementById("aliasClear");
+      if (!input || !saveBtn || !clearBtn) return;
+      const alias = aliasForKey(key);
+      const enabled = Boolean(key);
+      input.disabled = !enabled;
+      saveBtn.disabled = !enabled;
+      clearBtn.disabled = !enabled || !alias;
+      const currentKey = input.dataset.aliasKey || "";
+      const nextKey = key || "";
+      const isFocused = document.activeElement === input;
+      if (isFocused && currentKey === nextKey) {
+        return;
+      }
+      input.dataset.aliasKey = nextKey;
+      input.placeholder = symbol ? `Display name (${symbol})` : "Display name";
+      input.value = alias;
+    }
+
     function stripQuoteSymbol(symbol) {
       if (!symbol) return "";
       const upper = symbol.toUpperCase();
@@ -1182,8 +1292,9 @@
       entries.forEach(item => {
         const key = entryKey(item);
         const symbol = item.symbol || key || "--";
+        const displayName = displayNameFor(key, symbol);
         const card = document.createElement("div");
-        const signalState = computeSignalState(item.prediction || {});
+        const signalState = computeSignalState(item.prediction || {}, item.direction || {});
         const signalClasses = [];
         if (signalState.active) {
           signalClasses.push("signal-hot");
@@ -1201,7 +1312,10 @@
         const labelWrap = document.createElement("div");
         labelWrap.className = "summary-symbol";
         const label = document.createElement("span");
-        label.textContent = symbol;
+        label.textContent = displayName;
+        if (displayName !== symbol) {
+          label.title = symbol;
+        }
         labelWrap.appendChild(label);
         if (signalState.active) {
           const dot = document.createElement("span");
@@ -1306,7 +1420,7 @@
         tabChart.classList.remove("active");
         if (state.selected) {
           fetchHistory(state.selected);
-          refreshSignals(state.selected, state.selectedSymbol);
+          refreshSignals(state.selected, state.selectedLabel || state.selectedSymbol);
         }
       }
     }
@@ -1321,11 +1435,13 @@
     function selectSymbol(key) {
       state.selected = key;
       const item = key ? state.latestMap[key] : null;
-      state.selectedSymbol = item?.symbol || key || null;
+      const symbol = item?.symbol || key || null;
+      state.selectedSymbol = symbol;
+      state.selectedLabel = displayNameFor(key, symbol);
       renderSummary(state.items);
       if (key) {
         fetchHistory(key);
-        refreshSignals(key, state.selectedSymbol);
+        refreshSignals(key, state.selectedLabel || state.selectedSymbol);
       }
     }
 
@@ -1348,11 +1464,22 @@
       const model = data.model || {};
       const featureVector = data.feature_vector || {};
 
-      const keyTag = key !== symbol ? ` (${key})` : "";
+      const alias = aliasForKey(key);
+      const displayName = alias || symbol;
+      state.selectedLabel = displayName;
+      const tagParts = [];
+      if (alias && alias !== symbol) {
+        tagParts.push(symbol);
+      }
+      if (key && key !== symbol && key !== alias) {
+        tagParts.push(key);
+      }
+      const tagText = tagParts.length ? ` (${tagParts.join(" / ")})` : "";
       const modelText = modelLabel(data);
       const modelTag = modelText && modelText !== "--" ? ` | Model: ${modelText}` : "";
-      document.getElementById("detailTitle").textContent = `Selected: ${symbol}${keyTag}`;
+      document.getElementById("detailTitle").textContent = `Selected: ${displayName}${tagText}`;
       document.getElementById("detailSub").textContent = `Startup: ${data.startup_time || "--"} | Uptime: ${Math.round(data.uptime_sec || 0)}s | Last: ${data.ts || "--"}${modelTag}`;
+      syncAliasControls(key, symbol);
       const detailStatus = document.getElementById("detailStatus");
       if (data.signal_only) {
         detailStatus.textContent = "Signal Only";
@@ -1616,9 +1743,8 @@
         return null;
       };
       const addDirectionPoint = (side, pred, threshold, aggressiveThreshold, barTime) => {
-        if (!Number.isFinite(pred) || !Number.isFinite(threshold)) return;
-        const aggressiveOk = Number.isFinite(aggressiveThreshold);
-        const aggressive = aggressiveOk && pred >= aggressiveThreshold;
+        if (!Number.isFinite(pred) || !Number.isFinite(threshold) || !Number.isFinite(aggressiveThreshold)) return;
+        const aggressive = pred >= aggressiveThreshold;
         const normal = pred >= threshold;
         if (!normal && !aggressive) return;
         const idx = findBarIndex(barTime);
@@ -1628,7 +1754,7 @@
         if (!Number.isFinite(basePrice) || basePrice <= 0) return;
         const offset = basePrice * 0.0015;
         const price = side === "short" ? basePrice - offset : basePrice + offset;
-        const baseThreshold = aggressive && aggressiveOk ? aggressiveThreshold : threshold;
+        const baseThreshold = aggressive ? aggressiveThreshold : threshold;
         const span = Number.isFinite(baseThreshold) ? Math.max(0.0001, 1 - baseThreshold) : 1;
         const strength = Number.isFinite(baseThreshold) ? Math.max(0, Math.min(1, (pred - baseThreshold) / span)) : 0;
         const size = 10 + Math.round(strength * 10) + (aggressive ? 8 : 0);
@@ -1667,10 +1793,10 @@
           const barTime = normalizeBarTime(dir.bar_time || item.market?.last_bar_time || item.bar_time);
           const tsMs = item.ts ? (parseTs(String(item.ts)) || 0) : 0;
           recordDirection(barTime, {
-            predLong: Number(dir.pred_long),
-            predShort: Number(dir.pred_short),
-            threshold: Number(dir.threshold),
-            aggressiveThreshold: Number(dir.aggressive_threshold)
+            predLong: numOrNaN(dir.pred_long),
+            predShort: numOrNaN(dir.pred_short),
+            threshold: numOrNaN(dir.threshold),
+            aggressiveThreshold: numOrNaN(dir.aggressive_threshold)
           }, tsMs);
         });
       } else {
@@ -1678,10 +1804,10 @@
         const direction = latestItem && latestItem.direction ? latestItem.direction : {};
         const barTime = normalizeBarTime(direction.bar_time);
         recordDirection(barTime, {
-          predLong: Number(direction.pred_long),
-          predShort: Number(direction.pred_short),
-          threshold: Number(direction.threshold),
-          aggressiveThreshold: Number(direction.aggressive_threshold)
+          predLong: numOrNaN(direction.pred_long),
+          predShort: numOrNaN(direction.pred_short),
+          threshold: numOrNaN(direction.threshold),
+          aggressiveThreshold: numOrNaN(direction.aggressive_threshold)
         }, 0);
       }
 
@@ -2239,13 +2365,45 @@
     }, 10000);
     setInterval(() => {
       if (state.selected) {
-        refreshSignals(state.selected, state.selectedSymbol);
+        refreshSignals(state.selected, state.selectedLabel || state.selectedSymbol);
       }
     }, 6000);
 
     document.getElementById("tabAccount").addEventListener("click", () => setView("account"));
     document.getElementById("tabTraders").addEventListener("click", () => setView("traders"));
     document.getElementById("tabChart").addEventListener("click", () => setView("chart"));
+    const aliasInput = document.getElementById("aliasInput");
+    const aliasSave = document.getElementById("aliasSave");
+    const aliasClear = document.getElementById("aliasClear");
+    const commitAlias = () => {
+      if (!aliasInput) return;
+      const key = aliasInput.dataset.aliasKey || state.selected;
+      if (!key) return;
+      const alias = normalizeAlias(aliasInput.value);
+      setAliasForKey(key, alias);
+      renderSummary(state.items);
+    };
+    if (aliasSave) {
+      aliasSave.addEventListener("click", commitAlias);
+    }
+    if (aliasClear) {
+      aliasClear.addEventListener("click", () => {
+        if (!aliasInput) return;
+        const key = aliasInput.dataset.aliasKey || state.selected;
+        if (!key) return;
+        aliasInput.value = "";
+        setAliasForKey(key, "");
+        renderSummary(state.items);
+      });
+    }
+    if (aliasInput) {
+      aliasInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          commitAlias();
+        }
+      });
+    }
+    syncAliasControls(null, null);
     const signalClearBtn = document.getElementById("signalClear");
     if (signalClearBtn) {
       signalClearBtn.addEventListener("click", () => {

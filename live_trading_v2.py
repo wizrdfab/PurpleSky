@@ -1252,6 +1252,8 @@ class LiveTradingV2:
         self.direction_gate_signals = True
         self.direction_threshold_set = True
         self.aggressive_threshold_set = False
+        self.direction_threshold_in_params = False
+        self.aggressive_threshold_in_params = False
         self.last_signal: Dict[str, object] = {}
         self.last_feature_vector: Optional[Dict[str, object]] = None
         self.last_feature_row: Optional[pd.Series] = None

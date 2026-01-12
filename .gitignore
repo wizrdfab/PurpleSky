@@ -155,6 +155,9 @@ data_history*
 balance_history*
 closed_pnl*
 positions_raw*
+signals_*
+open_orders*
+closed_pnl_stats*
 
 # ----------------------------------------------------------------------------
 # Keep these files tracked (use ! to negate ignore)
