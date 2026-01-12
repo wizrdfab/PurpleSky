@@ -244,15 +244,19 @@ class AutoML:
         # Constrained Search Space to prevent Overfitting (SNIPER MODE)
         lr = trial.suggest_float('learning_rate', 0.005, 0.05, log=True)
         depth = trial.suggest_int('max_depth', 2, 4)
-        leaves = trial.suggest_int('num_leaves', 8, 24)
+        leaves = trial.suggest_int('num_leaves', 4, 16)
         min_child = 40
         
         thresh = trial.suggest_float('model_threshold', 0.60, 0.93)
+        dir_thresh = trial.suggest_float('direction_threshold', 0.35, 0.65)
+        agg_thresh = trial.suggest_float('aggressive_threshold', 0.75, 0.98)
         
         conf = copy.deepcopy(CONF)
         conf.strategy.base_limit_offset_atr, conf.strategy.take_profit_atr, conf.strategy.stop_loss_atr = offset, tp, sl
         conf.model.learning_rate, conf.model.max_depth, conf.model.num_leaves = lr, depth, leaves
         conf.model.min_child_samples = min_child
+        conf.model.direction_threshold = dir_thresh
+        conf.model.aggressive_threshold = agg_thresh
         
         df = self.raw_df.copy()
         df = Labeler(conf).generate_labels(df)
@@ -273,16 +277,23 @@ class AutoML:
         for train_idx, val_idx in tscv.split(df_dev):
             X_t = df_dev.iloc[train_idx][feats]
             y_l, y_s = df_dev.iloc[train_idx]['target_long'], df_dev.iloc[train_idx]['target_short']
+            y_dir_l, y_dir_s = df_dev.iloc[train_idx]['target_dir_long'], df_dev.iloc[train_idx]['target_dir_short']
             
             p = {'objective':'binary','metric':'auc','verbosity':-1,'n_jobs':-1,
                  'learning_rate':lr,'max_depth':depth,'num_leaves':leaves,
                  'min_child_samples':conf.model.min_child_samples,'boosting_type':'gbdt'}
             
+            # Train Execution Models
             m_l = lgb.train(p, lgb.Dataset(X_t, label=y_l), num_boost_round=100)
             m_s = lgb.train(p, lgb.Dataset(X_t, label=y_s), num_boost_round=100)
             
+            # Train Direction Models (Lighter version for speed)
+            m_dir_l = lgb.train(p, lgb.Dataset(X_t, label=y_dir_l), num_boost_round=50)
+            m_dir_s = lgb.train(p, lgb.Dataset(X_t, label=y_dir_s), num_boost_round=50)
+            
             val_f = df_dev.iloc[val_idx].copy()
             val_f['pred_long'], val_f['pred_short'] = m_l.predict(val_f[feats]), m_s.predict(val_f[feats])
+            val_f['pred_dir_long'], val_f['pred_dir_short'] = m_dir_l.predict(val_f[feats]), m_dir_s.predict(val_f[feats])
             
             # Simple Backtest (Direction logic is not applied in optimization loop to keep it fast)
             res = Backtester(conf).run(val_f, threshold=thresh)
@@ -297,6 +308,8 @@ class AutoML:
         conf.strategy.base_limit_offset_atr, conf.strategy.take_profit_atr, conf.strategy.stop_loss_atr = params['limit_offset_atr'], params['take_profit_atr'], params['stop_loss_atr']
         conf.model.learning_rate, conf.model.max_depth, conf.model.num_leaves, conf.model.model_threshold = params['learning_rate'], params['max_depth'], params['num_leaves'], params['model_threshold']
         conf.model.min_child_samples = 40
+        conf.model.direction_threshold = params['direction_threshold']
+        conf.model.aggressive_threshold = params['aggressive_threshold']
         
         df = self.raw_df.copy()
         df = Labeler(conf).generate_labels(df)

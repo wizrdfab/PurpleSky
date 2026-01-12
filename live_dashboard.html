@@ -571,7 +571,7 @@
     <section class="detail-wrap">
       <div class="detail-header">
         <div>
-          <h2 id="detailTitle">Select a symbol</h2>
+          <h2 id="detailTitle">Select a model</h2>
           <div class="sub" id="detailSub">No data loaded</div>
         </div>
         <div class="pill" id="detailStatus">--</div>
@@ -671,7 +671,7 @@
     <div class="detail-header">
       <div>
         <h2 id="chartTitle">Chart</h2>
-        <div class="sub" id="chartSub">Select a symbol to view price.</div>
+        <div class="sub" id="chartSub">Select a model to view price.</div>
       </div>
       <div class="pill" id="chartStatus">--</div>
     </div>
@@ -705,9 +705,10 @@
 
     const state = {
       selected: null,
+      selectedSymbol: null,
       latestMap: {},
       items: [],
-      lastHistorySymbol: null,
+      lastHistoryKey: null,
       view: "account",
       balanceRange: "all",
       balanceScale: "split",
@@ -722,6 +723,7 @@
       signalFocusId: null,
       signalChart: null,
       signalChartLoading: false,
+      signalKey: null,
       signalSymbol: null,
       signalLastCandleFetch: 0,
       signalZoom: null,
@@ -1083,26 +1085,59 @@
       return "muted";
     }
 
+    function entryKey(item) {
+      if (!item) return null;
+      return item.dash_key || item.symbol || null;
+    }
+
+    function modelLabel(item) {
+      if (!item) return "--";
+      const model = item.model || {};
+      if (model.keys_profile) return String(model.keys_profile);
+      const dir = model.dir || "";
+      if (dir) {
+        const cleaned = String(dir).replace(/\\/g, "/");
+        const parts = cleaned.split("/").filter(Boolean);
+        if (parts.length >= 2) {
+          return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+        }
+        return parts[parts.length - 1] || "--";
+      }
+      if (item.dash_key && item.symbol && item.dash_key !== item.symbol) {
+        return item.dash_key;
+      }
+      return "--";
+    }
+
     function renderSummary(items) {
       state.items = items || [];
       state.latestMap = {};
       const grid = document.getElementById("summaryGrid");
       grid.innerHTML = "";
       state.items.forEach(item => {
-        if (!item || !item.symbol) return;
-        state.latestMap[item.symbol] = item;
+        const key = entryKey(item);
+        if (!key) return;
+        state.latestMap[key] = item;
       });
-      const symbols = Object.keys(state.latestMap).sort();
-      document.getElementById("statusPill").textContent = `${symbols.length} symbols`;
+      const entries = Object.values(state.latestMap).sort((a, b) => {
+        const symA = (a.symbol || "").toString();
+        const symB = (b.symbol || "").toString();
+        if (symA !== symB) return symA.localeCompare(symB);
+        const keyA = entryKey(a) || "";
+        const keyB = entryKey(b) || "";
+        return String(keyA).localeCompare(String(keyB));
+      });
+      document.getElementById("statusPill").textContent = `${entries.length} models`;
       const subline = document.getElementById("subline");
       if (subline) {
-        subline.textContent = `Active symbols: ${symbols.length} | Updated: ${new Date().toLocaleTimeString()}`;
+        subline.textContent = `Active models: ${entries.length} | Updated: ${new Date().toLocaleTimeString()}`;
       }
       if (!state.selected || !state.latestMap[state.selected]) {
-        state.selected = symbols[0] || null;
+        state.selected = entries.length ? entryKey(entries[0]) : null;
       }
-      symbols.forEach(symbol => {
-        const item = state.latestMap[symbol];
+      entries.forEach(item => {
+        const key = entryKey(item);
+        const symbol = item.symbol || key || "--";
         const card = document.createElement("div");
         const signalState = computeSignalState(item.prediction || {});
         const signalClasses = [];
@@ -1112,10 +1147,10 @@
             signalClasses.push("short");
           }
         }
-        card.className = ["summary-card", symbol === state.selected ? "selected" : "", ...signalClasses]
+        card.className = ["summary-card", key === state.selected ? "selected" : "", ...signalClasses]
           .filter(Boolean)
           .join(" ");
-        card.addEventListener("click", () => selectSymbol(symbol));
+        card.addEventListener("click", () => selectSymbol(key));
 
         const title = document.createElement("div");
         title.className = "summary-title";
@@ -1162,6 +1197,7 @@
           }
         }
         const rows = [
+          ["Model", modelLabel(item)],
           ["Daily PnL", fmt(item.daily_pnl, 4)],
           ["Position", formatPosition(item.position)],
           ["Health", item.health?.status || "--"],
@@ -1177,6 +1213,10 @@
           left.textContent = k;
           const right = document.createElement("span");
           right.textContent = v;
+          if (k === "Model") {
+            right.className = "truncate";
+            right.title = v;
+          }
           row.appendChild(left);
           row.appendChild(right);
           card.appendChild(row);
@@ -1222,7 +1262,7 @@
         tabChart.classList.remove("active");
         if (state.selected) {
           fetchHistory(state.selected);
-          refreshSignals(state.selected);
+          refreshSignals(state.selected, state.selectedSymbol);
         }
       }
     }
@@ -1234,17 +1274,24 @@
       return `${side} ${size}`;
     }
 
-    function selectSymbol(symbol) {
-      state.selected = symbol;
+    function selectSymbol(key) {
+      state.selected = key;
+      const item = key ? state.latestMap[key] : null;
+      state.selectedSymbol = item?.symbol || key || null;
       renderSummary(state.items);
-      if (symbol) {
-        fetchHistory(symbol);
-        refreshSignals(symbol);
+      if (key) {
+        fetchHistory(key);
+        refreshSignals(key, state.selectedSymbol);
       }
     }
 
     function updateDetail(data) {
-      if (!data || !data.symbol) return;
+      if (!data) return;
+      const key = entryKey(data);
+      if (!key) return;
+      const symbol = data.symbol || key;
+      state.selected = key;
+      state.selectedSymbol = symbol;
       const pos = data.position || {};
       const health = data.health || {};
       const latency = data.latency || {};
@@ -1257,8 +1304,11 @@
       const model = data.model || {};
       const featureVector = data.feature_vector || {};
 
-      document.getElementById("detailTitle").textContent = `Selected: ${data.symbol}`;
-      document.getElementById("detailSub").textContent = `Startup: ${data.startup_time || "--"} | Uptime: ${Math.round(data.uptime_sec || 0)}s | Last: ${data.ts || "--"}`;
+      const keyTag = key !== symbol ? ` (${key})` : "";
+      const modelText = modelLabel(data);
+      const modelTag = modelText && modelText !== "--" ? ` | Model: ${modelText}` : "";
+      document.getElementById("detailTitle").textContent = `Selected: ${symbol}${keyTag}`;
+      document.getElementById("detailSub").textContent = `Startup: ${data.startup_time || "--"} | Uptime: ${Math.round(data.uptime_sec || 0)}s | Last: ${data.ts || "--"}${modelTag}`;
       const detailStatus = document.getElementById("detailStatus");
       if (data.signal_only) {
         detailStatus.textContent = "Signal Only";
@@ -1716,9 +1766,9 @@
       }
     }
 
-    async function fetchSignals(symbol) {
-      if (!symbol) return;
-      const resp = await fetch(`/api/signals?symbol=${encodeURIComponent(symbol)}&limit=80`);
+    async function fetchSignals(key) {
+      if (!key) return;
+      const resp = await fetch(`/api/signals?key=${encodeURIComponent(key)}&limit=80`);
       if (!resp.ok) return;
       const data = await resp.json();
       state.signalHistory = normalizeSignals(data || []);
@@ -1728,19 +1778,20 @@
       }
     }
 
-    async function fetchSignalCandles(symbol) {
-      if (!symbol) return;
-      const resp = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&limit=500`);
+    async function fetchSignalCandles(key) {
+      if (!key) return;
+      const resp = await fetch(`/api/candles?key=${encodeURIComponent(key)}&limit=500`);
       if (!resp.ok) return;
       const payload = await resp.json();
       state.signalCandles = normalizeCandles(payload);
       renderSignalChart();
     }
 
-    function refreshSignals(symbol) {
-      if (!symbol) return;
-      if (state.signalSymbol !== symbol) {
-        state.signalSymbol = symbol;
+    function refreshSignals(key, symbol) {
+      if (!key) return;
+      if (state.signalKey !== key) {
+        state.signalKey = key;
+        state.signalSymbol = symbol || key;
         state.signalFocusId = null;
         state.signalCandles = [];
         state.signalHistory = [];
@@ -1755,9 +1806,9 @@
       const now = Date.now();
       if (!state.signalLastCandleFetch || (now - state.signalLastCandleFetch) > 20000) {
         state.signalLastCandleFetch = now;
-        fetchSignalCandles(symbol);
+        fetchSignalCandles(key);
       }
-      fetchSignals(symbol);
+      fetchSignals(key);
     }
 
     function renderProfiles(list) {
@@ -1943,16 +1994,16 @@
       renderSummary(items || []);
     }
 
-    async function fetchHistory(symbol) {
-      if (!symbol) return;
-      const resp = await fetch(`/api/metrics?symbol=${encodeURIComponent(symbol)}&limit=200`);
+    async function fetchHistory(key) {
+      if (!key) return;
+      const resp = await fetch(`/api/metrics?key=${encodeURIComponent(key)}&limit=200`);
       if (!resp.ok) return;
       const data = await resp.json();
       const equity = data.map(x => Number(x.equity || 0));
       const latency = data.map(x => Number(x.latency?.rest_avg_ms || 0));
       sparkline(document.getElementById("equityChart"), equity, "#22c55e");
       sparkline(document.getElementById("latencyChart"), latency, "#f59e0b");
-      state.lastHistorySymbol = symbol;
+      state.lastHistoryKey = key;
     }
 
     fetchSummary();
@@ -1969,7 +2020,7 @@
     }, 10000);
     setInterval(() => {
       if (state.selected) {
-        refreshSignals(state.selected);
+        refreshSignals(state.selected, state.selectedSymbol);
       }
     }, 6000);
 

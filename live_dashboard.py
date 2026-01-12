@@ -282,6 +282,34 @@ def extract_keys_profile(latest: dict) -> Optional[str]:
     return None
 
 
+def resolve_latest_symbol(latest: dict, fallback: str) -> str:
+    if isinstance(latest, dict):
+        symbol = latest.get("symbol")
+        if symbol:
+            return str(symbol)
+    return fallback
+
+
+def apply_dash_meta(latest: dict, dash_key: str) -> dict:
+    if not isinstance(latest, dict):
+        return latest
+    symbol = latest.get("symbol") or dash_key
+    latest["symbol"] = symbol
+    latest["dash_key"] = dash_key
+    return latest
+
+
+def dash_key_from_metrics_path(metrics_path: Path) -> Optional[str]:
+    if not metrics_path:
+        return None
+    stem = metrics_path.stem
+    if stem.startswith("live_metrics_"):
+        key = stem.replace("live_metrics_", "", 1)
+    else:
+        key = stem
+    return key or None
+
+
 class TradeStatsState:
     def __init__(self) -> None:
         self.reset()
@@ -1264,7 +1292,12 @@ def is_protective_order(order: dict) -> bool:
 
 
 def read_open_orders_latest(metrics_path: Path, symbol: str):
-    orders_path = metrics_path.with_name(f"open_orders_{symbol}.jsonl")
+    key = dash_key_from_metrics_path(metrics_path)
+    key_path = metrics_path.with_name(f"open_orders_{key}.jsonl") if key else None
+    if key_path and key_path.exists() and key_path.stat().st_size > 0:
+        orders_path = key_path
+    else:
+        orders_path = metrics_path.with_name(f"open_orders_{symbol}.jsonl")
     latest = read_latest(orders_path)
     orders = latest.get("open_orders") if isinstance(latest, dict) else None
     if not isinstance(orders, list):
@@ -1337,25 +1370,45 @@ def discover_metrics_files(metrics_dir: Path, symbols=None):
     mapping = {}
     if not metrics_dir.exists():
         return mapping
-    for path in metrics_dir.glob("live_metrics_*.jsonl"):
-        symbol = path.stem.replace("live_metrics_", "", 1)
-        if not symbol:
+    for path in sorted(metrics_dir.glob("live_metrics_*.jsonl")):
+        key = path.stem.replace("live_metrics_", "", 1)
+        if not key:
             continue
-        if symbols and symbol not in symbols:
+        latest = read_latest(path)
+        symbol = resolve_latest_symbol(latest, key)
+        if symbols and symbol not in symbols and key not in symbols:
             continue
-        mapping[symbol] = path
+        if symbol not in mapping:
+            mapping[symbol] = path
+    return mapping
+
+
+def discover_metrics_entries(metrics_dir: Path, symbols=None):
+    mapping = {}
+    if not metrics_dir.exists():
+        return mapping
+    for path in sorted(metrics_dir.glob("live_metrics_*.jsonl")):
+        key = path.stem.replace("live_metrics_", "", 1)
+        if not key:
+            continue
+        if symbols:
+            latest = read_latest(path)
+            symbol = resolve_latest_symbol(latest, key)
+            if symbol not in symbols and key not in symbols:
+                continue
+        mapping[key] = path
     return mapping
 
 
 def summary_from_files(file_map):
     items = []
-    for symbol in sorted(file_map.keys()):
-        path = file_map[symbol]
+    for key in sorted(file_map.keys()):
+        path = file_map[key]
         latest = read_latest(path)
         if not latest:
-            latest = {"symbol": symbol, "ts": None}
-        elif not latest.get("symbol"):
-            latest["symbol"] = symbol
+            latest = {"symbol": None, "ts": None}
+        latest = apply_dash_meta(latest, key)
+        symbol = latest.get("symbol") or key
         latest = augment_latest(latest, symbol, path)
         items.append(latest)
     return items
@@ -1467,7 +1520,7 @@ EXTRA_SCRIPT = """
   let chartFetchInFlight = false;
   let chartFullCandles = [];
   let chartIntervalSec = 60;
-  let chartLastSymbol = null;
+  let chartLastKey = null;
   let chartPricePrecision = 6;
   let chartLibLoading = false;
   let chartLibFallback = false;
@@ -1925,13 +1978,13 @@ EXTRA_SCRIPT = """
     return Number.isFinite(price) ? price : 0;
   }
 
-  async function fetchMetricHistory(symbol) {
+  async function fetchMetricHistory(key) {
     if (!chartInitialized) return;
     const sampleSec = window.__dashMetricsIntervalSec || 2;
     const targetRange = chartRangeSec || (24 * 60 * 60);
     const desired = Math.ceil(targetRange / sampleSec) + 200;
     const limit = Math.min(10000, Math.max(300, desired));
-    const resp = await fetch(`/api/metrics?symbol=${encodeURIComponent(symbol)}&limit=${limit}`);
+    const resp = await fetch(`/api/metrics?key=${encodeURIComponent(key)}&limit=${limit}`);
     if (!resp.ok) return;
     const data = await resp.json();
     if (!Array.isArray(data)) return;
@@ -1962,24 +2015,24 @@ EXTRA_SCRIPT = """
 
   async function fetchChartHistory(force = false) {
     if (!chartInitialized) return;
-    const symbol = window.__dashSymbol;
-    if (!symbol || chartFetchInFlight) return;
+    const key = window.__dashKey || window.__dashSymbol;
+    if (!key || chartFetchInFlight) return;
     if (force) {
       chartNeedsFit = true;
       chartUserZoom = false;
       chartZoomState = null;
     }
     chartFetchInFlight = true;
-    const currentSymbol = symbol;
+    const currentKey = key;
     try {
       const limit = computeCandleLimit();
-      const resp = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&limit=${limit}`);
+      const resp = await fetch(`/api/candles?key=${encodeURIComponent(key)}&limit=${limit}`);
       if (!resp.ok) {
-        await fetchMetricHistory(symbol);
+        await fetchMetricHistory(key);
         return;
       }
       const payload = await resp.json();
-      if (currentSymbol !== window.__dashSymbol) return;
+      if (currentKey !== (window.__dashKey || window.__dashSymbol)) return;
       if (payload && payload.interval_sec) {
         const interval = Number(payload.interval_sec);
         if (Number.isFinite(interval) && interval > 0) {
@@ -1988,12 +2041,12 @@ EXTRA_SCRIPT = """
       }
       const candles = normalizeCandles(payload ? payload.candles : []);
       if (!candles.length) {
-        await fetchMetricHistory(symbol);
+        await fetchMetricHistory(key);
         return;
       }
       setCandlesData(candles);
     } catch (_err) {
-      await fetchMetricHistory(symbol);
+      await fetchMetricHistory(key);
     } finally {
       chartFetchInFlight = false;
     }
@@ -2094,15 +2147,17 @@ EXTRA_SCRIPT = """
   let chartRangeSec = 15 * 60;
   let chartRangeLabel = "15M";
   async function sendCommand(scope, side) {
+    const key = window.__dashKey;
     const symbol = window.__dashSymbol;
-    if (!symbol) return;
+    if (!symbol && !key) return;
     const payload = {
       ts: Date.now() / 1000,
       action: "cancel_iceberg",
       scope,
       side,
-      symbol,
     };
+    if (symbol) payload.symbol = symbol;
+    if (key) payload.key = key;
     try {
       await fetch("/api/command", {
         method: "POST",
@@ -2296,6 +2351,10 @@ EXTRA_SCRIPT = """
     ensureChartSection();
     bindIcebergControls();
     bindChartRangeControls();
+    const dashKey = data.dash_key || data.symbol;
+    if (dashKey) {
+      window.__dashKey = dashKey;
+    }
     if (data.symbol) {
       window.__dashSymbol = data.symbol;
     }
@@ -2303,9 +2362,16 @@ EXTRA_SCRIPT = """
       window.__dashMetricsIntervalSec = Number(data.metrics_interval_sec) || window.__dashMetricsIntervalSec;
     }
     const chartTitle = document.getElementById("chartTitle");
-    if (chartTitle && data.symbol) chartTitle.textContent = `${data.symbol} Chart`;
+    if (chartTitle && (data.symbol || dashKey)) {
+      const base = data.symbol || dashKey;
+      const keyTag = dashKey && data.symbol && dashKey !== data.symbol ? ` (${dashKey})` : "";
+      chartTitle.textContent = `${base}${keyTag} Chart`;
+    }
     const chartSub = document.getElementById("chartSub");
-    if (chartSub) chartSub.textContent = data.ts ? `Updated ${data.ts}` : "Waiting for data...";
+    if (chartSub) {
+      const tag = dashKey && data.symbol && dashKey !== data.symbol ? ` | ${dashKey}` : "";
+      chartSub.textContent = data.ts ? `Updated ${data.ts}${tag}` : "Waiting for data...";
+    }
     const chartStatus = document.getElementById("chartStatus");
     if (chartStatus) chartStatus.textContent = data.health?.status || "Live";
     const dash = data.dashboard || {};
@@ -2374,10 +2440,10 @@ EXTRA_SCRIPT = """
 
     loadChartLib(() => {
       initChart();
-      const symbol = window.__dashSymbol;
-      const symbolChanged = symbol && symbol !== chartLastSymbol;
-      if (symbolChanged) {
-        chartLastSymbol = symbol;
+      const key = window.__dashKey || window.__dashSymbol;
+      const keyChanged = key && key !== chartLastKey;
+      if (keyChanged) {
+        chartLastKey = key;
         chartFullCandles = [];
         chartNeedsFit = true;
         chartUserZoom = false;
@@ -2394,7 +2460,7 @@ EXTRA_SCRIPT = """
       if (!chartTimer) {
         fetchChartHistory(true);
         chartTimer = setInterval(fetchChartHistory, 10000);
-      } else if (symbolChanged) {
+      } else if (keyChanged) {
         fetchChartHistory(true);
       }
     });
@@ -2797,13 +2863,21 @@ class MetricsHandler(BaseHTTPRequestHandler):
     def _resolve_files(self):
         if self.fixed_files:
             return self.fixed_files
-        return discover_metrics_files(self.metrics_dir, self.symbols_filter)
+        return discover_metrics_entries(self.metrics_dir, self.symbols_filter)
 
-    def _choose_symbol(self, file_map, symbol):
-        if symbol and symbol in file_map:
-            return symbol
-        symbols = sorted(file_map.keys())
-        return symbols[0] if symbols else None
+    def _choose_entry(self, file_map, key: Optional[str] = None, symbol: Optional[str] = None):
+        if key and key in file_map:
+            return key
+        if symbol:
+            if symbol in file_map:
+                return symbol
+            for candidate in sorted(file_map.keys()):
+                latest = read_latest(file_map[candidate])
+                candidate_symbol = resolve_latest_symbol(latest, candidate)
+                if candidate_symbol == symbol:
+                    return candidate
+        keys = sorted(file_map.keys())
+        return keys[0] if keys else None
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -2819,11 +2893,15 @@ class MetricsHandler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error": "invalid json"})
         file_map = self._resolve_files()
+        key = payload.get("key")
         symbol = payload.get("symbol")
-        symbol = self._choose_symbol(file_map, symbol)
-        if not symbol:
+        entry_key = self._choose_entry(file_map, key=key, symbol=symbol)
+        if not entry_key:
             return self._send(400, {"error": "unknown symbol"})
+        latest = read_latest(file_map[entry_key])
+        symbol = resolve_latest_symbol(latest, entry_key)
         payload["ts"] = payload.get("ts") or time.time()
+        payload["symbol"] = symbol
         cmd_path = self.metrics_dir / f"commands_{symbol}.jsonl"
         append_jsonl(cmd_path, payload)
         return self._send(200, {"ok": True})
@@ -2861,53 +2939,70 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/latest":
             qs = parse_qs(parsed.query)
+            key = qs.get("key", [""])[0] or None
             symbol = qs.get("symbol", [""])[0] or None
-            symbol = self._choose_symbol(file_map, symbol)
-            if not symbol:
+            entry_key = self._choose_entry(file_map, key=key, symbol=symbol)
+            if not entry_key:
                 return self._send(200, {})
-            latest = read_latest(file_map[symbol])
+            path = file_map[entry_key]
+            latest = read_latest(path)
             if not latest:
-                latest = {"symbol": symbol, "ts": None}
-            elif not latest.get("symbol"):
-                latest["symbol"] = symbol
-            latest = augment_latest(latest, symbol, file_map[symbol])
+                latest = {"symbol": None, "ts": None}
+            latest = apply_dash_meta(latest, entry_key)
+            symbol = latest.get("symbol") or entry_key
+            latest = augment_latest(latest, symbol, path)
             return self._send(200, latest)
 
         if parsed.path == "/api/metrics":
             qs = parse_qs(parsed.query)
+            key = qs.get("key", [""])[0] or None
             symbol = qs.get("symbol", [""])[0] or None
-            symbol = self._choose_symbol(file_map, symbol)
-            if not symbol:
+            entry_key = self._choose_entry(file_map, key=key, symbol=symbol)
+            if not entry_key:
                 return self._send(200, [])
             limit = int(qs.get("limit", [self.history_limit])[0])
             max_bytes = max(512 * 1024, limit * 1024)
             max_bytes = min(max_bytes, 16 * 1024 * 1024)
-            return self._send(200, tail_jsonl(file_map[symbol], limit=limit, max_bytes=max_bytes))
+            return self._send(200, tail_jsonl(file_map[entry_key], limit=limit, max_bytes=max_bytes))
 
         if parsed.path == "/api/signals":
             qs = parse_qs(parsed.query)
+            key = qs.get("key", [""])[0] or None
             symbol = qs.get("symbol", [""])[0] or None
-            symbol = self._choose_symbol(file_map, symbol)
-            if not symbol:
+            entry_key = self._choose_entry(file_map, key=key, symbol=symbol)
+            if not entry_key:
                 return self._send(200, [])
             limit = int(qs.get("limit", [40])[0])
             limit = max(1, min(200, limit))
             max_bytes = max(256 * 1024, limit * 1024)
             max_bytes = min(max_bytes, 4 * 1024 * 1024)
-            signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+            latest = read_latest(file_map[entry_key])
+            symbol = resolve_latest_symbol(latest, entry_key)
+            key_signals = self.metrics_dir / f"signals_{entry_key}.jsonl"
+            if key_signals.exists() and key_signals.stat().st_size > 0:
+                signals_path = key_signals
+            else:
+                signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
             return self._send(200, tail_jsonl(signals_path, limit=limit, max_bytes=max_bytes))
 
         if parsed.path == "/api/candles":
             qs = parse_qs(parsed.query)
+            key = qs.get("key", [""])[0] or None
             symbol = qs.get("symbol", [""])[0] or None
-            symbol = self._choose_symbol(file_map, symbol)
-            if not symbol:
+            entry_key = self._choose_entry(file_map, key=key, symbol=symbol)
+            if not entry_key:
                 return self._send(200, {"candles": [], "interval_sec": None})
             limit = int(qs.get("limit", [2000])[0])
             limit = max(100, min(20000, limit))
             max_bytes = max(512 * 1024, limit * 256)
             max_bytes = min(max_bytes, 16 * 1024 * 1024)
-            candles_path = self.metrics_dir / f"data_history_{symbol}.csv"
+            latest = read_latest(file_map[entry_key])
+            symbol = resolve_latest_symbol(latest, entry_key)
+            key_candles = self.metrics_dir / f"data_history_{entry_key}.csv"
+            if key_candles.exists() and key_candles.stat().st_size > 0:
+                candles_path = key_candles
+            else:
+                candles_path = self.metrics_dir / f"data_history_{symbol}.csv"
             rows = tail_csv_dicts(candles_path, limit=limit, max_bytes=max_bytes)
             candles = []
             for row in rows:

@@ -40,6 +40,8 @@ class Backtester:
         atrs = df['atr'].values
         p_long = df['pred_long'].values
         p_short = df['pred_short'].values
+        p_dir_long = df.get('pred_dir_long', pd.Series(1.0, index=df.index)).values
+        p_dir_short = df.get('pred_dir_short', pd.Series(1.0, index=df.index)).values
         
         offset = self.strat.base_limit_offset_atr
         
@@ -124,12 +126,43 @@ class Backtester:
                     active_sell = None
             
             # 3. Place Orders
-            if len(self.positions) == 0 and atrs[i] > 0:
-                if active_buy is None and p_long[i] > threshold:
+            if len(self.positions) < self.strat.max_positions and atrs[i] > 0:
+                
+                # --- AGGRESSIVE OVERRIDE (LONG) ---
+                if p_dir_long[i] > self.conf.model.aggressive_threshold:
+                    # Cancel pending limit if any
+                    active_buy = None 
+                    # Execute Market Buy
+                    fill_p = closes[i]
+                    size = (self.equity * self.strat.risk_per_trade) / (atrs[i] * self.strat.stop_loss_atr)
+                    fee = fill_p * size * self.strat.taker_fee # TAKER FEE
+                    self.equity -= fee
+                    
+                    # Aggressive TP (10x Boost)
+                    tp = fill_p + (atrs[i] * self.strat.take_profit_atr * 10.0)
+                    sl = fill_p - (atrs[i] * self.strat.stop_loss_atr)
+                    self.positions.append(Position(fill_p, size, tp, sl, i, 1))
+                    
+                # Standard Limit Logic (Long)
+                elif active_buy is None and p_long[i] > threshold and p_dir_long[i] > self.conf.model.direction_threshold:
                     limit = closes[i] - (atrs[i] * offset)
                     active_buy = (limit, i)
                 
-                if active_sell is None and p_short[i] > threshold:
+                # --- AGGRESSIVE OVERRIDE (SHORT) ---
+                if p_dir_short[i] > self.conf.model.aggressive_threshold:
+                    active_sell = None
+                    fill_p = closes[i]
+                    size = (self.equity * self.strat.risk_per_trade) / (atrs[i] * self.strat.stop_loss_atr)
+                    fee = fill_p * size * self.strat.taker_fee # TAKER FEE
+                    self.equity -= fee
+                    
+                    # Aggressive TP (10x Boost)
+                    tp = fill_p - (atrs[i] * self.strat.take_profit_atr * 10.0)
+                    sl = fill_p + (atrs[i] * self.strat.stop_loss_atr)
+                    self.positions.append(Position(fill_p, size, tp, sl, i, -1))
+                    
+                # Standard Limit Logic (Short)
+                elif active_sell is None and p_short[i] > threshold and p_dir_short[i] > self.conf.model.direction_threshold:
                     limit = closes[i] + (atrs[i] * offset)
                     active_sell = (limit, i)
                     

@@ -73,6 +73,8 @@ class ModelConfig:
     ensemble_size: int = 5       # Size of the Council
     voting_threshold: int = 1    # Min votes to execute
     use_meta_labeling: bool = True
+    direction_threshold: float = 0.5 # Dynamic Threshold for Direction Model
+    aggressive_threshold: float = 0.8 # Threshold for Market Order Override
 
 @dataclass
 class GlobalConfig:
