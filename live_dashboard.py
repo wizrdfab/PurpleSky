@@ -22,6 +22,11 @@ try:
 except Exception:
     BybitHTTP = None
 
+try:
+    import joblib
+except Exception:
+    joblib = None
+
 
 def tail_jsonl(path: Path, limit: int = 200, max_bytes: int = 512 * 1024):
     if not path.exists() or path.stat().st_size == 0:
@@ -110,6 +115,15 @@ def safe_float(value, default=0.0):
         return default
 
 
+def maybe_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 def safe_int(value, default=0):
     try:
         if value is None or value == "":
@@ -127,6 +141,12 @@ def safe_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
     return bool(value)
+
+
+DEFAULT_DIRECTION_THRESHOLD = 0.5
+DEFAULT_AGGRESSIVE_THRESHOLD = 0.8
+MODEL_META_CACHE = {}
+MODEL_META_LOCK = threading.Lock()
 
 
 def parse_ts(ts: str):
@@ -308,6 +328,286 @@ def dash_key_from_metrics_path(metrics_path: Path) -> Optional[str]:
     else:
         key = stem
     return key or None
+
+
+def model_cache_key(model_dir: Path) -> str:
+    try:
+        return str(model_dir.resolve())
+    except Exception:
+        return str(model_dir)
+
+
+def resolve_model_dir(model_dir_value, metrics_path: Optional[Path]) -> Optional[Path]:
+    if not model_dir_value:
+        return None
+    try:
+        model_dir = Path(str(model_dir_value))
+    except Exception:
+        return None
+    if model_dir.is_absolute():
+        return model_dir
+    candidates = []
+    if metrics_path:
+        candidates.append(metrics_path.parent / model_dir)
+    candidates.append(Path.cwd() / model_dir)
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except Exception:
+            continue
+    return model_dir
+
+
+def read_model_params(model_dir: Optional[Path]) -> dict:
+    if not model_dir:
+        return {}
+    params_path = model_dir / "params.json"
+    if not params_path.exists():
+        return {}
+    try:
+        payload = json.loads(params_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def model_label_from_params(params: dict) -> Optional[str]:
+    if not isinstance(params, dict):
+        return None
+    keys = (
+        "dashboard_name",
+        "display_name",
+        "tab_name",
+        "model_name",
+        "name",
+        "label",
+        "alias",
+    )
+    for key in keys:
+        val = params.get(key)
+        if isinstance(val, str):
+            label = val.strip()
+            if label:
+                return label
+    return None
+
+
+def derive_model_label(model_dir: Optional[Path]) -> str:
+    if not model_dir:
+        return ""
+    try:
+        cleaned = model_dir.as_posix()
+    except Exception:
+        cleaned = str(model_dir)
+    parts = [p for p in cleaned.replace("\\", "/").split("/") if p]
+    if not parts:
+        return ""
+    if len(parts) >= 2:
+        return f"{parts[-2]}/{parts[-1]}"
+    return parts[-1]
+
+
+def load_model_meta(model_dir: Optional[Path]) -> dict:
+    if not model_dir:
+        return {}
+    params_path = model_dir / "params.json"
+    features_path = model_dir / "features.pkl"
+    dir_long_path = model_dir / "dir_model_long.pkl"
+    dir_short_path = model_dir / "dir_model_short.pkl"
+    mtimes = {
+        "params": params_path.stat().st_mtime if params_path.exists() else None,
+        "features": features_path.stat().st_mtime if features_path.exists() else None,
+        "dir_long": dir_long_path.stat().st_mtime if dir_long_path.exists() else None,
+        "dir_short": dir_short_path.stat().st_mtime if dir_short_path.exists() else None,
+    }
+    key = model_cache_key(model_dir)
+    with MODEL_META_LOCK:
+        cached = MODEL_META_CACHE.get(key)
+        if cached and cached.get("mtimes") == mtimes:
+            return cached
+
+    params = read_model_params(model_dir)
+    label = model_label_from_params(params)
+    features = None
+    if joblib and features_path.exists():
+        try:
+            features = joblib.load(features_path)
+        except Exception:
+            features = None
+    if isinstance(features, tuple):
+        features = list(features)
+    if not isinstance(features, list):
+        features = None
+
+    dir_model_long = None
+    dir_model_short = None
+    if joblib and dir_long_path.exists():
+        try:
+            dir_model_long = joblib.load(dir_long_path)
+        except Exception:
+            dir_model_long = None
+    if joblib and dir_short_path.exists():
+        try:
+            dir_model_short = joblib.load(dir_short_path)
+        except Exception:
+            dir_model_short = None
+
+    meta = {
+        "params": params,
+        "label": label,
+        "features": features,
+        "dir_model_long": dir_model_long,
+        "dir_model_short": dir_model_short,
+        "model_dir": str(model_dir),
+        "mtimes": mtimes,
+    }
+    with MODEL_META_LOCK:
+        MODEL_META_CACHE[key] = meta
+    return meta
+
+
+def build_feature_row(latest: dict, features: Optional[List[str]]) -> Optional[List[float]]:
+    if not latest or not features:
+        return None
+    vec = latest.get("feature_vector") or {}
+    names = vec.get("names") or []
+    values = vec.get("values") or []
+    if not names or not values:
+        return None
+    mapping = {}
+    for i, name in enumerate(names):
+        if i >= len(values):
+            break
+        mapping[name] = values[i]
+    row = []
+    for feature in features:
+        val = mapping.get(feature)
+        try:
+            row.append(float(val))
+        except Exception:
+            row.append(0.0)
+    return row
+
+
+def normalize_bar_time(value) -> Optional[int]:
+    ts = safe_int(value, 0)
+    if ts <= 0:
+        return None
+    if ts > 1_000_000_000_000:
+        ts = int(ts / 1000)
+    return ts
+
+
+def resolve_direction_info(latest: dict, meta: dict) -> Optional[dict]:
+    if not isinstance(latest, dict):
+        return None
+    direction = latest.get("direction")
+    direction_data = direction if isinstance(direction, dict) else {}
+    threshold_present = isinstance(direction, dict) and "threshold" in direction
+    aggressive_present = isinstance(direction, dict) and "aggressive_threshold" in direction
+    pred_long = maybe_float(direction_data.get("pred_long"))
+    pred_short = maybe_float(direction_data.get("pred_short"))
+    source = direction_data.get("source") if isinstance(direction, dict) else None
+
+    pred = latest.get("prediction") or {}
+    if pred_long is None and pred_short is None:
+        if "pred_dir_long" in pred or "pred_dir_short" in pred:
+            pred_long = maybe_float(pred.get("pred_dir_long"))
+            pred_short = maybe_float(pred.get("pred_dir_short"))
+            source = source or "prediction"
+
+    last_pred = (latest.get("health") or {}).get("last_prediction") or {}
+    if pred_long is None and pred_short is None:
+        if "pred_dir_long" in last_pred or "pred_dir_short" in last_pred:
+            pred_long = maybe_float(last_pred.get("pred_dir_long"))
+            pred_short = maybe_float(last_pred.get("pred_dir_short"))
+            source = source or "health"
+
+    params = meta.get("params") if isinstance(meta, dict) else {}
+    param_has_direction = isinstance(params, dict) and (
+        "direction_threshold" in params or "aggressive_threshold" in params
+    )
+    has_models = bool(meta.get("dir_model_long") or meta.get("dir_model_short")) if isinstance(meta, dict) else False
+
+    if (pred_long is None or pred_short is None) and has_models:
+        row = build_feature_row(latest, meta.get("features"))
+        if row:
+            if pred_long is None and meta.get("dir_model_long"):
+                try:
+                    pred_long = float(meta["dir_model_long"].predict([row])[0])
+                    source = source or "computed"
+                except Exception:
+                    pred_long = pred_long
+            if pred_short is None and meta.get("dir_model_short"):
+                try:
+                    pred_short = float(meta["dir_model_short"].predict([row])[0])
+                    source = source or "computed"
+                except Exception:
+                    pred_short = pred_short
+
+    if (
+        pred_long is None
+        and pred_short is None
+        and not direction
+        and not param_has_direction
+        and not has_models
+    ):
+        return None
+
+    threshold = maybe_float(direction_data.get("threshold")) if threshold_present else None
+    aggressive = maybe_float(direction_data.get("aggressive_threshold")) if aggressive_present else None
+    if threshold is None and not threshold_present and isinstance(params, dict):
+        threshold = maybe_float(params.get("direction_threshold"))
+    if aggressive is None and not aggressive_present and isinstance(params, dict):
+        aggressive = maybe_float(params.get("aggressive_threshold"))
+    if threshold is None and not threshold_present and (
+        param_has_direction or has_models or pred_long is not None or pred_short is not None
+    ):
+        threshold = DEFAULT_DIRECTION_THRESHOLD
+    if aggressive is None and not aggressive_present and (
+        param_has_direction or has_models or pred_long is not None or pred_short is not None
+    ):
+        aggressive = DEFAULT_AGGRESSIVE_THRESHOLD
+
+    bar_time = normalize_bar_time(direction.get("bar_time") if isinstance(direction, dict) else None)
+    if bar_time is None:
+        bar_time = normalize_bar_time(pred.get("bar_time"))
+    if bar_time is None:
+        bar_time = normalize_bar_time(last_pred.get("bar_time"))
+    if bar_time is None:
+        bar_time = normalize_bar_time((latest.get("market") or {}).get("last_bar_time"))
+    if bar_time is None:
+        bar_time = normalize_bar_time(latest.get("bar_time"))
+    if bar_time is None:
+        ts = parse_ts(latest.get("ts"))
+        if ts:
+            bar_time = int(ts)
+
+    payload = dict(direction_data) if isinstance(direction, dict) else {}
+    payload.update({
+        "pred_long": pred_long,
+        "pred_short": pred_short,
+        "threshold": threshold,
+        "aggressive_threshold": aggressive,
+        "bar_time": bar_time,
+        "source": source or payload.get("source"),
+    })
+    return payload
+
+
+def apply_model_meta(latest: dict, metrics_path: Path) -> Tuple[dict, dict]:
+    if not isinstance(latest, dict):
+        return latest, {}
+    model_dir = resolve_model_dir((latest.get("model") or {}).get("dir"), metrics_path)
+    meta = load_model_meta(model_dir) if model_dir else {}
+    label = meta.get("label") if isinstance(meta, dict) else None
+    if label:
+        model = latest.get("model") or {}
+        if not model.get("label"):
+            model["label"] = label
+        latest["model"] = model
+    return latest, meta
 
 
 class TradeStatsState:
@@ -1352,6 +1652,10 @@ def extract_price(latest: dict):
 def augment_latest(latest: dict, symbol: str, metrics_path: Path):
     if not isinstance(latest, dict):
         return latest
+    latest, meta = apply_model_meta(latest, metrics_path)
+    direction = resolve_direction_info(latest, meta)
+    if direction:
+        latest["direction"] = direction
     exch_daily = exchange_daily_pnl(symbol)
     if exch_daily is not None:
         latest["daily_pnl"] = exch_daily
@@ -1412,6 +1716,25 @@ def summary_from_files(file_map):
         latest = augment_latest(latest, symbol, path)
         items.append(latest)
     return items
+
+
+def format_model_display(latest: dict, entry_key: str, metrics_path: Path) -> Tuple[str, str]:
+    if not isinstance(latest, dict):
+        return entry_key or "", entry_key or ""
+    latest, _meta = apply_model_meta(latest, metrics_path)
+    symbol = resolve_latest_symbol(latest, entry_key)
+    model = latest.get("model") or {}
+    label = model.get("label") or model.get("keys_profile")
+    if not label:
+        model_dir = resolve_model_dir(model.get("dir"), metrics_path)
+        label = derive_model_label(model_dir) if model_dir else None
+    tags = []
+    if label and label != symbol:
+        tags.append(str(label))
+    if entry_key and entry_key != symbol and entry_key not in tags:
+        tags.append(str(entry_key))
+    display = f"{symbol} ({' / '.join(tags)})" if tags else symbol
+    return display, symbol
 
 
 EXTRA_SCRIPT = """
@@ -1529,6 +1852,7 @@ EXTRA_SCRIPT = """
   let chartUserZoom = false;
   let chartZoomState = null;
   let chartOverlay = { lines: [], markers: [], livePrice: null };
+  const chartStateCache = {};
 
   function ensureChartSection() {
     if (document.getElementById("icebergChart")) return;
@@ -1636,6 +1960,46 @@ EXTRA_SCRIPT = """
     }
   }
 
+  function syncChartRangeButtons() {
+    const rangeWrap = document.getElementById("chartRange");
+    if (!rangeWrap) return;
+    const target = (chartRangeKey || "").toLowerCase();
+    rangeWrap.querySelectorAll(".range-btn").forEach(btn => {
+      const key = (btn.dataset.range || "").toLowerCase();
+      btn.classList.toggle("active", key === target);
+    });
+  }
+
+  function stashChartState(key) {
+    if (!key) return;
+    chartStateCache[key] = {
+      fullCandles: chartFullCandles,
+      intervalSec: chartIntervalSec,
+      pricePrecision: chartPricePrecision,
+      zoomState: chartZoomState,
+      userZoom: chartUserZoom,
+      rangeSec: chartRangeSec,
+      rangeLabel: chartRangeLabel,
+      rangeKey: chartRangeKey,
+    };
+  }
+
+  function restoreChartState(key) {
+    const cached = chartStateCache[key];
+    if (!cached) return false;
+    chartFullCandles = Array.isArray(cached.fullCandles) ? cached.fullCandles : [];
+    chartIntervalSec = Number(cached.intervalSec) || chartIntervalSec;
+    chartPricePrecision = Number(cached.pricePrecision) || chartPricePrecision;
+    chartZoomState = cached.zoomState || null;
+    chartUserZoom = Boolean(cached.userZoom);
+    chartRangeSec = cached.rangeSec ?? chartRangeSec;
+    chartRangeLabel = cached.rangeLabel || chartRangeLabel;
+    chartRangeKey = cached.rangeKey || chartRangeKey;
+    chartNeedsFit = !chartUserZoom;
+    syncChartRangeButtons();
+    return chartFullCandles.length > 0;
+  }
+
   function parseTs(ts) {
     if (ts === null || ts === undefined || ts === "") return null;
     if (typeof ts === "number") {
@@ -1688,6 +2052,38 @@ EXTRA_SCRIPT = """
     const abs = Math.abs(num);
     const precision = abs >= 1 ? 4 : 6;
     return num.toFixed(precision);
+  }
+
+  function stripQuoteSymbol(symbol) {
+    if (!symbol) return "";
+    const upper = String(symbol).toUpperCase();
+    if (upper.endsWith("USDT") || upper.endsWith("USDC")) {
+      return String(symbol).slice(0, -4);
+    }
+    return String(symbol);
+  }
+
+  function modelFolderSuffix(modelDir) {
+    if (!modelDir) return "";
+    const cleaned = String(modelDir).replace(/\\/g, "/");
+    const parts = cleaned.split("/").filter(Boolean);
+    if (!parts.length) return "";
+    let folder = parts[parts.length - 1];
+    if (folder.toLowerCase().startsWith("rank_") && parts.length >= 2) {
+      folder = parts[parts.length - 2];
+    }
+    const idx = folder.indexOf("_");
+    if (idx < 0 || idx >= folder.length - 1) return "";
+    return folder.slice(idx + 1);
+  }
+
+  function shortModelLabel(data) {
+    if (!data) return "";
+    const symbol = data.symbol || data.dash_key || "";
+    const base = stripQuoteSymbol(symbol);
+    const suffix = modelFolderSuffix(data.model?.dir);
+    if (base && suffix) return `${base} ${suffix}`;
+    return base || suffix || "";
   }
 
   function setChartMeta(text) {
@@ -1896,8 +2292,10 @@ EXTRA_SCRIPT = """
       .map(m => ({
         coord: [m.time, m.price],
         name: m.title || "",
+        symbol: m.symbol || "pin",
+        symbolSize: m.symbolSize || 32,
         itemStyle: { color: m.color || "#38bdf8" },
-        label: { show: true, color: "#0b1220", fontSize: 9, formatter: "{b}" },
+        label: { show: true, color: m.labelColor || "#0b1220", fontSize: 9, formatter: "{b}" },
       }));
     chart.setOption({
       series: [
@@ -2070,15 +2468,41 @@ EXTRA_SCRIPT = """
     return chartFullCandles[0].time;
   }
 
+  function resolveMarkerPrice(time, fallback) {
+    const base = Number(fallback || 0);
+    if (!chartFullCandles.length) return base > 0 ? base : 0;
+    for (let i = chartFullCandles.length - 1; i >= 0; i--) {
+      const candle = chartFullCandles[i];
+      if (candle.time <= time) {
+        return Number(candle.close || candle.open || base || 0);
+      }
+    }
+    const first = chartFullCandles[0];
+    return Number(first?.close || first?.open || base || 0);
+  }
+
+  function numOrNaN(value) {
+    if (value === null || value === undefined || value === "") return NaN;
+    const num = Number(value);
+    return Number.isFinite(num) ? num : NaN;
+  }
+
+  function strengthRatio(value, threshold) {
+    if (!Number.isFinite(value) || !Number.isFinite(threshold)) return 0;
+    if (value <= threshold) return 0;
+    const span = Math.max(0.0001, 1 - threshold);
+    return Math.max(0, Math.min(1, (value - threshold) / span));
+  }
+
   function updateChartMarkers(data) {
     const markers = [];
     const ice = data.iceberg || {};
     const tp = data.iceberg_tp || {};
-    const pushMarker = (time, price, color, title) => {
+    const pushMarker = (time, price, color, title, symbol, symbolSize, labelColor) => {
       const t = Number(time || 0);
       const p = Number(price || 0);
       if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(p) || p <= 0) return;
-      markers.push({ time: t, price: p, color, title });
+      markers.push({ time: t, price: p, color, title, symbol, symbolSize, labelColor });
     };
     if (ice.buy && ice.buy.active) {
       const time = resolveMarkerTime(ice.buy.last_post_ts || ice.buy.created_ts);
@@ -2103,6 +2527,97 @@ EXTRA_SCRIPT = """
       const time = resolveMarkerTime(tp.short.tp_order_ts || tp.short.created_ts);
       const price = Number(tp.short.tp_order_price || tp.short.tp_target || 0);
       pushMarker(time, price, "#f59e0b", lineTitle("TP Short", tpInfoLabel(tp.short)));
+    }
+    const prediction = data.prediction || data.health?.last_prediction || {};
+    const predThreshold = numOrNaN(prediction.threshold);
+    const predTime = resolveMarkerTime(prediction.bar_time || data.market?.last_bar_time || data.ts);
+    const predLong = numOrNaN(prediction.pred_long);
+    const predShort = numOrNaN(prediction.pred_short);
+
+    const direction = data.direction || {};
+    const dirThreshold = numOrNaN(direction.threshold);
+    const dirAggressive = numOrNaN(direction.aggressive_threshold);
+    const dirTime = resolveMarkerTime(direction.bar_time || prediction.bar_time || data.market?.last_bar_time || data.ts);
+    const dirLong = numOrNaN(direction.pred_long);
+    const dirShort = numOrNaN(direction.pred_short);
+    const gateEnabled = Number.isFinite(dirThreshold) && Number.isFinite(dirAggressive);
+
+    const cuePositions = (price) => {
+      const baseOffset = price > 0 ? price * 0.0012 : 0;
+      const step = price > 0 ? price * 0.0009 : 0;
+      return {
+        long: {
+          pred: price + baseOffset,
+          dir: price + baseOffset + step,
+          gate: price + baseOffset + step * 2,
+        },
+        short: {
+          pred: price - baseOffset,
+          dir: price - baseOffset - step,
+          gate: price - baseOffset - step * 2,
+        },
+      };
+    };
+
+    if (predTime && Number.isFinite(predThreshold)) {
+      const basePrice = resolveMarkerPrice(predTime, resolveLivePrice(data));
+      if (basePrice > 0) {
+        const pos = cuePositions(basePrice);
+        if (Number.isFinite(predLong) && predLong >= predThreshold) {
+          const strength = strengthRatio(predLong, predThreshold);
+          const size = 14 + Math.round(strength * 12);
+          const label = `PL ${predLong.toFixed(2)}`;
+          pushMarker(predTime, pos.long.pred, "#22c55e", label, "triangle", size, "#0b1220");
+        }
+        if (Number.isFinite(predShort) && predShort >= predThreshold) {
+          const strength = strengthRatio(predShort, predThreshold);
+          const size = 14 + Math.round(strength * 12);
+          const label = `PS ${predShort.toFixed(2)}`;
+          pushMarker(predTime, pos.short.pred, "#ef4444", label, "triangle", size, "#0b1220");
+        }
+      }
+    }
+
+    if (dirTime && Number.isFinite(dirThreshold)) {
+      const basePrice = resolveMarkerPrice(dirTime, resolveLivePrice(data));
+      if (basePrice > 0) {
+        const pos = cuePositions(basePrice);
+        if (Number.isFinite(dirLong) && dirLong >= dirThreshold) {
+          const strength = strengthRatio(dirLong, dirThreshold);
+          const aggressive = Number.isFinite(dirAggressive) && dirLong >= dirAggressive;
+          const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
+          const label = `${aggressive ? "AGG " : ""}DL ${dirLong.toFixed(2)}`;
+          const color = aggressive ? "#0ea5e9" : "#38bdf8";
+          pushMarker(dirTime, pos.long.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+        }
+        if (Number.isFinite(dirShort) && dirShort >= dirThreshold) {
+          const strength = strengthRatio(dirShort, dirThreshold);
+          const aggressive = Number.isFinite(dirAggressive) && dirShort >= dirAggressive;
+          const size = 16 + Math.round(strength * 14) + (aggressive ? 10 : 0);
+          const label = `${aggressive ? "AGG " : ""}DS ${dirShort.toFixed(2)}`;
+          const color = aggressive ? "#ec4899" : "#f472b6";
+          pushMarker(dirTime, pos.short.dir, color, label, aggressive ? "diamond" : "circle", size, "#0b1220");
+        }
+      }
+    }
+
+    if (predTime && Number.isFinite(predThreshold) && gateEnabled) {
+      const basePrice = resolveMarkerPrice(predTime, resolveLivePrice(data));
+      if (basePrice > 0) {
+        const pos = cuePositions(basePrice);
+        if (Number.isFinite(predLong) && Number.isFinite(dirLong) && predLong >= predThreshold && dirLong >= dirThreshold) {
+          const strength = Math.min(strengthRatio(predLong, predThreshold), strengthRatio(dirLong, dirThreshold));
+          const size = 18 + Math.round(strength * 12);
+          const label = `GL ${predLong.toFixed(2)}`;
+          pushMarker(predTime, pos.long.gate, "#facc15", label, "pin", size, "#0b1220");
+        }
+        if (Number.isFinite(predShort) && Number.isFinite(dirShort) && predShort >= predThreshold && dirShort >= dirThreshold) {
+          const strength = Math.min(strengthRatio(predShort, predThreshold), strengthRatio(dirShort, dirThreshold));
+          const size = 18 + Math.round(strength * 12);
+          const label = `GS ${predShort.toFixed(2)}`;
+          pushMarker(predTime, pos.short.gate, "#f97316", label, "pin", size, "#0b1220");
+        }
+      }
     }
     chartOverlay.markers = markers;
     applyChartOverlay();
@@ -2146,6 +2661,7 @@ EXTRA_SCRIPT = """
   let chartControlsBound = false;
   let chartRangeSec = 15 * 60;
   let chartRangeLabel = "15M";
+  let chartRangeKey = "15m";
   async function sendCommand(scope, side) {
     const key = window.__dashKey;
     const symbol = window.__dashSymbol;
@@ -2198,22 +2714,23 @@ EXTRA_SCRIPT = """
       "all": { label: "All", sec: 0 },
     };
     rangeWrap.querySelectorAll(".range-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        rangeWrap.querySelectorAll(".range-btn").forEach(b => b.classList.remove("active"));
-        btn.classList.add("active");
-        const key = (btn.dataset.range || "").toLowerCase();
-        const meta = mapping[key];
-        if (meta) {
-          chartNeedsFit = true;
-          chartUserZoom = false;
-          chartZoomState = null;
-          chartRangeSec = meta.sec;
-          chartRangeLabel = meta.label;
-          if (chartFullCandles.length) {
-            setCandlesData(chartFullCandles);
-          } else {
-            fetchChartHistory(true);
-          }
+        btn.addEventListener("click", () => {
+          rangeWrap.querySelectorAll(".range-btn").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          const key = (btn.dataset.range || "").toLowerCase();
+          const meta = mapping[key];
+          if (meta) {
+            chartNeedsFit = true;
+            chartUserZoom = false;
+            chartZoomState = null;
+            chartRangeSec = meta.sec;
+            chartRangeLabel = meta.label;
+            chartRangeKey = key;
+            if (chartFullCandles.length) {
+              setCandlesData(chartFullCandles);
+            } else {
+              fetchChartHistory(true);
+            }
         }
       });
     });
@@ -2364,12 +2881,20 @@ EXTRA_SCRIPT = """
     const chartTitle = document.getElementById("chartTitle");
     if (chartTitle && (data.symbol || dashKey)) {
       const base = data.symbol || dashKey;
-      const keyTag = dashKey && data.symbol && dashKey !== data.symbol ? ` (${dashKey})` : "";
-      chartTitle.textContent = `${base}${keyTag} Chart`;
+      const modelLabel = shortModelLabel(data);
+      const tags = [];
+      if (dashKey && data.symbol && dashKey !== data.symbol) tags.push(dashKey);
+      if (modelLabel && modelLabel !== data.symbol && modelLabel !== dashKey) tags.push(modelLabel);
+      const tagText = tags.length ? ` (${tags.join(" / ")})` : "";
+      chartTitle.textContent = `${base}${tagText} Chart`;
     }
     const chartSub = document.getElementById("chartSub");
     if (chartSub) {
-      const tag = dashKey && data.symbol && dashKey !== data.symbol ? ` | ${dashKey}` : "";
+      const modelLabel = shortModelLabel(data);
+      const tags = [];
+      if (dashKey && data.symbol && dashKey !== data.symbol) tags.push(dashKey);
+      if (modelLabel && modelLabel !== data.symbol && modelLabel !== dashKey) tags.push(modelLabel);
+      const tag = tags.length ? ` | ${tags.join(" / ")}` : "";
       chartSub.textContent = data.ts ? `Updated ${data.ts}${tag}` : "Waiting for data...";
     }
     const chartStatus = document.getElementById("chartStatus");
@@ -2442,16 +2967,30 @@ EXTRA_SCRIPT = """
       initChart();
       const key = window.__dashKey || window.__dashSymbol;
       const keyChanged = key && key !== chartLastKey;
+      let restored = false;
       if (keyChanged) {
+        if (chartLastKey) {
+          stashChartState(chartLastKey);
+        }
         chartLastKey = key;
-        chartFullCandles = [];
-        chartNeedsFit = true;
-        chartUserZoom = false;
-        chartZoomState = null;
         chartOverlay = { lines: [], markers: [], livePrice: null };
+        restored = restoreChartState(key);
+        if (!restored) {
+          chartFullCandles = [];
+          chartNeedsFit = true;
+          chartUserZoom = false;
+          chartZoomState = null;
+          chartRangeSec = 15 * 60;
+          chartRangeLabel = "15M";
+          chartRangeKey = "15m";
+          syncChartRangeButtons();
+        }
         if (chart) {
           chart.clear();
           chart.setOption(baseChartOption(), { notMerge: true, lazyUpdate: true });
+        }
+        if (restored && chartFullCandles.length) {
+          setCandlesData(chartFullCandles);
         }
       }
       updateChartLines(data);
@@ -2461,7 +3000,7 @@ EXTRA_SCRIPT = """
         fetchChartHistory(true);
         chartTimer = setInterval(fetchChartHistory, 10000);
       } else if (keyChanged) {
-        fetchChartHistory(true);
+        fetchChartHistory(!restored);
       }
     });
   }
@@ -2469,7 +3008,7 @@ EXTRA_SCRIPT = """
   window.refreshIcebergChart = function() {
     loadChartLib(() => {
       initChart();
-      fetchChartHistory(true);
+      fetchChartHistory(!chartFullCandles.length);
     });
   };
 
@@ -2979,10 +3518,15 @@ class MetricsHandler(BaseHTTPRequestHandler):
             latest = read_latest(file_map[entry_key])
             symbol = resolve_latest_symbol(latest, entry_key)
             key_signals = self.metrics_dir / f"signals_{entry_key}.jsonl"
-            if key_signals.exists() and key_signals.stat().st_size > 0:
+            if key and entry_key == key:
+                if not (key_signals.exists() and key_signals.stat().st_size > 0):
+                    return self._send(200, [])
                 signals_path = key_signals
             else:
-                signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+                if key_signals.exists() and key_signals.stat().st_size > 0:
+                    signals_path = key_signals
+                else:
+                    signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
             return self._send(200, tail_jsonl(signals_path, limit=limit, max_bytes=max_bytes))
 
         if parsed.path == "/api/candles":
@@ -3109,8 +3653,8 @@ class DiscordNotifier:
         except Exception as exc:
             print(f"Discord notify error: {exc}")
 
-    def _cooldown_ok(self, symbol: str, event: str) -> bool:
-        key = f"{symbol}:{event}"
+    def _cooldown_ok(self, entry_key: str, event: str) -> bool:
+        key = f"{entry_key}:{event}"
         now = time.time()
         last = self.last_sent.get(key, 0.0)
         if now - last < self.cooldown_sec:
@@ -3118,8 +3662,8 @@ class DiscordNotifier:
         self.last_sent[key] = now
         return True
 
-    def _notify(self, symbol: str, event: str, message: str) -> None:
-        if not self._cooldown_ok(symbol, event):
+    def _notify(self, entry_key: str, event: str, message: str) -> None:
+        if not self._cooldown_ok(entry_key, event):
             return
         self._send(message)
 
@@ -3142,15 +3686,16 @@ class DiscordNotifier:
         ]
         return any(k in lower for k in keywords)
 
-    def _check_symbol(self, symbol: str, latest: dict) -> None:
-        state = self.last_state.setdefault(symbol, {})
+    def _check_entry(self, entry_key: str, latest: dict, metrics_path: Path) -> None:
+        state = self.last_state.setdefault(entry_key, {})
         now = time.time()
         ts = parse_ts(latest.get("ts")) if latest else None
         online = ts is not None and (now - ts) <= self.offline_sec
+        display, symbol = format_model_display(latest or {}, entry_key, metrics_path)
         if state.get("online", True) and not online:
             age = now - ts if ts else None
             age_text = f"{age:.1f}s" if age is not None else "unknown"
-            self._notify(symbol, "offline", f"{symbol} offline (last update {age_text} ago)")
+            self._notify(entry_key, "offline", f"{display} offline (last update {age_text} ago)")
         state["online"] = online
 
         if not latest or not online:
@@ -3158,7 +3703,7 @@ class DiscordNotifier:
 
         startup = latest.get("startup_time")
         if startup and startup != state.get("startup_time"):
-            self._notify(symbol, "started", f"{symbol} started (startup {startup})")
+            self._notify(entry_key, "started", f"{display} started (startup {startup})")
             state["startup_time"] = startup
 
         errors = latest.get("errors") or {}
@@ -3166,9 +3711,9 @@ class DiscordNotifier:
         api_count = int(errors.get("api_count") or 0)
         if runtime_count > state.get("runtime_count", 0) or api_count > state.get("api_count", 0):
             err_text = errors.get("last_runtime_error") or errors.get("last_api_error") or "unknown error"
-            self._notify(symbol, "error", f"{symbol} error: {err_text}")
+            self._notify(entry_key, "error", f"{display} error: {err_text}")
             if self._is_order_error(err_text):
-                self._notify(symbol, "order_error", f"{symbol} order error: {err_text}")
+                self._notify(entry_key, "order_error", f"{display} order error: {err_text}")
         state["runtime_count"] = runtime_count
         state["api_count"] = api_count
 
@@ -3181,9 +3726,9 @@ class DiscordNotifier:
         if drawdown and not state.get("drawdown_alerted"):
             pct = (daily_pnl / equity) * 100.0 if equity else 0.0
             self._notify(
-                symbol,
+                entry_key,
                 "drawdown",
-                f"{symbol} drawdown alert: {daily_pnl:.2f} ({pct:.1f}%)",
+                f"{display} drawdown alert: {daily_pnl:.2f} ({pct:.1f}%)",
             )
             state["drawdown_alerted"] = True
         elif not drawdown:
@@ -3194,12 +3739,12 @@ class DiscordNotifier:
             if self.fixed_files:
                 file_map = self.fixed_files
             else:
-                file_map = discover_metrics_files(self.metrics_dir, self.symbols_filter)
-            for symbol, path in file_map.items():
+                file_map = discover_metrics_entries(self.metrics_dir, self.symbols_filter)
+            for entry_key, path in file_map.items():
                 latest = read_latest(path)
                 if latest and not latest.get("symbol"):
-                    latest["symbol"] = symbol
-                self._check_symbol(symbol, latest or {})
+                    latest["symbol"] = resolve_latest_symbol(latest, entry_key)
+                self._check_entry(entry_key, latest or {}, path)
             time.sleep(self.poll_sec)
 
 
@@ -3329,9 +3874,9 @@ class SignalNotifier:
             return f"{bar_time}-{side}"
         return None
 
-    def _remember_signal(self, symbol: str, signal_id: str) -> None:
-        history = self._seen.setdefault(symbol, deque(maxlen=self.max_seen))
-        seen = self._seen_set.setdefault(symbol, set())
+    def _remember_signal(self, entry_key: str, signal_id: str) -> None:
+        history = self._seen.setdefault(entry_key, deque(maxlen=self.max_seen))
+        seen = self._seen_set.setdefault(entry_key, set())
         if signal_id in seen:
             return
         if len(history) >= self.max_seen:
@@ -3341,10 +3886,10 @@ class SignalNotifier:
         history.append(signal_id)
         seen.add(signal_id)
 
-    def _seen_signal(self, symbol: str, signal_id: str) -> bool:
-        return signal_id in self._seen_set.get(symbol, set())
+    def _seen_signal(self, entry_key: str, signal_id: str) -> bool:
+        return signal_id in self._seen_set.get(entry_key, set())
 
-    def _format_signal_message(self, symbol: str, signal: dict) -> str:
+    def _format_signal_message(self, display: str, signal: dict) -> str:
         side_raw = str(signal.get("side") or "").lower()
         side = "LONG" if side_raw == "buy" else "SHORT" if side_raw == "sell" else side_raw.upper() or "SIGNAL"
         pred = safe_float(signal.get("pred"), 0.0)
@@ -3356,7 +3901,7 @@ class SignalNotifier:
         timeframe = signal.get("timeframe") or ""
         mode = signal.get("mode") or ""
         lines = [
-            f"{symbol} {side} signal {pred:.3f} (>= {self.min_pred:.2f})",
+            f"{display} {side} signal {pred:.3f} (>= {self.min_pred:.2f})",
             f"Entry {entry} | TP {tp} | SL {sl}",
         ]
         if ts:
@@ -3367,29 +3912,41 @@ class SignalNotifier:
             lines.append(f"Mode: {mode}")
         return "\n".join(lines)
 
-    def _prime_seen(self, symbol: str) -> None:
-        signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+    def _prime_seen(self, entry_key: str, signals_path: Path) -> None:
         signals = tail_jsonl(signals_path, limit=self.max_seen, max_bytes=256 * 1024)
         for signal in signals:
             signal_id = self._signal_key(signal)
             if signal_id:
-                self._remember_signal(symbol, signal_id)
+                self._remember_signal(entry_key, signal_id)
 
     def _run(self) -> None:
         while not self._stop.is_set():
             if self.fixed_files:
                 file_map = self.fixed_files
             else:
-                file_map = discover_metrics_files(self.metrics_dir, self.symbols_filter)
-            symbols = list(file_map.keys())
+                file_map = discover_metrics_entries(self.metrics_dir, self.symbols_filter)
+            entries = list(file_map.items())
             if not self._bootstrapped:
-                for symbol in symbols:
-                    self._prime_seen(symbol)
+                for entry_key, path in entries:
+                    latest = read_latest(path)
+                    symbol = resolve_latest_symbol(latest, entry_key)
+                    key_signals = self.metrics_dir / f"signals_{entry_key}.jsonl"
+                    if key_signals.exists() and key_signals.stat().st_size > 0:
+                        signals_path = key_signals
+                    else:
+                        signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+                    self._prime_seen(entry_key, signals_path)
                 self._bootstrapped = True
                 time.sleep(self.poll_sec)
                 continue
-            for symbol in symbols:
-                signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+            for entry_key, path in entries:
+                latest = read_latest(path)
+                display, symbol = format_model_display(latest or {}, entry_key, path)
+                key_signals = self.metrics_dir / f"signals_{entry_key}.jsonl"
+                if key_signals.exists() and key_signals.stat().st_size > 0:
+                    signals_path = key_signals
+                else:
+                    signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
                 signals = tail_jsonl(signals_path, limit=40, max_bytes=256 * 1024)
                 if not signals:
                     continue
@@ -3402,11 +3959,219 @@ class SignalNotifier:
                     if pred < self.min_pred:
                         continue
                     signal_id = self._signal_key(signal)
-                    if not signal_id or self._seen_signal(symbol, signal_id):
+                    if not signal_id or self._seen_signal(entry_key, signal_id):
                         continue
-                    message = self._format_signal_message(symbol, signal)
+                    message = self._format_signal_message(display, signal)
                     self._send(message)
-                    self._remember_signal(symbol, signal_id)
+                    self._remember_signal(entry_key, signal_id)
+            time.sleep(self.poll_sec)
+
+
+class DirectionNotifier:
+    def __init__(
+        self,
+        webhook_url: str,
+        telegram_token: str,
+        telegram_chat_id: str,
+        metrics_dir: Path,
+        poll_sec: float = 5.0,
+        fixed_files=None,
+        symbols_filter=None,
+    ):
+        self.webhook_url = webhook_url
+        self.telegram_token = telegram_token
+        self.telegram_chat_id = telegram_chat_id
+        self.metrics_dir = metrics_dir
+        self.poll_sec = poll_sec
+        self.fixed_files = fixed_files
+        self.symbols_filter = symbols_filter
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._bootstrapped = False
+        self._seen = {}
+
+    def start(self):
+        if self.webhook_url or (self.telegram_token and self.telegram_chat_id):
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _send_discord(self, content: str) -> None:
+        if not self.webhook_url:
+            return
+        payload = json.dumps({"content": content}).encode("utf-8")
+        req = Request(
+            self.webhook_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "live-dashboard/1.0",
+            },
+        )
+        try:
+            with urlopen(req, timeout=10) as resp:
+                resp.read()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            print(f"Direction notify (discord) failed: HTTP {exc.code} {exc.reason} {detail}")
+        except URLError as exc:
+            print(f"Direction notify (discord) failed: {exc}")
+        except Exception as exc:
+            print(f"Direction notify (discord) error: {exc}")
+
+    def _send_telegram(self, content: str) -> None:
+        if not self.telegram_token or not self.telegram_chat_id:
+            return
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        payload = json.dumps({"chat_id": self.telegram_chat_id, "text": content}).encode("utf-8")
+        req = Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "live-dashboard/1.0",
+            },
+        )
+        try:
+            with urlopen(req, timeout=10) as resp:
+                resp.read()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            print(f"Direction notify (telegram) failed: HTTP {exc.code} {exc.reason} {detail}")
+        except URLError as exc:
+            print(f"Direction notify (telegram) failed: {exc}")
+        except Exception as exc:
+            print(f"Direction notify (telegram) error: {exc}")
+
+    def _send(self, content: str) -> None:
+        self._send_discord(content)
+        self._send_telegram(content)
+
+    def _seen_key(self, entry_key: str, side: str) -> Optional[int]:
+        return self._seen.get(entry_key, {}).get(side)
+
+    def _remember(self, entry_key: str, side: str, bar_time: int) -> None:
+        if entry_key not in self._seen:
+            self._seen[entry_key] = {}
+        self._seen[entry_key][side] = bar_time
+
+    def _format_direction_message(
+        self,
+        display: str,
+        side: str,
+        pred: float,
+        aggressive: float,
+        threshold: Optional[float],
+        bar_time: Optional[int],
+        ts: Optional[str],
+    ) -> str:
+        side_label = "LONG" if side == "long" else "SHORT"
+        lines = [f"{display} DIR {side_label} {pred:.3f} (>= {aggressive:.2f})"]
+        if threshold is not None:
+            lines.append(f"Dir Threshold {threshold:.2f} | Bar {bar_time or 'n/a'}")
+        else:
+            lines.append(f"Bar {bar_time or 'n/a'}")
+        if ts:
+            lines.append(f"Time: {ts}")
+        return "\n".join(lines)
+
+    def _direction_bar_time(self, direction: dict, latest: dict) -> Optional[int]:
+        bar_time = normalize_bar_time(direction.get("bar_time"))
+        if bar_time is None:
+            ts = parse_ts(latest.get("ts")) if latest else None
+            if ts:
+                bar_time = int(ts)
+        return bar_time
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.fixed_files:
+                file_map = self.fixed_files
+            else:
+                file_map = discover_metrics_entries(self.metrics_dir, self.symbols_filter)
+            entries = list(file_map.items())
+            if not self._bootstrapped:
+                for entry_key, path in entries:
+                    latest = read_latest(path)
+                    if not latest:
+                        continue
+                    latest = apply_dash_meta(latest, entry_key)
+                    latest, meta = apply_model_meta(latest, path)
+                    direction = resolve_direction_info(latest, meta)
+                    if not direction:
+                        continue
+                    bar_time = self._direction_bar_time(direction, latest)
+                    aggressive = maybe_float(direction.get("aggressive_threshold"))
+                    if aggressive is None:
+                        continue
+                    pred_long = maybe_float(direction.get("pred_long"))
+                    pred_short = maybe_float(direction.get("pred_short"))
+                    if pred_long is not None and pred_long >= aggressive and bar_time:
+                        self._remember(entry_key, "long", bar_time)
+                    if pred_short is not None and pred_short >= aggressive and bar_time:
+                        self._remember(entry_key, "short", bar_time)
+                self._bootstrapped = True
+                time.sleep(self.poll_sec)
+                continue
+
+            for entry_key, path in entries:
+                latest = read_latest(path)
+                if not latest:
+                    continue
+                latest = apply_dash_meta(latest, entry_key)
+                latest, meta = apply_model_meta(latest, path)
+                direction = resolve_direction_info(latest, meta)
+                if not direction:
+                    continue
+                bar_time = self._direction_bar_time(direction, latest)
+                aggressive = maybe_float(direction.get("aggressive_threshold"))
+                if aggressive is None:
+                    continue
+                threshold = maybe_float(direction.get("threshold"))
+                display, _symbol = format_model_display(latest, entry_key, path)
+                ts_text = latest.get("ts")
+
+                pred_long = maybe_float(direction.get("pred_long"))
+                if pred_long is not None and pred_long >= aggressive and bar_time:
+                    last_seen = self._seen_key(entry_key, "long")
+                    if last_seen is None or bar_time > last_seen:
+                        message = self._format_direction_message(
+                            display,
+                            "long",
+                            pred_long,
+                            aggressive,
+                            threshold,
+                            bar_time,
+                            ts_text,
+                        )
+                        self._send(message)
+                        self._remember(entry_key, "long", bar_time)
+
+                pred_short = maybe_float(direction.get("pred_short"))
+                if pred_short is not None and pred_short >= aggressive and bar_time:
+                    last_seen = self._seen_key(entry_key, "short")
+                    if last_seen is None or bar_time > last_seen:
+                        message = self._format_direction_message(
+                            display,
+                            "short",
+                            pred_short,
+                            aggressive,
+                            threshold,
+                            bar_time,
+                            ts_text,
+                        )
+                        self._send(message)
+                        self._remember(entry_key, "short", bar_time)
+
             time.sleep(self.poll_sec)
 
 
@@ -3514,6 +4279,16 @@ def main():
         symbols_filter=MetricsHandler.symbols_filter,
     )
     signal_notifier.start()
+    direction_notifier = DirectionNotifier(
+        webhook_url=webhook,
+        telegram_token=telegram_token,
+        telegram_chat_id=telegram_chat_id,
+        metrics_dir=MetricsHandler.metrics_dir,
+        poll_sec=args.notify_poll_sec,
+        fixed_files=MetricsHandler.fixed_files,
+        symbols_filter=MetricsHandler.symbols_filter,
+    )
+    direction_notifier.start()
 
     server = HTTPServer((args.host, args.port), MetricsHandler)
     print(f"Dashboard running on http://{args.host}:{args.port}")

@@ -143,6 +143,7 @@
     .warn { color: var(--accent2); }
     .bad { color: var(--danger); }
     .muted { color: var(--muted); }
+    .strong { font-weight: 700; text-shadow: 0 0 8px rgba(248,250,252,0.25); }
     .pill.signal {
       color: #38bdf8;
       border-color: rgba(56,189,248,0.6);
@@ -605,8 +606,13 @@
           <div class="value" id="modelPred">--</div>
           <div class="row"><span>Pred Long</span><span id="predLong">--</span></div>
           <div class="row"><span>Pred Short</span><span id="predShort">--</span></div>
+          <div class="row"><span>Dir Long</span><span id="dirLong">--</span></div>
+          <div class="row"><span>Dir Short</span><span id="dirShort">--</span></div>
           <div class="row"><span>Threshold</span><span id="predThreshold">--</span></div>
-          <div class="row"><span>Bar Time</span><span id="predBar">--</span></div>
+          <div class="row"><span>Pred Bar</span><span id="predBar">--</span></div>
+          <div class="row"><span>Dir Threshold</span><span id="dirThreshold">--</span></div>
+          <div class="row"><span>Aggressive</span><span id="dirAggressive">--</span></div>
+          <div class="row"><span>Dir Bar</span><span id="dirBar">--</span></div>
           <div class="row"><span>Model Path</span><span class="truncate" id="modelPath">--</span></div>
           <div class="row"><span>Keys Profile</span><span id="keysProfile">--</span></div>
         </div>
@@ -1085,27 +1091,62 @@
       return "muted";
     }
 
+    function setDirectionValue(id, value, threshold, aggressive, side) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const num = Number(value);
+      if (!Number.isFinite(num)) {
+        el.textContent = "--";
+        el.className = "";
+        return;
+      }
+      el.textContent = fmt(num, 3);
+      let cls = "";
+      if (Number.isFinite(aggressive) && num >= aggressive) {
+        cls = side === "short" ? "bad strong" : "ok strong";
+      } else if (Number.isFinite(threshold) && num >= threshold) {
+        cls = side === "short" ? "bad" : "ok";
+      }
+      el.className = cls;
+    }
+
     function entryKey(item) {
       if (!item) return null;
       return item.dash_key || item.symbol || null;
     }
 
+    function stripQuoteSymbol(symbol) {
+      if (!symbol) return "";
+      const upper = symbol.toUpperCase();
+      if (upper.endsWith("USDT")) return symbol.slice(0, -4);
+      if (upper.endsWith("USDC")) return symbol.slice(0, -4);
+      return symbol;
+    }
+
+    function modelFolderSuffix(modelDir) {
+      if (!modelDir) return "";
+      const cleaned = String(modelDir).replace(/\\/g, "/");
+      const parts = cleaned.split("/").filter(Boolean);
+      if (!parts.length) return "";
+      let folder = parts[parts.length - 1];
+      if (folder.toLowerCase().startsWith("rank_") && parts.length >= 2) {
+        folder = parts[parts.length - 2];
+      }
+      const idx = folder.indexOf("_");
+      if (idx < 0 || idx >= folder.length - 1) return "";
+      return folder.slice(idx + 1);
+    }
+
     function modelLabel(item) {
       if (!item) return "--";
+      const symbol = String(item.symbol || item.dash_key || "");
+      const base = stripQuoteSymbol(symbol);
       const model = item.model || {};
+      const suffix = modelFolderSuffix(model.dir);
+      if (base && suffix) return `${base} ${suffix}`;
+      if (base) return base;
+      if (suffix) return suffix;
       if (model.keys_profile) return String(model.keys_profile);
-      const dir = model.dir || "";
-      if (dir) {
-        const cleaned = String(dir).replace(/\\/g, "/");
-        const parts = cleaned.split("/").filter(Boolean);
-        if (parts.length >= 2) {
-          return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
-        }
-        return parts[parts.length - 1] || "--";
-      }
-      if (item.dash_key && item.symbol && item.dash_key !== item.symbol) {
-        return item.dash_key;
-      }
       return "--";
     }
 
@@ -1364,6 +1405,24 @@
       document.getElementById("predShort").textContent = fmt(predShort, 3);
       document.getElementById("predThreshold").textContent = fmt(prediction.threshold, 3);
       document.getElementById("predBar").textContent = prediction.bar_time ?? "--";
+
+      const direction = data.direction || {};
+      const dirThreshold = direction.threshold;
+      const dirAggressive = direction.aggressive_threshold;
+      setDirectionValue("dirLong", direction.pred_long, dirThreshold, dirAggressive, "long");
+      setDirectionValue("dirShort", direction.pred_short, dirThreshold, dirAggressive, "short");
+      const dirThresholdEl = document.getElementById("dirThreshold");
+      if (dirThresholdEl) {
+        dirThresholdEl.textContent = fmt(dirThreshold, 3);
+        dirThresholdEl.className = "muted";
+      }
+      const dirAggressiveEl = document.getElementById("dirAggressive");
+      if (dirAggressiveEl) {
+        dirAggressiveEl.textContent = fmt(dirAggressive, 3);
+        dirAggressiveEl.className = "muted";
+      }
+      const dirBarEl = document.getElementById("dirBar");
+      if (dirBarEl) dirBarEl.textContent = direction.bar_time ?? "--";
 
       const modelPath = model.dir || "--";
       const modelPathEl = document.getElementById("modelPath");

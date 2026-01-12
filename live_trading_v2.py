@@ -1232,6 +1232,10 @@ class LiveTradingV2:
         self.last_sentiment: Optional[str] = None
         self.last_health: Optional[str] = None
         self.last_prediction: Dict[str, object] = {}
+        self.last_direction: Dict[str, object] = {}
+        self.direction_gate_signals = False
+        self.direction_threshold_set = False
+        self.aggressive_threshold_set = False
         self.last_signal: Dict[str, object] = {}
         self.last_feature_vector: Optional[Dict[str, object]] = None
         self.last_feature_row: Optional[pd.Series] = None
@@ -1258,6 +1262,7 @@ class LiveTradingV2:
             self.logger.warning(f"Resolved model dir: {self.model_dir} (from {args.model_dir}).")
         self.model_long, self.model_short, self.model_features = self._load_model(self.model_dir)
         self._apply_model_params(self.model_dir)
+        self.dir_model_long, self.dir_model_short = self._load_direction_models(self.model_dir)
         self.min_feature_bars = self._min_window_for_features(self.model_features)
         if self.window_size < self.min_feature_bars:
             self.logger.warning(
@@ -1267,7 +1272,8 @@ class LiveTradingV2:
         self.feature_baseline = FeatureBaseline(self.model_features, args.feature_z_window)
 
         self.bar_window = BarWindow(self.tf_seconds, self.config.data.ob_levels, self.window_size, self.logger)
-        self.history_path = Path(f"data_history_{self.config.data.symbol}.csv")
+        self.metrics_key = self._resolve_log_key(args.metrics_log_path, self.config.data.symbol)
+        log_dir = self._resolve_log_dir(args.metrics_log_path)
         if args.metrics_log_path:
             self.metrics_path = Path(args.metrics_log_path)
         else:
@@ -1275,7 +1281,8 @@ class LiveTradingV2:
         if args.signal_log_path:
             self.signal_log_path = Path(args.signal_log_path)
         else:
-            self.signal_log_path = Path(f"signals_{self.config.data.symbol}.jsonl")
+            self.signal_log_path = log_dir / f"signals_{self.metrics_key}.jsonl"
+        self.history_path = log_dir / f"data_history_{self.config.data.symbol}.csv"
         self._load_history()
         self._fill_history_gaps()
         self._bootstrap_bars()
@@ -1396,6 +1403,26 @@ class LiveTradingV2:
                 return candidate
         return path
 
+    def _resolve_log_key(self, metrics_log_path: Optional[str], symbol: str) -> str:
+        if not metrics_log_path:
+            return symbol
+        try:
+            path = Path(metrics_log_path)
+        except Exception:
+            return symbol
+        stem = path.stem
+        if stem.startswith("live_metrics_"):
+            stem = stem.replace("live_metrics_", "", 1)
+        return stem or symbol
+
+    def _resolve_log_dir(self, metrics_log_path: Optional[str]) -> Path:
+        if not metrics_log_path:
+            return Path(".")
+        try:
+            return Path(metrics_log_path).expanduser().parent
+        except Exception:
+            return Path(".")
+
     def _load_model(self, model_dir: Path) -> Tuple[object, object, List[str]]:
         path = Path(model_dir)
         if not path.exists():
@@ -1406,6 +1433,28 @@ class LiveTradingV2:
         if not isinstance(features, list) or not features:
             raise ValueError("features.pkl must contain a non-empty list")
         return model_long, model_short, features
+
+    def _load_direction_models(self, model_dir: Path) -> Tuple[Optional[object], Optional[object]]:
+        path = Path(model_dir)
+        long_path = path / "dir_model_long.pkl"
+        short_path = path / "dir_model_short.pkl"
+        dir_long = None
+        dir_short = None
+        if long_path.exists():
+            try:
+                dir_long = joblib.load(long_path)
+            except Exception as exc:
+                self.logger.error(f"Failed to load dir_model_long.pkl: {exc}")
+        if short_path.exists():
+            try:
+                dir_short = joblib.load(short_path)
+            except Exception as exc:
+                self.logger.error(f"Failed to load dir_model_short.pkl: {exc}")
+        if dir_long or dir_short:
+            self.logger.info("Direction models loaded.")
+        else:
+            self.logger.info("Direction models not found; using pass-through.")
+        return dir_long, dir_short
 
     def _apply_model_params(self, model_dir: Path) -> None:
         path = Path(model_dir) / "params.json"
@@ -1419,10 +1468,24 @@ class LiveTradingV2:
             self.logger.error(f"Failed to load params.json: {exc}")
             return
 
+        self.direction_threshold_set = "direction_threshold" in params
+        self.aggressive_threshold_set = "aggressive_threshold" in params
+
         self.config.strategy.base_limit_offset_atr = safe_float(params.get("limit_offset_atr"), self.config.strategy.base_limit_offset_atr)
         self.config.strategy.take_profit_atr = safe_float(params.get("take_profit_atr"), self.config.strategy.take_profit_atr)
         self.config.strategy.stop_loss_atr = safe_float(params.get("stop_loss_atr"), self.config.strategy.stop_loss_atr)
         self.config.model.model_threshold = safe_float(params.get("model_threshold"), self.config.model.model_threshold)
+        if self.direction_threshold_set:
+            self.config.model.direction_threshold = safe_float(
+                params.get("direction_threshold"),
+                self.config.model.direction_threshold,
+            )
+        if self.aggressive_threshold_set:
+            self.config.model.aggressive_threshold = safe_float(
+                params.get("aggressive_threshold"),
+                self.config.model.aggressive_threshold,
+            )
+        self.direction_gate_signals = self.direction_threshold_set and self.aggressive_threshold_set
         self._validate_model_metadata(params)
 
     def _validate_model_metadata(self, params: Dict) -> None:
@@ -3197,6 +3260,13 @@ class LiveTradingV2:
         self.logger.info(f"Feature Count: {len(self.model_features)}")
         self.logger.info(f"Window Bars: {self.window_size} | Min Feature Bars: {self.min_feature_bars}")
         self.logger.info(f"Threshold: {self.config.model.model_threshold:.3f}")
+        dir_thresh_text = f"{self.config.model.direction_threshold:.3f}" if self.direction_threshold_set else "n/a"
+        agg_thresh_text = f"{self.config.model.aggressive_threshold:.3f}" if self.aggressive_threshold_set else "n/a"
+        self.logger.info(
+            f"Direction Models: {bool(self.dir_model_long or self.dir_model_short)} | "
+            f"Dir Threshold: {dir_thresh_text} | Aggressive: {agg_thresh_text} | "
+            f"Dir Gate: {self.direction_gate_signals}"
+        )
         self.logger.info(f"Limit Offset ATR: {self.config.strategy.base_limit_offset_atr:.3f}")
         self.logger.info(f"TP ATR: {self.config.strategy.take_profit_atr:.3f}")
         self.logger.info(f"SL ATR: {self.config.strategy.stop_loss_atr:.3f}")
@@ -4303,15 +4373,24 @@ class LiveTradingV2:
         pred_long: float,
         pred_short: float,
         threshold: float,
+        dir_pred_long: float,
+        dir_pred_short: float,
+        dir_threshold: Optional[float],
+        gate_signals: bool,
     ) -> None:
         ts = utc_now_str()
         ts_ms = int(time.time() * 1000)
         signals: List[Dict[str, object]] = []
-        if pred_long > threshold:
+        long_ok = True
+        short_ok = True
+        if gate_signals and dir_threshold is not None:
+            long_ok = dir_pred_long > dir_threshold
+            short_ok = dir_pred_short > dir_threshold
+        if pred_long > threshold and long_ok:
             signal = self._build_signal("Buy", pred_long, latest_row, bar_time, threshold, ts, ts_ms)
             if signal:
                 signals.append(signal)
-        if pred_short > threshold:
+        if pred_short > threshold and short_ok:
             signal = self._build_signal("Sell", pred_short, latest_row, bar_time, threshold, ts, ts_ms)
             if signal:
                 signals.append(signal)
@@ -4572,6 +4651,39 @@ class LiveTradingV2:
         pred_short = float(self.model_short.predict(X)[0])
         return pred_long, pred_short
 
+    def _compute_direction_predictions(self, row: pd.Series) -> Tuple[float, float, str]:
+        if self.dir_model_long is None and self.dir_model_short is None:
+            return 1.0, 1.0, "pass"
+        X = row[self.model_features].values.reshape(1, -1)
+        source = "model"
+        pred_long = 1.0
+        pred_short = 1.0
+        if self.dir_model_long is not None:
+            try:
+                pred_long = float(self.dir_model_long.predict(X)[0])
+                if not np.isfinite(pred_long):
+                    pred_long = 0.0
+            except Exception as exc:
+                self.logger.error(f"Direction long prediction failed: {exc}")
+                pred_long = 0.0
+                source = "error"
+        else:
+            if source != "error":
+                source = "partial"
+        if self.dir_model_short is not None:
+            try:
+                pred_short = float(self.dir_model_short.predict(X)[0])
+                if not np.isfinite(pred_short):
+                    pred_short = 0.0
+            except Exception as exc:
+                self.logger.error(f"Direction short prediction failed: {exc}")
+                pred_short = 0.0
+                source = "error"
+        else:
+            if source != "error":
+                source = "partial"
+        return pred_long, pred_short, source
+
     def _process_bar(self, bar_time: int) -> None:
         if self.state.state.get("last_processed_bar_time") == bar_time:
             return
@@ -4680,6 +4792,10 @@ class LiveTradingV2:
 
             pred_long, pred_short = self._compute_predictions(latest)
             threshold = self.config.model.model_threshold
+            dir_pred_long, dir_pred_short, dir_source = self._compute_direction_predictions(latest)
+            dir_threshold = self.config.model.direction_threshold if self.direction_threshold_set else None
+            aggressive_threshold = self.config.model.aggressive_threshold if self.aggressive_threshold_set else None
+            gate_signals = self.direction_gate_signals and dir_threshold is not None
             self.health.record_prediction(max(pred_long, pred_short))
             self.last_prediction = {
                 "bar_time": bar_time,
@@ -4687,7 +4803,25 @@ class LiveTradingV2:
                 "pred_short": pred_short,
                 "threshold": threshold,
             }
-            self._update_signals(bar_time, latest, pred_long, pred_short, threshold)
+            self.last_direction = {
+                "bar_time": bar_time,
+                "pred_long": dir_pred_long,
+                "pred_short": dir_pred_short,
+                "threshold": dir_threshold,
+                "aggressive_threshold": aggressive_threshold,
+                "source": dir_source,
+            }
+            self._update_signals(
+                bar_time,
+                latest,
+                pred_long,
+                pred_short,
+                threshold,
+                dir_pred_long,
+                dir_pred_short,
+                dir_threshold,
+                gate_signals,
+            )
 
             equity = 10000.0
             if not self.dry_run:
@@ -4708,7 +4842,8 @@ class LiveTradingV2:
             sentiment = self.health.check_sentiment()
             self.logger.info(
                 f"BAR {pd.to_datetime(bar_time, unit='s')} | close={close:.6f} atr={safe_float(latest.get('atr')):.6f} "
-                f"spread={spread_pct:.4%} predL={pred_long:.3f} predS={pred_short:.3f} | "
+                f"spread={spread_pct:.4%} predL={pred_long:.3f} predS={pred_short:.3f} "
+                f"dirL={dir_pred_long:.3f} dirS={dir_pred_short:.3f} | "
                 f"{self._data_health()} | Regime: {regime} | Sentiment: {sentiment} | Health: {self.health.check_health()}"
             )
 
@@ -4806,9 +4941,15 @@ class LiveTradingV2:
             has_buy = any(info.get("side") == "Buy" for info in orders.values())
             has_sell = any(info.get("side") == "Sell" for info in orders.values())
 
-            if pred_long > threshold and not has_buy:
+            long_ok = True
+            short_ok = True
+            if gate_signals and dir_threshold is not None:
+                long_ok = dir_pred_long > dir_threshold
+                short_ok = dir_pred_short > dir_threshold
+
+            if pred_long > threshold and long_ok and not has_buy:
                 self._place_order("Buy", latest, equity)
-            if pred_short > threshold and not has_sell:
+            if pred_short > threshold and short_ok and not has_sell:
                 self._place_order("Sell", latest, equity)
             self.last_regime = regime
             self.last_sentiment = sentiment
@@ -5053,6 +5194,7 @@ class LiveTradingV2:
             "dry_run": self.dry_run,
             "signal_only": self.signal_only,
             "prediction": self.last_prediction,
+            "direction": self.last_direction,
             "signal": self.last_signal,
             "feature_vector": self.last_feature_vector,
             "position": position_payload,
