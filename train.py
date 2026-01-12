@@ -26,8 +26,9 @@ CACHE = {}
 
 class CombinatorialPurgedKFold:
     """
-    simplified CPCV: Splits data into N groups, takes k combinations for testing.
-    Purges overlap at boundaries.
+    Combinatorial Purged Cross-Validation (CPCV).
+    Splits data into N groups, takes k combinations for testing.
+    Purges overlap at boundaries to prevent leakage.
     """
     def __init__(self, n_splits=5, n_test_splits=2, purge_overlap=50):
         self.n_splits = n_splits
@@ -39,36 +40,61 @@ class CombinatorialPurgedKFold:
         indices = np.arange(n)
         fold_size = n // self.n_splits
         
-        # Simple KFold-like split logic, but we select 'n_test_splits' chunks as test set
-        # This creates (n_splits Choose n_test_splits) combinations.
-        # For n=5, k=2 -> 10 combinations.
+        # Split indices into N chunks
+        chunks = [indices[i*fold_size : (i+1)*fold_size] for i in range(self.n_splits)]
+        # Handle remainder in the last chunk
+        if n % self.n_splits != 0:
+            chunks[-1] = np.concatenate([chunks[-1], indices[self.n_splits*fold_size:]])
         
         from itertools import combinations
-        chunks = [indices[i*fold_size : (i+1)*fold_size] for i in range(self.n_splits)]
-        
         chunk_indices = range(self.n_splits)
+        
         for test_chunk_idxs in combinations(chunk_indices, self.n_test_splits):
+            test_chunk_idxs = set(test_chunk_idxs)
+            
+            # Construct Test Set
             test_idx = np.concatenate([chunks[i] for i in test_chunk_idxs])
-            train_chunks = [chunks[i] for i in chunk_indices if i not in test_chunk_idxs]
-            train_idx = np.concatenate(train_chunks)
             
-            # PURGING: Remove train indices that are too close to test indices
-            # For each test chunk, purge 'purge' bars before and after from train
-            mask = np.ones(len(train_idx), dtype=bool)
-            for t_chunk in [chunks[i] for i in test_chunk_idxs]:
-                t_start, t_end = t_chunk[0], t_chunk[-1]
-                # Invalidate train points within purge distance
-                # Logic: if train_i is within [start-p, end+p]
-                # Vectorized:
-                # But simple way:
-                pass # Complexity vs Token limit. 
-                # Let's do simple gap purging:
-                # If a train chunk immediately follows a test chunk, remove first 50.
-                # If a train chunk immediately precedes a test chunk, remove last 50.
+            # Construct Train Set with Purging
+            train_indices_list = []
             
-            # Minimal implementation: Just yield raw split for now to save complexity, 
-            # real CPCV is complex to implement fully in one shot.
-            # Using standard TimeSeriesSplit with gaps is safer if we can't do full CPCV.
+            for i in range(self.n_splits):
+                if i in test_chunk_idxs:
+                    continue
+                
+                # This chunk is TRAIN. Check neighbors to see if we need to purge.
+                # A chunk i needs purging if it borders a TEST chunk.
+                
+                c_idx = chunks[i]
+                start = c_idx[0]
+                end = c_idx[-1]
+                
+                # Check PREVIOUS chunk (i-1)
+                # If i-1 was TEST, we must embargo the start of i (optional, but good for safety)
+                # For simplicity in this implementation, we focus on the main leakage:
+                # Labels in Train that look forward into Test.
+                # This happens when Train comes BEFORE Test.
+                
+                # Masking array for this chunk
+                mask = np.ones(len(c_idx), dtype=bool)
+                
+                # 1. Forward Leakage: Train i is followed by Test i+1
+                if (i + 1) in test_chunk_idxs:
+                    # Remove the LAST 'purge' items from this train chunk
+                    # because their labels might look into the start of the next (Test) chunk
+                    mask[-self.purge:] = False
+                    
+                # 2. Backward Leakage (Lookback features): Train i follows Test i-1
+                # If features use lagged data from Test, it's usually fine (market memory),
+                # but we can embargo start to be safe.
+                # (Skipped for standard label leakage protection, strictly focused on forward labels)
+                
+                train_indices_list.append(c_idx[mask])
+            
+            if not train_indices_list:
+                continue
+                
+            train_idx = np.concatenate(train_indices_list)
             yield train_idx, test_idx
 
 def get_data(config: GlobalConfig, timeframe: str):
@@ -139,6 +165,15 @@ class AutoML:
         print(f"Training Final Model on {len(df_train)} bars...")
         mm = ModelManager(conf.model)
         mm.train(df_train, feats)
+        
+        # Print Feature Importance
+        for name, model in [("LONG", mm.model_long), ("SHORT", mm.model_short)]:
+            print("\n" + f" [ {name} FEATURE IMPORTANCE ] ".center(60, "="))
+            importances = model.feature_importance(importance_type='gain')
+            feat_imp = sorted(zip(feats, importances), key=lambda x: x[1], reverse=True)
+            for f, imp in feat_imp:
+                print(f"{f:<30} | {imp:>10.2f}")
+            print("="*60)
         
         print(f"Backtesting on Holdout Set ({len(df_test)} bars)...")
         # Predict on Test

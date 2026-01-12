@@ -40,7 +40,21 @@ class FeatureEngine:
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
         
-        # 4. Microstructure (Trade Based)
+        # 4. Market Structure (Bollinger %B & EMA Slopes)
+        # Bollinger %B (Position relative to volatility bands)
+        bb_mean = df['close'].rolling(20).mean()
+        bb_std = df['close'].rolling(20).std()
+        bb_upper = bb_mean + (2 * bb_std)
+        bb_lower = bb_mean - (2 * bb_std)
+        df['bb_percent_b'] = ((df['close'] - bb_lower) / (bb_upper - bb_lower + 1e-9)).fillna(0.5)
+        
+        # EMA Slopes (Normalized by ATR to be stationary)
+        # (EMA[t] - EMA[t-5]) / ATR
+        for p in self.config.ema_periods:
+            ema = df['close'].ewm(span=p).mean()
+            df[f'ema_{p}_slope'] = (ema - ema.shift(5)) / df['atr'].replace(0, 1)
+
+        # 5. Microstructure (Trade Based)
         # Taker Flow Z-Score
         if 'taker_buy_ratio' in df.columns:
             tb_std = df['taker_buy_ratio'].rolling(24).std().replace(0, np.nan)
@@ -51,7 +65,7 @@ class FeatureEngine:
         vol_std = df['volume'].rolling(24).std().replace(0, np.nan)
         df['vol_z'] = (df['volume'] - vol_mean) / vol_std
         
-        # 5. Advanced Orderbook Features
+        # 6. Advanced Orderbook Features
         if 'ob_imbalance_mean' in df.columns:
             # --- Base Metrics ---
             # Imbalance Regime
@@ -133,7 +147,7 @@ class FeatureEngine:
                 df['bid_integrity_chg'] = df['ob_bid_integrity_mean'].diff()
                 df['ask_integrity_chg'] = df['ob_ask_integrity_mean'].diff()
 
-        # 6. Inventory Context (VWAP Deviations)
+        # 7. Inventory Context (VWAP Deviations)
         # Using 'dollar_val' for VWAP. 4h = 48 bars, 24h = 288 bars (for 5m timeframe)
         if 'dollar_val' not in df.columns:
             df['dollar_val'] = df['close'] * df['volume']
@@ -150,7 +164,7 @@ class FeatureEngine:
         df['vwap_24h'] = v_24h / q_24h.replace(0, 1)
         df['vwap_24h_dist'] = (df['close'] - df['vwap_24h']) / df['atr'].replace(0, 1)
         
-        # 7. Volume Regimes (Context)
+        # 8. Volume Regimes (Context)
         # Intraday Regime: Is today active relative to yesterday?
         vol_1h = df['volume'].rolling(12, min_periods=3).mean()
         vol_24h = df['volume'].rolling(288, min_periods=24).mean()
@@ -161,7 +175,7 @@ class FeatureEngine:
         vol_30d = df['volume'].rolling(8640, min_periods=288).mean()
         df['vol_macro'] = vol_24h / vol_30d.replace(0, 1)
 
-        # 8. Volatility Regimes (Expansion/Compression)
+        # 9. Volatility Regimes (Expansion/Compression)
         # Volatility Z-Score (Shock detection)
         # Using NATR to be price-invariant
         atr_mean = df['natr'].rolling(24).mean()
@@ -181,6 +195,10 @@ class FeatureEngine:
         df['atr_macro'] = atr_24h / atr_30d.replace(0, 1)
 
         cols_to_drop = ['tr0', 'tr1', 'tr2', 'tr', 'up_move', 'down_move', 'plus_dm', 'minus_dm', 'price_chg', 'imb_chg', 'vol_buy', 'vol_sell', 'volume', 'vwap_4h', 'vwap_24h', 'dollar_val']
+        # Add Raw EMAs to drop list
+        for p in self.config.ema_periods:
+            cols_to_drop.append(f'ema_{p}')
+            
         df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
         
         # FINAL SAFETY: Drop any rows that have 0.0 or NaN in 'close' 
