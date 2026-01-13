@@ -73,7 +73,7 @@ Prerequisites:
 * Bybit or Binance Futures Account (Currently, there is an implementation of automated trading only for Bybit, API Keys required for live trading)
 
 Installation:
-```bash
+```bashd
 git clone https://github.com/wizrdfab/PurpleSky.git
 cd PurpleSky
 pip install -r requirements.txt
@@ -88,8 +88,7 @@ Usage Workflow
 --------------
 
 1. Data Collection
-Collect raw tick and depth data for your target asset (this is used for Binance data, you can collect raw trade data and orderbook level 2 data
-from many symbols at the same time)
+Collect raw tick and depth data for your target asset. You can do so directly from Bybit https://www.bybit.com/derivatives/en/history-data (raw trade data and orderbook data) or you can download the data from binance using a collector (it builds history, so it may take a bit before you have enough to train the models):
 
 ```bash
 python data_collector.py FARTCOINUSDT SOLUSDT ADAUSDT ZECUSDT
@@ -165,6 +164,8 @@ Contact & Support
 
 Community
 ---------
+
+Feel free to contact me in case you need help or you just want to have a chat!
 
 * Twitter/X: @Fabb_998 (https://twitter.com/Fabb_998)
 * Telegram: Join the Channel (https://t.me/PurpleSkymm)
