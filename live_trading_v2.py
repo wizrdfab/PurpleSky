@@ -2430,8 +2430,21 @@ class LiveTradingV2:
             existing["tp"] = tp
             existing["sl"] = sl
             existing["order_id"] = order_id or existing.get("order_id")
-            existing["entry_bar_time"] = existing.get("entry_bar_time") or entry_bar_time
-            existing["entry_ts_ms"] = existing.get("entry_ts_ms") or entry_ts_ms
+            existing_origin = existing.get("origin")
+            existing_bar = safe_int(existing.get("entry_bar_time"))
+            existing_ts = safe_int(existing.get("entry_ts_ms"))
+            if entry_bar_time:
+                if existing_origin != "execution":
+                    existing["entry_bar_time"] = entry_bar_time
+                elif existing_bar <= 0 or entry_bar_time < existing_bar:
+                    existing["entry_bar_time"] = entry_bar_time
+            if entry_ts_ms:
+                if existing_origin != "execution":
+                    existing["entry_ts_ms"] = entry_ts_ms
+                elif existing_ts <= 0 or entry_ts_ms < existing_ts:
+                    existing["entry_ts_ms"] = entry_ts_ms
+            if origin == "execution" and existing_origin != "execution":
+                existing["origin"] = "execution"
             return existing
 
         if atr <= 0 and self.last_feature_row is not None:
@@ -3410,9 +3423,12 @@ class LiveTradingV2:
                             intent["filled"] = True
                             intents[side] = intent
                             self.state.state["entry_intent"] = intents
-                            filled_bar = safe_int(intent.get("created_bar_time")) or safe_int(
-                                self.state.state.get("last_bar_time")
-                            )
+                            created_bar = safe_int(intent.get("created_bar_time"))
+                            current_bar = safe_int(self.state.state.get("last_bar_time"))
+                            if created_bar and current_bar:
+                                filled_bar = max(created_bar, current_bar)
+                            else:
+                                filled_bar = created_bar or current_bar
                             self._register_entry_intent_fill(side, intent, filled_bar or None)
                     else:
                         self._clear_entry_intent(side, oid, order_link_id, force=True)
@@ -4004,7 +4020,12 @@ class LiveTradingV2:
                 intent["filled"] = True
                 intents[side] = intent
                 self.state.state["entry_intent"] = intents
-                filled_bar = safe_int(intent.get("created_bar_time"))
+                created_bar = safe_int(intent.get("created_bar_time"))
+                current_bar = safe_int(self.state.state.get("last_bar_time"))
+                if created_bar and current_bar:
+                    filled_bar = max(created_bar, current_bar)
+                else:
+                    filled_bar = created_bar or current_bar
                 self._register_entry_intent_fill(side, intent, filled_bar or None)
             elif side:
                 self._clear_entry_intent(side, oid, order_link_id)
@@ -5532,12 +5553,6 @@ class LiveTradingV2:
 
             if has_position:
                 if self.hedge_mode:
-                    sides_to_cancel = []
-                    if has_long:
-                        sides_to_cancel.append("Buy")
-                    if has_short:
-                        sides_to_cancel.append("Sell")
-                    self._cancel_orders_for_sides(sides_to_cancel, "position_open")
                     if has_long:
                         idx = safe_int(long_pos.get("position_idx")) or 1
                         self._ensure_tp_sl(latest, long_pos, "Buy", position_idx=idx, state_key="long")
@@ -5545,8 +5560,6 @@ class LiveTradingV2:
                         idx = safe_int(short_pos.get("position_idx")) or 2
                         self._ensure_tp_sl(latest, short_pos, "Sell", position_idx=idx, state_key="short")
                 else:
-                    if self.state.state.get("active_orders"):
-                        self._cancel_active_orders("position_open")
                     self._ensure_tp_sl(latest)
                 if open_positions >= max_positions:
                     return

@@ -110,8 +110,8 @@ python train.py --symbol FARTCOINUSDT --data-dir data/FARTCOINUSDT_Binance --tri
 Test the model live without using real money.
 ```bash
 
-python live_trading_v2.py --symbol FARTCOINUSDT --keys-file keys.json --dry-run
-python live_trading_v2.py --symbol FARTCOINUSDT --keys-file keys.json --testnet
+python live_trading_v2.py --symbol FARTCOINUSDT --keys-file key_profiles.json --dry-run
+python live_trading_v2.py --symbol FARTCOINUSDT --keys-file key_profiles.json --testnet
 ```
 
 4. Live Trading (Real Money)
@@ -153,7 +153,7 @@ Results vary by market regime. Past performance is not indicative of future resu
 --------------------------------------------------------------------------------
 
 It's greatly suggested that you train the model for certain coins with data from binance (using the data_collector for example) 
-because in some coins Binance will lead from orderbook/volume and the model uses that to make predictions. Using data from Bybit for FARTCOINUSDT is ok
+because in some coins Binance will lead from orderbook/volume and the model uses that to make predictions. You can though use data from Binance to get signals to trade in Bybit manually or use that data to trade automatically on Bybit by just training the model on Binance data and running it connected to Bybit. Using data from Bybit for FARTCOINUSDT is ok
 because Bybit leads this coin hence the results are more reliable. I may soon add a connector to Binance API for automated trading.
 
 Disclaimer
