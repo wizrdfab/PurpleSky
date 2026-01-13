@@ -363,7 +363,7 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--candidate-n", type=int, default=100, help="Number of top trials to move to OOS-1")
     parser.add_argument("--timeframe", type=str, default="5m")
-    parser.add_argument("--ob-levels", type=int, default=200)
+    parser.add_argument("--ob-levels", type=int, default=CONF.data.ob_levels)
     parser.add_argument("--min-child", type=int, default=50) 
     parser.add_argument("--data-dir", type=str, default="data/RAVEUSDT")
     parser.add_argument("--symbol", type=str, default="RAVEUSDT")

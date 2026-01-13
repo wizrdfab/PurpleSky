@@ -65,26 +65,26 @@
       text-transform: uppercase;
       cursor: pointer;
       transition: transform 0.15s ease, border 0.15s ease, box-shadow 0.15s ease;
-      box-shadow: 0 0 12px var(--glow1), 0 0 26px var(--glow2);
-      text-shadow: 0 0 6px var(--glow1);
-      animation: signalGlow 4.2s ease-in-out infinite;
+      box-shadow: 0 0 16px var(--glow1), 0 0 36px var(--glow2);
+      text-shadow: 0 0 8px var(--glow1);
+      animation: signalGlow 4.8s ease-in-out infinite alternate;
     }
     .signal-chip.long {
-      --glow1: rgba(34,197,94,0.6);
-      --glow2: rgba(34,197,94,0.35);
+      --glow1: rgba(34,197,94,0.75);
+      --glow2: rgba(34,197,94,0.45);
     }
     .signal-chip.short {
-      --glow1: rgba(239,68,68,0.6);
-      --glow2: rgba(239,68,68,0.35);
+      --glow1: rgba(239,68,68,0.75);
+      --glow2: rgba(239,68,68,0.45);
     }
     .signal-chip.dual {
-      --glow1: rgba(148,163,184,0.6);
-      --glow2: rgba(148,163,184,0.35);
+      --glow1: rgba(148,163,184,0.7);
+      --glow2: rgba(148,163,184,0.4);
     }
     .signal-chip.aggressive {
-      --glow1: rgba(245,158,11,0.85);
-      --glow2: rgba(245,158,11,0.55);
-      animation: signalGlowAgg 3.4s ease-in-out infinite;
+      --glow1: rgba(245,158,11,0.95);
+      --glow2: rgba(245,158,11,0.65);
+      animation: signalGlowAgg 3.8s ease-in-out infinite alternate;
     }
     .signal-chip__icon {
       display: inline-block;
@@ -108,6 +108,11 @@
       justify-content: space-between;
       align-items: flex-end;
       gap: 16px;
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
     h1 {
       margin: 0;
@@ -485,26 +490,26 @@
       100% { transform: scale(0.9); opacity: 0.6; }
     }
     @keyframes signalGlow {
-      0%, 100% {
-        box-shadow: 0 0 12px var(--glow1), 0 0 26px var(--glow2);
-        text-shadow: 0 0 6px var(--glow1);
-        color: rgba(229,231,235,0.85);
+      from {
+        box-shadow: 0 0 16px var(--glow1), 0 0 36px var(--glow2);
+        text-shadow: 0 0 8px var(--glow1);
+        color: rgba(236,239,241,0.95);
       }
-      50% {
-        box-shadow: 0 0 26px var(--glow1), 0 0 56px var(--glow2);
-        text-shadow: 0 0 12px var(--glow1);
-        color: rgba(248,250,252,1);
+      to {
+        box-shadow: 0 0 32px var(--glow1), 0 0 70px var(--glow2);
+        text-shadow: 0 0 16px var(--glow1);
+        color: rgba(255,255,255,1);
       }
     }
     @keyframes signalGlowAgg {
-      0%, 100% {
-        box-shadow: 0 0 16px var(--glow1), 0 0 34px var(--glow2);
-        text-shadow: 0 0 8px var(--glow1);
-        color: rgba(254,249,195,0.9);
+      from {
+        box-shadow: 0 0 20px var(--glow1), 0 0 44px var(--glow2);
+        text-shadow: 0 0 10px var(--glow1);
+        color: rgba(254,249,195,0.95);
       }
-      50% {
-        box-shadow: 0 0 34px var(--glow1), 0 0 70px var(--glow2);
-        text-shadow: 0 0 16px var(--glow1);
+      to {
+        box-shadow: 0 0 40px var(--glow1), 0 0 88px var(--glow2);
+        text-shadow: 0 0 20px var(--glow1);
         color: rgba(255,255,255,1);
       }
     }
@@ -686,7 +691,10 @@
       <h1>Live Trading Dashboard</h1>
       <div class="sub" id="subline">Waiting for metrics...</div>
     </div>
-    <div class="pill" id="statusPill">Offline</div>
+    <div class="header-actions">
+      <button class="toggle-btn" id="soundToggle" type="button">Sound Off</button>
+      <div class="pill" id="statusPill">Offline</div>
+    </div>
   </header>
 
   <nav class="nav-tabs">
@@ -948,6 +956,29 @@
       const num = Number(value);
       return Number.isFinite(num) ? num : NaN;
     };
+    const DEFAULT_FAVICON_URL = (() => {
+      const svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+        + "<rect width='64' height='64' fill='#0b1220'/>"
+        + "<circle cx='32' cy='32' r='18' fill='#6d28d9'/>"
+        + "</svg>";
+      return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+    })();
+    const SOUND_ALERT_KEY = "dash_sound_alert_v1";
+    const loadSoundAlert = () => {
+      try {
+        const raw = localStorage.getItem(SOUND_ALERT_KEY);
+        return raw === "true";
+      } catch (err) {
+        return false;
+      }
+    };
+    const saveSoundAlert = (enabled) => {
+      try {
+        localStorage.setItem(SOUND_ALERT_KEY, enabled ? "true" : "false");
+      } catch (err) {
+        return;
+      }
+    };
     const ALIAS_STORAGE_KEY = "dash_aliases_v1";
     const loadAliases = () => {
       try {
@@ -1038,8 +1069,21 @@
       directionHistory: [],
       directionKey: null,
       aliases: loadAliases(),
-      traderMode: loadTraderMode()
+      traderMode: loadTraderMode(),
+      activeSignalMap: {},
+      activeSignalInitialized: false,
+      soundEnabled: loadSoundAlert(),
+      lastBeepAt: 0
     };
+    const faviconState = {
+      link: null,
+      baseHref: null,
+      baseImage: null,
+      badgeKey: null,
+      pendingBadge: null,
+      loading: false
+    };
+    let soundContext = null;
 
     function sparkline(canvas, values, color) {
       const ctx = canvas.getContext("2d");
@@ -1523,6 +1567,181 @@
       });
     }
 
+    function ensureSoundContext() {
+      if (soundContext) return soundContext;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return null;
+      try {
+        soundContext = new AudioCtx();
+      } catch (err) {
+        soundContext = null;
+      }
+      return soundContext;
+    }
+
+    function playSignalBeep(force = false) {
+      const nowMs = Date.now();
+      if (!force && nowMs - state.lastBeepAt < 900) return;
+      const ctx = ensureSoundContext();
+      if (!ctx) return;
+      if (ctx.state === "suspended") {
+        ctx.resume().catch(() => null);
+      }
+      const now = ctx.currentTime + 0.02;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(520, now);
+      osc.frequency.exponentialRampToValueAtTime(620, now + 0.12);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.05, now + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.36);
+      state.lastBeepAt = nowMs;
+    }
+
+    function syncSoundToggle() {
+      const btn = document.getElementById("soundToggle");
+      if (!btn) return;
+      btn.classList.toggle("active", state.soundEnabled);
+      btn.textContent = state.soundEnabled ? "Sound On" : "Sound Off";
+    }
+
+    function ensureFaviconLink() {
+      if (faviconState.link) return faviconState.link;
+      let link = document.querySelector("link[rel~='icon']");
+      if (!link) {
+        link = document.createElement("link");
+        link.rel = "icon";
+        document.head.appendChild(link);
+      }
+      if (!link.getAttribute("href")) {
+        link.href = DEFAULT_FAVICON_URL;
+      }
+      faviconState.link = link;
+      if (!faviconState.baseHref) {
+        faviconState.baseHref = link.href;
+      }
+      if (!faviconState.baseImage && !faviconState.loading) {
+        faviconState.loading = true;
+        const img = new Image();
+        img.onload = () => {
+          faviconState.baseImage = img;
+          faviconState.loading = false;
+          if (faviconState.pendingBadge) {
+            const pending = faviconState.pendingBadge;
+            faviconState.pendingBadge = null;
+            applyFaviconBadge(pending.color, pending.key);
+          }
+        };
+        img.onerror = () => {
+          faviconState.loading = false;
+        };
+        img.src = faviconState.baseHref;
+      }
+      return link;
+    }
+
+    function clearFaviconBadge() {
+      const link = ensureFaviconLink();
+      if (!link || !faviconState.baseHref) return;
+      if (faviconState.badgeKey === null) return;
+      link.href = faviconState.baseHref;
+      faviconState.badgeKey = null;
+    }
+
+    function applyFaviconBadge(color, key) {
+      const link = ensureFaviconLink();
+      if (!link) return;
+      const badgeKey = key || color || "badge";
+      if (faviconState.badgeKey === badgeKey) return;
+      if (!faviconState.baseImage) {
+        faviconState.pendingBadge = { color, key: badgeKey };
+        return;
+      }
+      const size = 64;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(faviconState.baseImage, 0, 0, size, size);
+      const radius = Math.round(size * 0.16);
+      const padding = Math.round(size * 0.08);
+      const cx = size - radius - padding;
+      const cy = radius + padding;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = Math.max(1, Math.round(size * 0.05));
+      ctx.strokeStyle = "rgba(15, 23, 42, 0.9)";
+      ctx.stroke();
+      link.href = canvas.toDataURL("image/png");
+      faviconState.badgeKey = badgeKey;
+    }
+
+    function updateFaviconBadgeForSignals(active) {
+      if (!Array.isArray(active) || !active.length) {
+        clearFaviconBadge();
+        return;
+      }
+      let hasLong = false;
+      let hasShort = false;
+      let hasAggLong = false;
+      let hasAggShort = false;
+      active.forEach(entry => {
+        const side = (entry.side || "").toLowerCase();
+        const aggSide = (entry.aggressiveSide || "").toLowerCase();
+        if (side === "dual") {
+          hasLong = true;
+          hasShort = true;
+        } else if (side === "long") {
+          hasLong = true;
+        } else if (side === "short") {
+          hasShort = true;
+        }
+        if (aggSide === "dual") {
+          hasAggLong = true;
+          hasAggShort = true;
+        } else if (aggSide === "long") {
+          hasAggLong = true;
+        } else if (aggSide === "short") {
+          hasAggShort = true;
+        }
+      });
+      const styles = getComputedStyle(document.documentElement);
+      const cyanBadge = "#06b6d4";
+      const colorLong = cyanBadge;
+      const colorShort = cyanBadge;
+      const colorDual = cyanBadge;
+      const colorAggLong = cyanBadge;
+      const colorAggShort = cyanBadge;
+      const colorAggDual = cyanBadge;
+      if (hasAggLong || hasAggShort) {
+        if (hasAggLong && hasAggShort) {
+          applyFaviconBadge(colorAggDual, "agg-dual");
+        } else if (hasAggShort) {
+          applyFaviconBadge(colorAggShort, "agg-short");
+        } else {
+          applyFaviconBadge(colorAggLong, "agg-long");
+        }
+        return;
+      }
+      if (hasLong && hasShort) {
+        applyFaviconBadge(colorDual, "dual");
+      } else if (hasShort) {
+        applyFaviconBadge(colorShort, "short");
+      } else if (hasLong) {
+        applyFaviconBadge(colorLong, "long");
+      } else {
+        clearFaviconBadge();
+      }
+    }
+
     function syncTraderModeButtons() {
       const wrap = document.getElementById("traderModeToggle");
       if (!wrap) return;
@@ -1608,6 +1827,7 @@
       if (!active.length) {
         strip.style.display = "none";
         items.innerHTML = "";
+        updateFaviconBadgeForSignals(active);
         return;
       }
       strip.style.display = "flex";
@@ -1639,6 +1859,7 @@
         chip.addEventListener("click", () => selectSymbol(entry.key));
         items.appendChild(chip);
       });
+      updateFaviconBadgeForSignals(active);
     }
 
     function renderSummary(items) {
@@ -1646,6 +1867,8 @@
       state.latestMap = {};
       const grid = document.getElementById("summaryGrid");
       grid.innerHTML = "";
+      const nextActiveMap = {};
+      let newSignalCount = 0;
       state.items.forEach(item => {
         const key = entryKey(item);
         if (!key) return;
@@ -1674,6 +1897,14 @@
         const displayName = displayNameFor(key, symbol);
         const card = document.createElement("div");
         const signalState = computeSignalState(item.prediction || {}, item.direction || {});
+        if (signalState.active) {
+          const stateKey = `${signalState.side}:${signalState.aggressiveSide || ""}`;
+          nextActiveMap[key] = stateKey;
+          const prevKey = state.activeSignalMap ? state.activeSignalMap[key] : null;
+          if (prevKey !== stateKey) {
+            newSignalCount += 1;
+          }
+        }
         const signalClasses = [];
         if (signalState.active) {
           signalClasses.push("signal-hot");
@@ -1776,6 +2007,11 @@
           }
         }
       }
+      if (state.activeSignalInitialized && state.soundEnabled && newSignalCount > 0) {
+        playSignalBeep();
+      }
+      state.activeSignalMap = nextActiveMap;
+      state.activeSignalInitialized = true;
     }
 
     function setView(view) {
@@ -2854,6 +3090,22 @@
         });
       });
       syncSignalLegendButtons();
+    }
+    const soundToggle = document.getElementById("soundToggle");
+    if (soundToggle) {
+      soundToggle.addEventListener("click", () => {
+        state.soundEnabled = !state.soundEnabled;
+        saveSoundAlert(state.soundEnabled);
+        syncSoundToggle();
+        if (state.soundEnabled) {
+          const ctx = ensureSoundContext();
+          if (ctx && ctx.state === "suspended") {
+            ctx.resume().catch(() => null);
+          }
+          playSignalBeep(true);
+        }
+      });
+      syncSoundToggle();
     }
     const traderModeToggle = document.getElementById("traderModeToggle");
     if (traderModeToggle) {

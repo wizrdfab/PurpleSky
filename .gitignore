@@ -178,3 +178,5 @@ live_metrics_RAVEUSDT.jsonl
 live_metrics_MONUSDT.jsonl
 live_metrics_PIEVERSEUSDT.jsonl
 bot_state_MONUSDT_v2.json
+
+data_collector.log
