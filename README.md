@@ -156,6 +156,37 @@ It's greatly suggested that you train the model for certain coins with data from
 because in some coins Binance will lead from orderbook/volume and the model uses that to make predictions. You can though use data from Binance to get signals to trade in Bybit manually or use that data to trade automatically on Bybit by just training the model on Binance data and running it connected to Bybit. Using data from Bybit for FARTCOINUSDT is ok
 because Bybit leads this coin hence the results are more reliable. I may soon add a connector to Binance API for automated trading.
 
+Contact & Support
+-----------------
+
+* Bug Reports: If you find a bug, please open an Issue here: ../../issues
+* Feature Requests: Have an idea? Start a discussion in the Issues tab.
+* Business Inquiries: servicios.de.mercado.fzf@gmail.com
+
+Community
+---------
+
+* Twitter/X: @Fabb_998 (https://twitter.com/Fabb_998)
+* Telegram: Join the Channel (https://t.me/PurpleSkymm)
+* Discord: Join the Server (https://discord.gg/JjSC23Cv)
+
+--------------------------------------------------------------------------------
+
+Support & Donations
+-------------------
+
+If you find this project useful, consider making a donation or signing with my referral code in Bybit:
+
+* Bitcoin (BTC): 1PucNiXsUCzfrMqUGCPfwgdyE3BL8Xnrrp
+* Ethereum (ETH): 0x58ef00f47d6e94dfc486a2ed9b3dd3cfaf3c9714
+
+Create a Bybit account using my referral link:
+https://www.bybit.com/invite?ref=14VP14Z
+
+Thanks <3
+
+--------------------------------------------------------------------------------
+
 Disclaimer
 ----------
 

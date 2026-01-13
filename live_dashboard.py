@@ -3763,15 +3763,14 @@ class MetricsHandler(BaseHTTPRequestHandler):
             latest = read_latest(file_map[entry_key])
             symbol = resolve_latest_symbol(latest, entry_key)
             key_signals = self.metrics_dir / f"signals_{entry_key}.jsonl"
-            if key and entry_key == key:
-                if not (key_signals.exists() and key_signals.stat().st_size > 0):
-                    return self._send(200, [])
+            if key_signals.exists() and key_signals.stat().st_size > 0:
                 signals_path = key_signals
             else:
-                if key_signals.exists() and key_signals.stat().st_size > 0:
-                    signals_path = key_signals
+                symbol_signals = self.metrics_dir / f"signals_{symbol}.jsonl"
+                if symbol_signals.exists() and symbol_signals.stat().st_size > 0:
+                    signals_path = symbol_signals
                 else:
-                    signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+                    return self._send(200, [])
             return self._send(200, tail_jsonl(signals_path, limit=limit, max_bytes=max_bytes))
 
         if parsed.path == "/api/candles":
