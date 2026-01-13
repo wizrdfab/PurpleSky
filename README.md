@@ -1,3 +1,5 @@
+![Status](https://img.shields.io/badge/Status-Pre--Alpha-orange)
+
 PurpleSky - Advanced Quantitative Trading System
 ================================================
 
