@@ -1275,6 +1275,20 @@ class LiveTradingV2:
         self.model_long, self.model_short, self.model_features = self._load_model(self.model_dir)
         self._apply_model_params(self.model_dir)
         self.dir_model_long, self.dir_model_short = self._load_direction_models(self.model_dir)
+        if (self.direction_threshold_set or self.aggressive_threshold_set) and (
+            self.dir_model_long is None or self.dir_model_short is None
+        ):
+            missing = []
+            if self.dir_model_long is None:
+                missing.append("dir_model_long.pkl")
+            if self.dir_model_short is None:
+                missing.append("dir_model_short.pkl")
+            msg = (
+                "Directional thresholds are set but direction models are missing: "
+                + ", ".join(missing)
+            )
+            self.logger.error(msg)
+            raise RuntimeError(msg)
         self.min_feature_bars = self._min_window_for_features(self.model_features)
         if self.window_size < self.min_feature_bars:
             self.logger.warning(

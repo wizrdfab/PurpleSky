@@ -1,0 +1,14 @@
+{
+    "limit_offset_atr": 0.8410663510502585,
+    "take_profit_atr": 0.7269470424811781,
+    "stop_loss_atr": 3.774080854835688,
+    "learning_rate": 0.03769722291566141,
+    "max_depth": 2,
+    "num_leaves": 12,
+    "model_threshold": 0.8696833260664012,
+    "direction_threshold": 0.5165602434798386,
+    "aggressive_threshold": 0.8718196330218815,
+    "symbol": "FARTCOINUSDT",
+    "timeframe": "5m",
+    "ob_levels": 50
+}
