@@ -84,7 +84,7 @@ DEFAULT_CONTINUITY_BARS = 24
 DEFAULT_MAX_LAST_BAR_AGE_SEC = 0.0
 DEFAULT_FAST_BOOTSTRAP = False
 DEFAULT_POSITION_MODE = "hedge"
-DEFAULT_TP_MAKER = False
+DEFAULT_TP_MAKER = True
 DEFAULT_TP_MAKER_FALLBACK_SEC = 5.0
 DEFAULT_BROKER_ID = ""
 
@@ -2481,6 +2481,8 @@ class LiveTradingV2:
                     existing["entry_ts_ms"] = entry_ts_ms
             if origin == "execution" and existing_origin != "execution":
                 existing["origin"] = "execution"
+            if "tp_mode" not in existing:
+                existing["tp_mode"] = "maker" if self.tp_maker else "market"
             return existing
 
         if atr <= 0 and self.last_feature_row is not None:
@@ -2505,6 +2507,13 @@ class LiveTradingV2:
             "position_idx": position_idx,
             "external": external,
             "origin": origin,
+            "tp_mode": "maker" if self.tp_maker else "market",
+            "tp_order_id": None,
+            "tp_order_link_id": None,
+            "tp_order_ts": None,
+            "tp_order_price": None,
+            "tp_order_qty": None,
+            "tp_trigger_seen_ts": None,
             "created_ts": utc_now_str(),
         }
         positions.append(payload)
@@ -2638,6 +2647,95 @@ class LiveTradingV2:
             origin="execution",
         )
 
+    def _reset_virtual_tp_order_fields(self, pos: Dict) -> None:
+        pos["tp_order_id"] = None
+        pos["tp_order_link_id"] = None
+        pos["tp_order_ts"] = None
+        pos["tp_order_price"] = None
+        pos["tp_order_qty"] = None
+        pos["tp_trigger_seen_ts"] = None
+
+    def _cancel_virtual_tp_order(self, pos: Dict) -> None:
+        tp_order_id = pos.get("tp_order_id")
+        tp_order_link_id = pos.get("tp_order_link_id")
+        if not (tp_order_id or tp_order_link_id):
+            return
+        if not self.dry_run:
+            self.api.cancel_order(tp_order_id, tp_order_link_id)
+        self._reset_virtual_tp_order_fields(pos)
+
+    def _ensure_virtual_tp_orders(self, latest_row: Optional[pd.Series]) -> None:
+        if not self.tp_maker or self.dry_run or self.signal_only:
+            return
+        positions = self._virtual_positions()
+        if not positions:
+            return
+        latest_row = latest_row or self.last_feature_row
+        updated = False
+        for pos in positions:
+            if pos.get("external"):
+                continue
+            side = pos.get("side")
+            size = safe_float(pos.get("size"))
+            if side not in {"Buy", "Sell"} or size <= 0:
+                continue
+            if pos.get("tp_mode") != "maker":
+                pos["tp_mode"] = "maker"
+                updated = True
+            tp = safe_float(pos.get("tp"))
+            sl = safe_float(pos.get("sl"))
+            if (tp <= 0 or sl <= 0) and latest_row is not None:
+                atr = safe_float(pos.get("atr_at_entry"))
+                if atr <= 0:
+                    atr = safe_float(latest_row.get("atr"))
+                entry_price = safe_float(pos.get("entry_price"))
+                if atr > 0 and entry_price > 0:
+                    tp_calc, sl_calc = self._compute_tp_sl_targets(
+                        side,
+                        entry_price,
+                        atr,
+                        tp_mult=safe_float(pos.get("tp_mult"), 1.0),
+                    )
+                    if tp <= 0:
+                        pos["tp"] = tp_calc
+                        tp = tp_calc
+                        updated = True
+                    if sl <= 0:
+                        pos["sl"] = sl_calc
+                        sl = sl_calc
+                        updated = True
+            if tp <= 0:
+                continue
+            tp_order_id = pos.get("tp_order_id")
+            tp_order_link_id = pos.get("tp_order_link_id")
+            if tp_order_id or tp_order_link_id:
+                if self._tp_order_needs_resize(pos, size):
+                    self._cancel_virtual_tp_order(pos)
+                    updated = True
+                else:
+                    continue
+            order_link_id = self._new_order_link_id("T", side)
+            position_idx = pos.get("position_idx") if self.hedge_mode else None
+            order_id = self._place_tp_limit_order(
+                side,
+                size,
+                tp,
+                position_idx=position_idx,
+                order_link_id=order_link_id,
+            )
+            if order_id:
+                pos["tp_order_id"] = order_id
+                pos["tp_order_link_id"] = order_link_id
+                pos["tp_order_ts"] = time.time()
+                pos["tp_order_price"] = tp
+                pos["tp_order_qty"] = abs(size)
+                pos["tp_trigger_seen_ts"] = None
+                updated = True
+            else:
+                self.logger.warning("TP limit placement failed for virtual position; will retry.")
+        if updated:
+            self.state.state["virtual_positions"] = positions
+
     def _manage_virtual_positions(self, bar_time: int, bar_high: float, bar_low: float, bar_close: float) -> None:
         if self.signal_only:
             return
@@ -2657,6 +2755,9 @@ class LiveTradingV2:
             tp = safe_float(pos.get("tp"))
             sl = safe_float(pos.get("sl"))
             atr = safe_float(pos.get("atr_at_entry"))
+            use_maker_tp = self.tp_maker and (
+                pos.get("tp_order_id") or pos.get("tp_order_link_id")
+            )
             if (tp <= 0 or sl <= 0) and entry_price > 0:
                 if atr <= 0 and self.last_feature_row is not None:
                     atr = safe_float(self.last_feature_row.get("atr"))
@@ -2685,17 +2786,19 @@ class LiveTradingV2:
                     if sl > 0 and bar_low <= sl:
                         exit_price = sl
                         reason = "sl"
-                    elif tp > 0 and bar_high >= tp:
+                    elif tp > 0 and bar_high >= tp and not use_maker_tp:
                         exit_price = tp
                         reason = "tp"
                 else:
                     if sl > 0 and bar_high >= sl:
                         exit_price = sl
                         reason = "sl"
-                    elif tp > 0 and bar_low <= tp:
+                    elif tp > 0 and bar_low <= tp and not use_maker_tp:
                         exit_price = tp
                         reason = "tp"
             if exit_price is not None:
+                if reason in {"time", "sl"}:
+                    self._cancel_virtual_tp_order(pos)
                 closed.append((pos, exit_price, reason))
 
         if not closed:
@@ -2770,6 +2873,24 @@ class LiveTradingV2:
     def _ensure_virtual_positions_state(self) -> None:
         positions = self._virtual_positions()
         if positions:
+            updated = False
+            for pos in positions:
+                if "tp_mode" not in pos:
+                    pos["tp_mode"] = "maker" if self.tp_maker else "market"
+                    updated = True
+                for key in (
+                    "tp_order_id",
+                    "tp_order_link_id",
+                    "tp_order_ts",
+                    "tp_order_price",
+                    "tp_order_qty",
+                    "tp_trigger_seen_ts",
+                ):
+                    if key not in pos:
+                        pos[key] = None
+                        updated = True
+            if updated:
+                self.state.state["virtual_positions"] = positions
             return
         if self.hedge_mode:
             state_positions = self.state.state.get("positions", {})
@@ -3559,28 +3680,60 @@ class LiveTradingV2:
                 updated = True
             if updated:
                 self.state.state["positions"] = positions
-            return updated
+            agg_updated = updated
+        else:
+            agg_updated = False
+            pos = self.state.state.get("position", {})
+            if pos and _matches(pos):
+                if is_closed:
+                    pos["tp_order_id"] = None
+                    pos["tp_order_link_id"] = None
+                    pos["tp_order_price"] = None
+                    pos["tp_order_qty"] = None
+                    pos["tp_order_ts"] = None
+                    pos["tp_trigger_seen_ts"] = None
+                else:
+                    pos["tp_order_id"] = oid or pos.get("tp_order_id")
+                    pos["tp_order_link_id"] = order_link_id or pos.get("tp_order_link_id")
+                    if price > 0:
+                        pos["tp_order_price"] = price
+                    if qty > 0:
+                        pos["tp_order_qty"] = qty
+                    pos["tp_order_ts"] = pos.get("tp_order_ts") or time.time()
+                self.state.state["position"] = pos
+                agg_updated = True
 
-        pos = self.state.state.get("position", {})
-        if pos and _matches(pos):
-            if is_closed:
-                pos["tp_order_id"] = None
-                pos["tp_order_link_id"] = None
-                pos["tp_order_price"] = None
-                pos["tp_order_qty"] = None
-                pos["tp_order_ts"] = None
-                pos["tp_trigger_seen_ts"] = None
-            else:
-                pos["tp_order_id"] = oid or pos.get("tp_order_id")
-                pos["tp_order_link_id"] = order_link_id or pos.get("tp_order_link_id")
-                if price > 0:
-                    pos["tp_order_price"] = price
-                if qty > 0:
-                    pos["tp_order_qty"] = qty
-                pos["tp_order_ts"] = pos.get("tp_order_ts") or time.time()
-            self.state.state["position"] = pos
-            return True
-        return False
+        virtual_updated = False
+        positions = self._virtual_positions()
+        if positions:
+            closed_ids = []
+            for vpos in positions:
+                if not vpos or not _matches(vpos):
+                    continue
+                if is_closed:
+                    if status == "filled" and vpos.get("id"):
+                        closed_ids.append(vpos.get("id"))
+                    self._reset_virtual_tp_order_fields(vpos)
+                else:
+                    vpos["tp_order_id"] = oid or vpos.get("tp_order_id")
+                    vpos["tp_order_link_id"] = order_link_id or vpos.get("tp_order_link_id")
+                    if price > 0:
+                        vpos["tp_order_price"] = price
+                    if qty > 0:
+                        vpos["tp_order_qty"] = qty
+                    vpos["tp_order_ts"] = vpos.get("tp_order_ts") or time.time()
+                    vpos["tp_trigger_seen_ts"] = None
+                    vpos["tp_mode"] = "maker"
+                virtual_updated = True
+            if closed_ids:
+                self.state.state["virtual_positions"] = [
+                    vpos for vpos in positions if vpos.get("id") not in closed_ids
+                ]
+                virtual_updated = True
+            elif virtual_updated:
+                self.state.state["virtual_positions"] = positions
+        return agg_updated or virtual_updated
+
 
     def _apply_ws_position_update(self, pos: Dict) -> bool:
         if pos.get("symbol") != self.config.data.symbol:
@@ -4505,11 +4658,21 @@ class LiveTradingV2:
                     updated = True
             if updated:
                 self.state.state["positions"] = positions
-            return
+        else:
+            pos = self.state.state.get("position", {})
+            if _sync_pos(pos):
+                self.state.state["position"] = pos
 
-        pos = self.state.state.get("position", {})
-        if _sync_pos(pos):
-            self.state.state["position"] = pos
+        virtual_updated = False
+        positions = self._virtual_positions()
+        if positions:
+            for vpos in positions:
+                if _sync_pos(vpos):
+                    if self.tp_maker:
+                        vpos["tp_mode"] = vpos.get("tp_mode") or "maker"
+                    virtual_updated = True
+            if virtual_updated:
+                self.state.state["virtual_positions"] = positions
 
     def _latest_tp_reference_price(self, pos: Dict) -> float:
         last_trade = safe_float(self.bar_window.trade_builder.last_price)
@@ -4523,11 +4686,12 @@ class LiveTradingV2:
     def _check_tp_limit_fallback(self, now: Optional[float] = None) -> None:
         if not self.tp_maker or self.dry_run or self.signal_only:
             return
-        if self._virtual_positions():
-            return
         if self.tp_maker_fallback_sec <= 0:
             return
         now = now or time.time()
+        if self._virtual_positions():
+            self._check_tp_limit_fallback_virtual(now)
+            return
         updated = False
         if self.hedge_mode:
             positions = self.state.state.get("positions", {})
@@ -4600,6 +4764,65 @@ class LiveTradingV2:
                 pos["tp_trigger_seen_ts"] = None
                 return True
         return False
+
+    def _check_tp_limit_fallback_virtual(self, now: float) -> None:
+        positions = self._virtual_positions()
+        if not positions:
+            return
+        closed_ids = set()
+        updated = False
+        for pos in positions:
+            if not pos or pos.get("external"):
+                continue
+            if pos.get("tp_mode") != "maker":
+                continue
+            tp_order_id = pos.get("tp_order_id")
+            tp_link_id = pos.get("tp_order_link_id")
+            tp_price = safe_float(pos.get("tp_order_price") or pos.get("tp"))
+            if not (tp_order_id or tp_link_id) or tp_price <= 0:
+                continue
+            size = safe_float(pos.get("size"))
+            if size <= 0:
+                self._reset_virtual_tp_order_fields(pos)
+                updated = True
+                continue
+            side = pos.get("side")
+            if side not in {"Buy", "Sell"}:
+                continue
+            price = self._latest_tp_reference_price(pos)
+            if price <= 0:
+                continue
+            crossed = price >= tp_price if side == "Buy" else price <= tp_price
+            trigger_ts = pos.get("tp_trigger_seen_ts")
+            if crossed:
+                if not trigger_ts:
+                    pos["tp_trigger_seen_ts"] = now
+                    updated = True
+                    continue
+                if (now - trigger_ts) >= self.tp_maker_fallback_sec:
+                    position_idx = pos.get("position_idx") if self.hedge_mode else None
+                    self.logger.warning(
+                        f"TP limit fallback (virtual) for {side} (price={price:.6f} tp={tp_price:.6f})."
+                    )
+                    if not self.dry_run:
+                        if tp_order_id or tp_link_id:
+                            self.api.cancel_order(tp_order_id, tp_link_id)
+                        self.api.market_close(side, abs(size), position_idx=position_idx)
+                    if pos.get("id"):
+                        closed_ids.add(pos.get("id"))
+                    updated = True
+            else:
+                if trigger_ts is not None:
+                    pos["tp_trigger_seen_ts"] = None
+                    updated = True
+        if closed_ids:
+            self.state.state["virtual_positions"] = [
+                pos for pos in positions if pos.get("id") not in closed_ids
+            ]
+            self.state.save()
+        elif updated:
+            self.state.state["virtual_positions"] = positions
+            self.state.save()
 
     def _ensure_tp_sl(
         self,
@@ -5535,6 +5758,7 @@ class LiveTradingV2:
             bar_high = safe_float(latest.get("high"))
             bar_low = safe_float(latest.get("low"))
             bar_close = close
+            self._ensure_virtual_tp_orders(latest)
             self._manage_virtual_positions(bar_time, bar_high, bar_low, bar_close)
 
             if trade_count == 0:
@@ -5619,33 +5843,31 @@ class LiveTradingV2:
             has_buy = any(info.get("side") == "Buy" for info in orders.values())
             has_sell = any(info.get("side") == "Sell" for info in orders.values())
 
-            aggressive_long = False
-            aggressive_short = False
+            aggressive_long_hit = False
+            aggressive_short_hit = False
             if self.aggressive_threshold_set and aggressive_threshold is not None and dir_source != "pass":
-                aggressive_long = dir_pred_long > aggressive_threshold
-                aggressive_short = dir_pred_short > aggressive_threshold
+                aggressive_long_hit = dir_pred_long > aggressive_threshold
+                aggressive_short_hit = dir_pred_short > aggressive_threshold
 
-            if aggressive_long or aggressive_short:
-                if not self.hedge_mode and aggressive_long and aggressive_short:
+            aggressive_long_exec = aggressive_long_hit
+            aggressive_short_exec = aggressive_short_hit
+            if aggressive_long_exec or aggressive_short_exec:
+                if not self.hedge_mode and aggressive_long_exec and aggressive_short_exec:
                     if dir_pred_long >= dir_pred_short:
-                        aggressive_short = False
+                        aggressive_short_exec = False
                     else:
-                        aggressive_long = False
+                        aggressive_long_exec = False
                 sides = []
-                if aggressive_long:
+                if aggressive_long_exec:
                     sides.append("Buy")
-                if aggressive_short:
+                if aggressive_short_exec:
                     sides.append("Sell")
                 if sides:
                     self._cancel_orders_for_sides(sides, "aggressive_override")
-                if aggressive_long:
+                if aggressive_long_exec:
                     self._place_market_order("Buy", latest, equity, tp_mult=10.0)
-                if aggressive_short:
+                if aggressive_short_exec:
                     self._place_market_order("Sell", latest, equity, tp_mult=10.0)
-                self.last_regime = regime
-                self.last_sentiment = sentiment
-                self.last_health = self.health.check_health()
-                return
 
             long_ok = True
             short_ok = True
@@ -5653,9 +5875,9 @@ class LiveTradingV2:
                 long_ok = dir_pred_long > dir_threshold
                 short_ok = dir_pred_short > dir_threshold
 
-            if pred_long > threshold and long_ok and not has_buy:
+            if pred_long > threshold and long_ok and not has_buy and not aggressive_long_hit:
                 self._place_order("Buy", latest, equity)
-            if pred_short > threshold and short_ok and not has_sell:
+            if pred_short > threshold and short_ok and not has_sell and not aggressive_short_hit:
                 self._place_order("Sell", latest, equity)
             self.last_regime = regime
             self.last_sentiment = sentiment
