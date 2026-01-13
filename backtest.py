@@ -1,5 +1,5 @@
 """
-Copyright (C) 2026 [YOUR NAME HERE]
+Copyright (C) 2026 Fabián Zúñiga Franck
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
