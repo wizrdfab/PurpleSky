@@ -1,6 +1,18 @@
-
 """
-Live Trading V2 - Robust execution engine.
+Copyright (C) 2026 Fabián Zúñiga Franck
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
 import argparse
@@ -74,6 +86,7 @@ DEFAULT_FAST_BOOTSTRAP = False
 DEFAULT_POSITION_MODE = "hedge"
 DEFAULT_TP_MAKER = False
 DEFAULT_TP_MAKER_FALLBACK_SEC = 5.0
+DEFAULT_BROKER_ID = ""
 
 ERRCODE_RE = re.compile(r"ErrCode:\s*(\d+)")
 
@@ -1119,6 +1132,8 @@ class SafeExchange:
                 params["orderId"] = order_id
             if order_link_id:
                 params["orderLinkId"] = order_link_id
+            if getattr(self.exchange, "broker_id", ""):
+                params["brokerId"] = self.exchange.broker_id
             return self.exchange.session.cancel_order(**params)
         resp = self._call("cancel_order", _cancel)
         return bool(resp)
@@ -1200,6 +1215,7 @@ class LiveTradingV2:
         self.positions_raw_logged = False
         self.keys_file = Path(args.keys_file).expanduser() if args.keys_file else None
         self.keys_profile = args.keys_profile
+        self.broker_id = (args.broker_id or "").strip()
 
         self.dry_run = args.dry_run
         self.signal_only = args.signal_only
@@ -1352,7 +1368,13 @@ class LiveTradingV2:
 
         self.api_key = key
         self.api_secret = secret
-        return ExchangeClient(key, secret, self.config.data.symbol, testnet=self.testnet)
+        return ExchangeClient(
+            key,
+            secret,
+            self.config.data.symbol,
+            testnet=self.testnet,
+            broker_id=self.broker_id,
+        )
 
     def _load_keys_file(self) -> Tuple[Optional[str], Optional[str]]:
         if not self.keys_file:
@@ -6037,6 +6059,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-feature-z", action="store_true", help="Log per-feature z-scores each bar")
     parser.add_argument("--keys-file", type=str, default="", help="Path to JSON file with API keys")
     parser.add_argument("--keys-profile", type=str, default="default", help="Profile name inside keys file")
+    parser.add_argument(
+        "--broker-id",
+        type=str,
+        default=os.getenv("BYBIT_BROKER_ID", DEFAULT_BROKER_ID),
+        help="Optional Bybit brokerId for order/cancel requests",
+    )
     parser.add_argument("--log-open-orders-raw", action="store_true", help="Log raw open orders payload when it changes")
     parser.add_argument("--open-orders-log-path", type=str, default="", help="Path for raw open orders JSONL log")
     parser.add_argument("--log-positions-raw", action="store_true", help="Log raw positions payload once")

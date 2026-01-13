@@ -51,7 +51,14 @@ def _format_with_step(value: float, step: float) -> str:
     return format(dec.normalize(), "f")
 
 class ExchangeClient:
-    def __init__(self, api_key: str, api_secret: str, symbol: str, testnet: bool = False):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        symbol: str,
+        testnet: bool = False,
+        broker_id: Optional[str] = None,
+    ):
         self.symbol = symbol
         self.session = HTTP(
             testnet=testnet,
@@ -68,6 +75,7 @@ class ExchangeClient:
         self.tick_size = 0.0
         self.min_notional = 0.0
         self.max_notional = 0.0
+        self.broker_id = str(broker_id).strip() if broker_id else ""
         print(f"Connected to Bybit {'Testnet' if testnet else 'Mainnet'} for {symbol}")
 
     def get_exchange_now(self) -> datetime:
@@ -344,6 +352,10 @@ class ExchangeClient:
         except Exception:
             return default
 
+    def _apply_broker_id(self, params: Dict) -> None:
+        if self.broker_id:
+            params["brokerId"] = self.broker_id
+
     def get_position(self) -> float:
         """Returns current position size (Signed: + for Long, - for Short)."""
         try:
@@ -583,6 +595,7 @@ class ExchangeClient:
                 params["stopLoss"] = _format_with_step(sl, self.tick_size)
             if position_idx is not None: params["positionIdx"] = int(position_idx)
             if order_link_id: params["orderLinkId"] = str(order_link_id)
+            self._apply_broker_id(params)
             
             resp = self.session.place_order(**params)
             return resp
@@ -624,6 +637,7 @@ class ExchangeClient:
                 params["positionIdx"] = int(position_idx)
             if order_link_id:
                 params["orderLinkId"] = str(order_link_id)
+            self._apply_broker_id(params)
             resp = self.session.place_order(**params)
             return resp
         except InvalidRequestError as e:
@@ -643,10 +657,12 @@ class ExchangeClient:
     def cancel_all_orders(self):
         """Cancel all open orders for symbol."""
         try:
-            self.session.cancel_all_orders(
-                category="linear",
-                symbol=self.symbol
-            )
+            params = {
+                "category": "linear",
+                "symbol": self.symbol,
+            }
+            self._apply_broker_id(params)
+            self.session.cancel_all_orders(**params)
         except Exception as e:
             logger.error(f"Error canceling orders: {e}")
 
@@ -667,6 +683,7 @@ class ExchangeClient:
             }
             if position_idx is not None:
                 params["positionIdx"] = int(position_idx)
+            self._apply_broker_id(params)
             self.session.place_order(**params)
             logger.info(f"Market Close sent: {side_to_send} {qty}")
         except Exception as e:
@@ -689,6 +706,7 @@ class ExchangeClient:
             }
             if position_idx is not None:
                 params["positionIdx"] = int(position_idx)
+            self._apply_broker_id(params)
             self.session.set_trading_stop(**params)
         except Exception as e:
             logger.error(f"Error setting TP/SL: {e}")
