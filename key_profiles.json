@@ -1,0 +1,12 @@
+{
+    "profiles": {
+        "default": {
+            "api_key": "YOUR_BYBIT_API_KEY",
+            "api_secret": "YOUR_BYBIT_API_SECRET"
+        },
+        "paper": {
+            "api_key": "YOUR_TESTNET_KEY",
+            "api_secret": "YOUR_TESTNET_SECRET"
+        }
+    }
+}
