@@ -333,6 +333,37 @@ def resolve_latest_symbol(latest: dict, fallback: str) -> str:
     return fallback
 
 
+def count_entries_for_symbol(file_map: dict, symbol: str) -> int:
+    if not file_map or not symbol:
+        return 0
+    total = 0
+    for key, path in file_map.items():
+        latest = read_latest(path)
+        candidate_symbol = resolve_latest_symbol(latest, key)
+        if candidate_symbol == symbol:
+            total += 1
+    return total
+
+
+def primary_entry_for_symbol(file_map: dict, symbol: str) -> Optional[str]:
+    if not file_map or not symbol:
+        return None
+    candidates = []
+    for key, path in file_map.items():
+        latest = read_latest(path)
+        candidate_symbol = resolve_latest_symbol(latest, key)
+        if candidate_symbol == symbol:
+            candidates.append(key)
+    if not candidates:
+        return None
+    if symbol in candidates:
+        return symbol
+    no_suffix = [c for c in candidates if "_" not in c]
+    if no_suffix:
+        return min(no_suffix, key=len)
+    return min(candidates, key=len)
+
+
 def apply_dash_meta(latest: dict, dash_key: str) -> dict:
     if not isinstance(latest, dict):
         return latest
@@ -3768,10 +3799,22 @@ class MetricsHandler(BaseHTTPRequestHandler):
             else:
                 symbol_signals = self.metrics_dir / f"signals_{symbol}.jsonl"
                 if symbol_signals.exists() and symbol_signals.stat().st_size > 0:
-                    signals_path = symbol_signals
+                    primary = primary_entry_for_symbol(file_map, symbol)
+                    if entry_key == symbol or count_entries_for_symbol(file_map, symbol) <= 1 or entry_key == primary:
+                        signals_path = symbol_signals
+                    else:
+                        return self._send(200, [])
                 else:
                     return self._send(200, [])
-            return self._send(200, tail_jsonl(signals_path, limit=limit, max_bytes=max_bytes))
+            signals = tail_jsonl(signals_path, limit=limit, max_bytes=max_bytes)
+            if signals:
+                has_keys = any(s.get("entry_key") for s in signals if isinstance(s, dict))
+                if has_keys:
+                    signals = [
+                        s for s in signals
+                        if isinstance(s, dict) and (s.get("entry_key") == entry_key)
+                    ]
+            return self._send(200, signals)
 
         if parsed.path == "/api/candles":
             qs = parse_qs(parsed.query)
@@ -4198,7 +4241,15 @@ class SignalNotifier:
                     if key_signals.exists() and key_signals.stat().st_size > 0:
                         signals_path = key_signals
                     else:
-                        signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+                        symbol_signals = self.metrics_dir / f"signals_{symbol}.jsonl"
+                        if symbol_signals.exists() and symbol_signals.stat().st_size > 0:
+                            primary = primary_entry_for_symbol(file_map, symbol)
+                            if entry_key == symbol or count_entries_for_symbol(file_map, symbol) <= 1 or entry_key == primary:
+                                signals_path = symbol_signals
+                            else:
+                                continue
+                        else:
+                            continue
                     self._prime_seen(entry_key, signals_path)
                 self._bootstrapped = True
                 time.sleep(self.poll_sec)
@@ -4210,10 +4261,26 @@ class SignalNotifier:
                 if key_signals.exists() and key_signals.stat().st_size > 0:
                     signals_path = key_signals
                 else:
-                    signals_path = self.metrics_dir / f"signals_{symbol}.jsonl"
+                    symbol_signals = self.metrics_dir / f"signals_{symbol}.jsonl"
+                    if symbol_signals.exists() and symbol_signals.stat().st_size > 0:
+                        primary = primary_entry_for_symbol(file_map, symbol)
+                        if entry_key == symbol or count_entries_for_symbol(file_map, symbol) <= 1 or entry_key == primary:
+                            signals_path = symbol_signals
+                        else:
+                            continue
+                    else:
+                        continue
                 signals = tail_jsonl(signals_path, limit=40, max_bytes=256 * 1024)
                 if not signals:
                     continue
+                has_keys = any(s.get("entry_key") for s in signals if isinstance(s, dict))
+                if has_keys:
+                    signals = [
+                        s for s in signals
+                        if isinstance(s, dict) and (s.get("entry_key") == entry_key)
+                    ]
+                    if not signals:
+                        continue
                 sorted_signals = sorted(
                     signals,
                     key=lambda s: safe_int(s.get("ts_ms") or 0) or safe_int(s.get("bar_time") or 0),

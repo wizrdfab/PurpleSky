@@ -5168,6 +5168,7 @@ class LiveTradingV2:
             "ts_ms": ts_ms,
             "bar_time": bar_time,
             "symbol": self.config.data.symbol,
+            "entry_key": self.metrics_key,
             "side": side,
             "pred": round(float(pred), 6),
             "threshold": round(float(threshold), 6),

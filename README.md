@@ -118,7 +118,7 @@ python live_trading_v2.py --symbol FARTCOINUSDT --keys-file key_profiles.json --
 4. Live Trading (Real Money)
 Warning: Ensure you understand the risks.
 ```bash
-python live_trading_v2.py --symbol FARTCOINUSDT --keys-file keys.json
+python live_trading_v2.py --symbol FARTCOINUSDT --keys-file key_profiles.json
 ```
 
 5. Monitoring Dashboard
