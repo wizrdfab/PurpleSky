@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # The Trading Bot
+  bot:
+    build: .
+    container_name: purplesky_bot
+    # Uses variables from the .env file
+    # Default behavior: Run with the symbol and flags defined in .env
+    command: python live_trading.py --symbol ${SYMBOL} --keys-file ${KEYS_FILE} ${BOT_ARGS}
+    volumes:
+      - ./:/app
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # The Dashboard
+  dashboard:
+    build: .
+    container_name: purplesky_dashboard
+    command: python live_dashboard.py --host 0.0.0.0 --port 8787 --keys-file ${KEYS_FILE}
+    ports:
+      - "${DASHBOARD_PORT}:8787"
+    volumes:
+      - ./:/app
+    restart: unless-stopped

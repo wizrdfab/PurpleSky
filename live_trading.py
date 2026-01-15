@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import sys
 import re
 import time
 import threading
@@ -258,12 +259,14 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
         file_handler.setFormatter(formatter)
         file_handler.setLevel(log_level)
 
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        stream_handler.setLevel(log_level)
+        if getattr(sys, "stderr", None) and hasattr(sys.stderr, "write"):
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(formatter)
+            stream_handler.setLevel(log_level)
 
         logger.addHandler(file_handler)
-        logger.addHandler(stream_handler)
+        if "stream_handler" in locals():
+            logger.addHandler(stream_handler)
 
     return logger
 
@@ -447,14 +450,9 @@ class HealthMonitor:
 
     def check_sentiment(self) -> str:
         if not self.confidences:
-            return "CALIBRATING"
+            return "Confidence avg: n/a"
         avg_conf = sum(self.confidences) / len(self.confidences)
-        state = "NEUTRAL"
-        if avg_conf > 0.75:
-            state = "PINNED BULLISH"
-        elif avg_conf < 0.25:
-            state = "PINNED BEARISH"
-        return f"{state} | 1H Avg: {avg_conf:.3f}"
+        return f"Confidence avg: {avg_conf:.3f}"
 
     def check_regime(self, df: pd.DataFrame) -> str:
         if len(df) < 50:
@@ -1159,7 +1157,6 @@ class LiveTradingV2:
     def __init__(self, args: argparse.Namespace):
         self.logger = setup_logger(args.log_level)
         self.config = CONF
-        self.config.data.data_dir = Path(args.data_dir)
         self.config.data.symbol = args.symbol
         self.config.data.ob_levels = args.ob_levels
         self.testnet = args.testnet
@@ -1361,7 +1358,10 @@ class LiveTradingV2:
             key = os.getenv("BYBIT_API_KEY")
             secret = os.getenv("BYBIT_API_SECRET")
         if not key or not secret:
-            self.logger.warning("API keys missing. Switching to dry run mode.")
+            if self.signal_only:
+                self.logger.info("API keys missing; signal-only mode will use public endpoints only.")
+            else:
+                self.logger.warning("API keys missing. Switching to dry run mode.")
             self.dry_run = True
             key = "dummy"
             secret = "dummy"
@@ -2646,6 +2646,9 @@ class LiveTradingV2:
             external=False,
             origin="execution",
         )
+        if self.tp_maker and not self.dry_run and not self.signal_only:
+            # Place maker TP promptly after entry fills.
+            self._ensure_virtual_tp_orders(self.last_feature_row)
 
     def _reset_virtual_tp_order_fields(self, pos: Dict) -> None:
         pos["tp_order_id"] = None
@@ -2670,7 +2673,8 @@ class LiveTradingV2:
         positions = self._virtual_positions()
         if not positions:
             return
-        latest_row = latest_row or self.last_feature_row
+        if latest_row is None:
+            latest_row = self.last_feature_row
         updated = False
         for pos in positions:
             if pos.get("external"):
@@ -5918,6 +5922,26 @@ class LiveTradingV2:
             "trade_cont": float(self.continuous_trade_bars),
         }
 
+    def _warmup_state(self) -> Dict[str, int]:
+        target = max(1, int(self.continuity_bars))
+        bars = self.bar_window.bars
+        if bars is None or bars.empty or "bar_time" not in bars.columns:
+            return {"count": 0, "target": target}
+        times = [safe_int(val) for val in bars["bar_time"].tolist()]
+        times = [val for val in times if val > 0]
+        if not times:
+            return {"count": 0, "target": target}
+        times = sorted(set(times))
+        count = 1
+        for idx in range(len(times) - 1, 0, -1):
+            if times[idx] - times[idx - 1] == self.tf_seconds:
+                count += 1
+                if count >= target:
+                    break
+            else:
+                break
+        return {"count": int(min(count, target)), "target": target}
+
     def _serialize_feature_vector(self, row: pd.Series) -> Dict[str, object]:
         names = list(self.model_features)
         values: List[Optional[float]] = []
@@ -6150,6 +6174,7 @@ class LiveTradingV2:
                 "ob_lag_sec": round(ob_lag, 2) if ob_lag is not None else None,
             },
             "data_health": self._data_health_metrics(),
+            "warmup": self._warmup_state(),
             "health": {
                 "status": health,
                 "sentiment": sentiment,
@@ -6269,11 +6294,10 @@ class LiveTradingV2:
                 time.sleep(backoff)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live Trading V2")
     parser.add_argument("--model-dir", type=str, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--symbol", type=str, default=CONF.data.symbol)
-    parser.add_argument("--data-dir", type=str, default=str(CONF.data.data_dir))
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_BARS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--signal-only", action="store_true", help="Emit model signals only (no orders)")
@@ -6288,7 +6312,12 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("BYBIT_BROKER_ID", DEFAULT_BROKER_ID),
         help="Optional Bybit brokerId for order/cancel requests",
     )
-    parser.add_argument("--log-open-orders-raw", action="store_true", help="Log raw open orders payload when it changes")
+    parser.add_argument(
+        "--log-open-orders-raw",
+        action="store_true",
+        default=True,
+        help="Log raw open orders payload when it changes",
+    )
     parser.add_argument("--open-orders-log-path", type=str, default="", help="Path for raw open orders JSONL log")
     parser.add_argument("--log-positions-raw", action="store_true", help="Log raw positions payload once")
     parser.add_argument("--positions-log-path", type=str, default="", help="Path for raw positions JSONL log")
@@ -6372,7 +6401,7 @@ def parse_args() -> argparse.Namespace:
         default="atr,rsi,vol_z,ob_spread_bps,ob_imbalance_mean,taker_buy_ratio,pred_long,pred_short",
         help="Comma-separated drift metrics to track",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.drift_keys = [k.strip() for k in args.drift_keys.split(",") if k.strip()]
     if hasattr(args, "position_mode") and args.position_mode:
         args.position_mode = args.position_mode.lower()

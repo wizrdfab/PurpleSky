@@ -66,6 +66,10 @@ config.local.py
 secrets.bat
 secrets2.bat
 key_profiles.json
+SOURCE.txt
+data_collector.txt
+dashboard_status.log
+launcher_state.json
 
 # ----------------------------------------------------------------------------
 # Logs and Runtime Files (keep structure, ignore contents)

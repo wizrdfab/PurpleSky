@@ -75,7 +75,7 @@ Prerequisites:
 * Bybit or Binance Futures Account (Currently, there is an implementation of automated trading only for Bybit, API Keys required for live trading)
 
 Installation:
-```bashd
+```bash
 git clone https://github.com/wizrdfab/PurpleSky.git
 cd PurpleSky
 pip install -r requirements.txt
@@ -102,7 +102,7 @@ Run the optimization pipeline. This will:
 1. Load data and generate features.
 2. Run Optuna trials to find the best Hybrid Strategy parameters.
 3. Validate the champion model on a held-out test set.
-4. Save the model to models_v9/.
+4. Save the model to models/.
 ```bash
 python train.py --symbol FARTCOINUSDT --data-dir data/FARTCOINUSDT_Binance --trials 50
 ```
@@ -126,7 +126,7 @@ Launch the local web dashboard to view live signals and PnL. Dashboard has a cha
 ```bash
 python live_dashboard.py
 ```
-Access at http://localhost:8787
+Access at http://localhost:9007
 
 Dashboard supports discord/telegram notifications. You can pass them as 
 
@@ -185,8 +185,6 @@ If you find this project useful, consider making a donation or signing with my r
 
 Create a Bybit account using my referral link:
 https://www.bybit.com/invite?ref=14VP14Z
-
-Thanks <3
 
 --------------------------------------------------------------------------------
 

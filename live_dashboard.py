@@ -19,11 +19,12 @@ import argparse
 import csv
 import json
 import os
+import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
@@ -39,6 +40,19 @@ try:
     import joblib
 except Exception:
     joblib = None
+
+try:
+    from translations import get_language, get_dashboard_translations, detect_system_language, set_language
+except ImportError:
+    # Fallback if translations module not available
+    def get_language():
+        return "en"
+    def get_dashboard_translations():
+        return {}
+    def detect_system_language():
+        return "en"
+    def set_language(lang):
+        pass
 
 
 def tail_jsonl(path: Path, limit: int = 200, max_bytes: int = 512 * 1024):
@@ -1672,6 +1686,45 @@ def read_open_orders_latest(metrics_path: Path, symbol: str):
     return resting
 
 
+def read_protective_orders_latest(metrics_path: Path, symbol: str):
+    key = dash_key_from_metrics_path(metrics_path)
+    key_path = metrics_path.with_name(f"open_orders_{key}.jsonl") if key else None
+    if key_path and key_path.exists() and key_path.stat().st_size > 0:
+        orders_path = key_path
+    else:
+        orders_path = metrics_path.with_name(f"open_orders_{symbol}.jsonl")
+    latest = read_latest(orders_path)
+    orders = latest.get("open_orders") if isinstance(latest, dict) else None
+    if not isinstance(orders, list):
+        return []
+    protective = []
+    for order in orders:
+        if not is_protective_order(order):
+            continue
+        trigger_price = safe_float(
+            order.get("triggerPrice")
+            or order.get("trigger_price")
+            or order.get("stopPrice")
+            or order.get("stop_price")
+        )
+        protective.append({
+            "order_id": order.get("orderId"),
+            "side": order.get("side"),
+            "price": safe_float(order.get("price")),
+            "trigger_price": trigger_price,
+            "qty": safe_float(order.get("qty")),
+            "status": order.get("orderStatus"),
+            "reduce_only": safe_bool(order.get("reduceOnly")),
+            "close_on_trigger": safe_bool(order.get("closeOnTrigger")),
+            "order_type": order.get("orderType"),
+            "order_filter": order.get("orderFilter"),
+            "stop_order_type": order.get("stopOrderType"),
+            "create_type": order.get("createType"),
+            "position_idx": order.get("positionIdx"),
+        })
+    return protective
+
+
 def extract_price(latest: dict):
     pos = latest.get("position") or {}
     price = safe_float(pos.get("mark_price"))
@@ -1715,10 +1768,13 @@ def augment_latest(latest: dict, symbol: str, metrics_path: Path):
         latest["daily_pnl"] = exch_daily
     price = extract_price(latest)
     resting = read_open_orders_latest(metrics_path, symbol)
+    protective = read_protective_orders_latest(metrics_path, symbol)
     latest["dashboard"] = {
         "price": price,
         "resting_orders": resting,
         "resting_count": len(resting),
+        "protective_orders": protective,
+        "protective_count": len(protective),
         "trade_stats": compute_trade_stats(metrics_path),
     }
     return latest
@@ -1796,6 +1852,8 @@ EXTRA_SCRIPT = """
 (function() {
   if (window.__dashExtrasInjected) return;
   window.__dashExtrasInjected = true;
+  const DT = (key) => (window.DASH_TRANS && window.DASH_TRANS[key])
+    || key.replace("dash_", "").replace(/_/g, " ");
 
   function fmt(v, d) {
     if (v === null || v === undefined) return "--";
@@ -1822,6 +1880,58 @@ EXTRA_SCRIPT = """
       .mini-btn:hover { border-color: #60a5fa; }
       .chart-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
       .chart-sub { color: var(--muted); font-size: 12px; }
+      .toggle-btn.donate-btn.active {
+        border-color: rgba(168,85,247,0.7);
+        box-shadow: 0 0 0 2px rgba(168,85,247,0.2);
+      }
+      .modal {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 50;
+      }
+      .modal.open { display: flex; }
+      .modal-backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(2, 6, 23, 0.72);
+        backdrop-filter: blur(2px);
+      }
+      .modal-card {
+        position: relative;
+        z-index: 1;
+        background: #0b1220;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 12px;
+        width: min(520px, calc(100% - 32px));
+        padding: 16px 18px;
+        box-shadow: 0 20px 40px rgba(0,0,0,0.45);
+      }
+      .modal-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 8px;
+      }
+      .modal-head h3 { margin: 0; font-size: 16px; }
+      .modal-body .row { margin-top: 10px; }
+      .modal-body .row span:last-child { text-align: right; }
+      .icon-btn {
+        background: transparent;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        color: var(--text);
+        width: 28px;
+        height: 28px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 16px;
+        line-height: 1;
+      }
+      .icon-btn:hover { border-color: #60a5fa; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
     `;
     document.head.appendChild(style);
   }
@@ -1836,11 +1946,11 @@ EXTRA_SCRIPT = """
     card.className = "card";
     card.id = "dashMarketCard";
     card.innerHTML = `
-      <h3>Market</h3>
+      <h3>${DT("dash_market")}</h3>
       <div class="value" id="dashPrice">--</div>
-      <div class="row"><span>Position Mode</span><span id="dashPosMode">--</span></div>
-      <div class="row"><span>Resting Orders</span><span id="dashOrderCount">--</span></div>
-      <div class="row"><span>Limits</span><span id="dashOrderList" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>${DT("dash_position_mode")}</span><span id="dashPosMode">--</span></div>
+      <div class="row"><span>${DT("dash_resting_orders")}</span><span id="dashOrderCount">--</span></div>
+      <div class="row"><span>${DT("dash_limits")}</span><span id="dashOrderList" style="white-space: pre-line; text-align: right;">--</span></div>
     `;
     grid.appendChild(card);
   }
@@ -1853,13 +1963,13 @@ EXTRA_SCRIPT = """
     card.className = "card";
     card.id = "dashPerfCard";
     card.innerHTML = `
-      <h3>Performance</h3>
+      <h3>${DT("dash_performance")}</h3>
       <div class="value" id="dashWinRate">--</div>
-      <div class="row"><span>Trades</span><span id="dashTradeCount">--</span></div>
-      <div class="row"><span>Sortino</span><span id="dashSortino">--</span></div>
-      <div class="row"><span>Profit Factor</span><span id="dashProfitFactor">--</span></div>
-      <div class="row"><span>Avg Trade</span><span id="dashAvgTrade">--</span></div>
-      <div class="row"><span>Max DD</span><span id="dashMaxDD">--</span></div>
+      <div class="row"><span>${DT("dash_trades")}</span><span id="dashTradeCount">--</span></div>
+      <div class="row"><span>${DT("dash_sortino")}</span><span id="dashSortino">--</span></div>
+      <div class="row"><span>${DT("dash_profit_factor")}</span><span id="dashProfitFactor">--</span></div>
+      <div class="row"><span>${DT("dash_avg_trade")}</span><span id="dashAvgTrade">--</span></div>
+      <div class="row"><span>${DT("dash_max_dd")}</span><span id="dashMaxDD">--</span></div>
     `;
     grid.appendChild(card);
   }
@@ -1872,23 +1982,106 @@ EXTRA_SCRIPT = """
     card.className = "card";
     card.id = "dashIcebergCard";
     card.innerHTML = `
-      <h3>Iceberg</h3>
+      <h3>${DT("dash_iceberg")}</h3>
       <div class="value" id="dashIcebergStatus">--</div>
-      <div class="row"><span>Entry Buy</span><span id="dashIcebergBuy" style="white-space: pre-line; text-align: right;">--</span></div>
-      <div class="row"><span>Entry Sell</span><span id="dashIcebergSell" style="white-space: pre-line; text-align: right;">--</span></div>
-      <div class="row"><span>TP Long</span><span id="dashIcebergTpLong" style="white-space: pre-line; text-align: right;">--</span></div>
-      <div class="row"><span>TP Short</span><span id="dashIcebergTpShort" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>${DT("dash_entry_buy")}</span><span id="dashIcebergBuy" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>${DT("dash_entry_sell")}</span><span id="dashIcebergSell" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>${DT("dash_tp_long")}</span><span id="dashIcebergTpLong" style="white-space: pre-line; text-align: right;">--</span></div>
+      <div class="row"><span>${DT("dash_tp_short")}</span><span id="dashIcebergTpShort" style="white-space: pre-line; text-align: right;">--</span></div>
       <div class="row"><span>L1</span><span id="dashIcebergL1">--</span></div>
-      <div class="row"><span>Controls</span>
+      <div class="row"><span>${DT("dash_controls")}</span>
         <span id="dashIcebergControls" class="iceberg-controls">
-          <button class="mini-btn" id="icebergCancelBuy">Cancel Buy</button>
-          <button class="mini-btn" id="icebergCancelSell">Cancel Sell</button>
-          <button class="mini-btn" id="icebergCancelTpLong">Cancel TP Long</button>
-          <button class="mini-btn" id="icebergCancelTpShort">Cancel TP Short</button>
+          <button class="mini-btn" id="icebergCancelBuy">${DT("dash_cancel_buy")}</button>
+          <button class="mini-btn" id="icebergCancelSell">${DT("dash_cancel_sell")}</button>
+          <button class="mini-btn" id="icebergCancelTpLong">${DT("dash_cancel_tp_long")}</button>
+          <button class="mini-btn" id="icebergCancelTpShort">${DT("dash_cancel_tp_short")}</button>
         </span>
       </div>
     `;
     grid.appendChild(card);
+  }
+
+  function ensureDonateUI() {
+    const actions = document.querySelector("header .header-actions");
+    if (!actions) return;
+    let button = document.getElementById("donateToggle");
+    if (!button) {
+      button = document.createElement("button");
+      button.className = "toggle-btn active donate-btn";
+      button.id = "donateToggle";
+      button.type = "button";
+      const sound = document.getElementById("soundToggle");
+      if (sound && sound.parentElement === actions) {
+        actions.insertBefore(button, sound);
+      } else {
+        actions.prepend(button);
+      }
+    }
+      button.textContent = DT("dash_donate_referral");
+      button.classList.add("donate-btn");
+
+    let modal = document.getElementById("donateModal");
+    if (!modal) {
+      modal = document.createElement("div");
+      modal.id = "donateModal";
+      modal.className = "modal";
+      modal.setAttribute("aria-hidden", "true");
+      modal.innerHTML = `
+        <div class="modal-backdrop" data-close="true"></div>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="donateTitle">
+          <div class="modal-head">
+            <h3 id="donateTitle">${DT("dash_donate_referral")}</h3>
+            <button class="icon-btn" id="donateClose" type="button" aria-label="${DT("dash_close")}">×</button>
+          </div>
+          <div class="modal-body">
+            <div class="sub" id="donateNote">${DT("dash_donate_note")}</div>
+            <div class="row"><span>${DT("dash_bitcoin")}</span><span class="mono">1PucNiXsUCzfrMqUGCPfwgdyE3BL8Xnrrp</span></div>
+            <div class="row"><span>${DT("dash_ethereum")}</span><span class="mono">0x58ef00f47d6e94dfc486a2ed9b3dd3cfaf3c9714</span></div>
+            <div class="row"><span>${DT("dash_referral_link")}</span><span class="mono">https://www.bybit.com/invite?ref=14VP14Z</span></div>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+    } else {
+      const title = modal.querySelector("#donateTitle");
+      if (title) title.textContent = DT("dash_donate_referral");
+      const note = modal.querySelector("#donateNote");
+      if (note) note.textContent = DT("dash_donate_note");
+      const closeBtn = modal.querySelector("#donateClose");
+      if (closeBtn) closeBtn.setAttribute("aria-label", DT("dash_close"));
+    }
+
+    const openModal = () => {
+      if (!modal) return;
+      modal.classList.add("open");
+      modal.setAttribute("aria-hidden", "false");
+    };
+    const closeModal = () => {
+      if (!modal) return;
+      modal.classList.remove("open");
+      modal.setAttribute("aria-hidden", "true");
+    };
+
+    if (!button.dataset.bound) {
+      button.addEventListener("click", openModal);
+      button.dataset.bound = "1";
+    }
+    if (modal && !modal.dataset.bound) {
+      const closeBtn = modal.querySelector("#donateClose");
+      const backdrop = modal.querySelector("[data-close]");
+      if (closeBtn) closeBtn.addEventListener("click", closeModal);
+      if (backdrop) backdrop.addEventListener("click", closeModal);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeModal();
+      });
+      modal.dataset.bound = "1";
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", ensureDonateUI);
+  } else {
+    ensureDonateUI();
   }
 
   let chart = null;
@@ -1960,7 +2153,7 @@ EXTRA_SCRIPT = """
     wrap.id = "icebergChartWrap";
     wrap.innerHTML = `
       <div class="chart-header">
-        <h3>Iceberg Chart</h3>
+        <h3>${DT("dash_iceberg_chart")}</h3>
         <div class="chart-sub" id="icebergChartMeta">--</div>
       </div>
       <div id="icebergChart"></div>
@@ -2005,7 +2198,7 @@ EXTRA_SCRIPT = """
         fallback.onerror = () => {
           chartLibLoading = false;
           const meta = document.getElementById("icebergChartMeta");
-          if (meta) meta.textContent = "Chart library failed to load.";
+          if (meta) meta.textContent = DT("dash_chart_failed");
         };
         fallback.onload = () => {
           chartLibLoading = false;
@@ -2016,7 +2209,7 @@ EXTRA_SCRIPT = """
       }
       chartLibLoading = false;
       const meta = document.getElementById("icebergChartMeta");
-      if (meta) meta.textContent = "Chart library failed to load.";
+      if (meta) meta.textContent = DT("dash_chart_failed");
     };
     script.onload = () => {
       chartLibLoading = false;
@@ -2219,10 +2412,10 @@ EXTRA_SCRIPT = """
     if (candle) {
       lines.push(`O ${fmtPrice(candle.open)} H ${fmtPrice(candle.high)} L ${fmtPrice(candle.low)} C ${fmtPrice(candle.close)}`);
     } else if (lineValue !== null && lineValue !== undefined) {
-      lines.push(`Price ${fmtPrice(lineValue)}`);
+      lines.push(`${DT("dash_price")} ${fmtPrice(lineValue)}`);
     }
     if (volume !== null && volume !== undefined && volume !== 0) {
-      lines.push(`Vol ${fmtQty(volume)}`);
+      lines.push(`${DT("dash_volume")} ${fmtQty(volume)}`);
     }
     return lines.join("<br/>");
   }
@@ -2312,7 +2505,7 @@ EXTRA_SCRIPT = """
     const series = [
       {
         id: "primary",
-        name: "Price",
+        name: DT("dash_price"),
         type: "candlestick",
         data: candleData,
         encode: { x: 0, y: [1, 2, 3, 4] },
@@ -2320,7 +2513,7 @@ EXTRA_SCRIPT = """
       },
       {
         id: "volume",
-        name: "Volume",
+        name: DT("dash_volume"),
         type: "bar",
         xAxisIndex: 1,
         yAxisIndex: 1,
@@ -2337,7 +2530,7 @@ EXTRA_SCRIPT = """
     const series = [
       {
         id: "primary",
-        name: "Price",
+        name: DT("dash_price"),
         type: "line",
         data: lineData,
         encode: { x: 0, y: 1 },
@@ -2347,7 +2540,7 @@ EXTRA_SCRIPT = """
       },
       {
         id: "volume",
-        name: "Volume",
+        name: DT("dash_volume"),
         type: "bar",
         xAxisIndex: 1,
         yAxisIndex: 1,
@@ -2379,7 +2572,7 @@ EXTRA_SCRIPT = """
       const lastPrice = Number(chartOverlay.livePrice);
       lines.push({
         yAxis: lastPrice,
-        name: `Last ${fmtPrice(lastPrice)}`,
+        name: `${DT("dash_last")} ${fmtPrice(lastPrice)}`,
         lineStyle: { color: "#38bdf8", width: 1, type: "solid" },
         label: { show: true, formatter: "{b}", color: "#38bdf8", fontSize: 10 },
       });
@@ -2458,7 +2651,7 @@ EXTRA_SCRIPT = """
     const filtered = filterCandles(chartFullCandles);
     if (!filtered.length) {
       renderCandles([]);
-      setChartMeta("No chart data yet.");
+      setChartMeta(DT("dash_no_chart_data"));
       return;
     }
     renderCandles(filtered);
@@ -2466,8 +2659,8 @@ EXTRA_SCRIPT = """
     applyPricePrecision(last.close);
     const interval = chartIntervalSec ? `${chartIntervalSec}s` : "--";
     const lastTime = new Date(last.time).toLocaleTimeString();
-    const label = chartRangeLabel || "All";
-    setChartMeta(`Range ${label} | Bars ${filtered.length} | Last ${fmtPrice(last.close)} | ${lastTime} | Int ${interval}`);
+    const label = chartRangeLabel || DT("dash_all");
+    setChartMeta(`${DT("dash_range")} ${label} | ${DT("dash_bars")} ${filtered.length} | ${DT("dash_last")} ${fmtPrice(last.close)} | ${lastTime} | ${DT("dash_interval")} ${interval}`);
   }
 
   function metricPrice(m) {
@@ -2498,22 +2691,22 @@ EXTRA_SCRIPT = """
       return { time, value };
     }).filter(Boolean);
     if (!points.length) {
-      setChartMeta("No chart data yet.");
+      setChartMeta(DT("dash_no_chart_data"));
       return;
     }
     const now = Date.now();
     const cutoff = chartRangeSec ? (now - chartRangeSec * 1000) : 0;
     const filtered = cutoff > 0 ? points.filter(p => p.time >= cutoff) : points;
     if (!filtered.length) {
-      setChartMeta("No data in selected range.");
+      setChartMeta(DT("dash_no_data_range"));
       return;
     }
     chartFullCandles = [];
     renderLine(filtered);
     const last = filtered[filtered.length - 1];
     applyPricePrecision(last.value);
-    const label = chartRangeLabel || "All";
-    setChartMeta(`Range ${label} | Points ${filtered.length} | Last ${fmtPrice(last.value)} | Metrics feed`);
+    const label = chartRangeLabel || DT("dash_all");
+    setChartMeta(`${DT("dash_range")} ${label} | ${DT("dash_points")} ${filtered.length} | ${DT("dash_last")} ${fmtPrice(last.value)} | ${DT("dash_metrics_feed")}`);
   }
 
   async function fetchDirectionHistory(force = false) {
@@ -2640,25 +2833,25 @@ EXTRA_SCRIPT = """
       const time = resolveMarkerTime(ice.buy.last_post_ts || ice.buy.created_ts);
       const price = Number(ice.buy.last_price || ice.buy.target_price || 0);
       const info = ice.buy.last_post_ts ? icebergClipLabel(ice.buy) : icebergEntryLabel(ice.buy);
-      const label = ice.buy.last_post_ts ? "Buy Clip" : "Buy Entry";
+      const label = ice.buy.last_post_ts ? DT("dash_buy_clip") : DT("dash_entry_buy");
       pushMarker(time, price, "#22c55e", lineTitle(label, info), undefined, undefined, undefined, "orders");
     }
     if (ice.sell && ice.sell.active) {
       const time = resolveMarkerTime(ice.sell.last_post_ts || ice.sell.created_ts);
       const price = Number(ice.sell.last_price || ice.sell.target_price || 0);
       const info = ice.sell.last_post_ts ? icebergClipLabel(ice.sell) : icebergEntryLabel(ice.sell);
-      const label = ice.sell.last_post_ts ? "Sell Clip" : "Sell Entry";
+      const label = ice.sell.last_post_ts ? DT("dash_sell_clip") : DT("dash_entry_sell");
       pushMarker(time, price, "#f97316", lineTitle(label, info), undefined, undefined, undefined, "orders");
     }
     if (tp.long && (tp.long.active || tp.long.paused)) {
       const time = resolveMarkerTime(tp.long.tp_order_ts || tp.long.created_ts);
       const price = Number(tp.long.tp_order_price || tp.long.tp_target || 0);
-      pushMarker(time, price, "#60a5fa", lineTitle("TP Long", tpInfoLabel(tp.long)), undefined, undefined, undefined, "orders");
+      pushMarker(time, price, "#60a5fa", lineTitle(DT("dash_tp_long"), tpInfoLabel(tp.long)), undefined, undefined, undefined, "orders");
     }
     if (tp.short && (tp.short.active || tp.short.paused)) {
       const time = resolveMarkerTime(tp.short.tp_order_ts || tp.short.created_ts);
       const price = Number(tp.short.tp_order_price || tp.short.tp_target || 0);
-      pushMarker(time, price, "#f59e0b", lineTitle("TP Short", tpInfoLabel(tp.short)), undefined, undefined, undefined, "orders");
+      pushMarker(time, price, "#f59e0b", lineTitle(DT("dash_tp_short"), tpInfoLabel(tp.short)), undefined, undefined, undefined, "orders");
     }
     const prediction = data.prediction || data.health?.last_prediction || {};
     const predThreshold = numOrNaN(prediction.threshold);
@@ -2871,31 +3064,31 @@ EXTRA_SCRIPT = """
     const levels = [];
     const ice = data.iceberg || {};
     if (ice.buy && ice.buy.active) {
-      levels.push({ price: ice.buy.target_price, color: "#22c55e", title: priceTitle("Entry Buy", ice.buy.target_price, icebergEntryLabel(ice.buy)) });
-      if (ice.buy.tp) levels.push({ price: ice.buy.tp, color: "#38bdf8", title: priceTitle("Entry TP", ice.buy.tp, "") });
-      if (ice.buy.sl) levels.push({ price: ice.buy.sl, color: "#ef4444", title: priceTitle("Entry SL", ice.buy.sl, "") });
+      levels.push({ price: ice.buy.target_price, color: "#22c55e", title: priceTitle(DT("dash_entry_buy"), ice.buy.target_price, icebergEntryLabel(ice.buy)) });
+      if (ice.buy.tp) levels.push({ price: ice.buy.tp, color: "#38bdf8", title: priceTitle(DT("dash_entry_tp"), ice.buy.tp, "") });
+      if (ice.buy.sl) levels.push({ price: ice.buy.sl, color: "#ef4444", title: priceTitle(DT("dash_entry_sl"), ice.buy.sl, "") });
       if (ice.buy.order_id && ice.buy.last_price) {
-        levels.push({ price: ice.buy.last_price, color: "#16a34a", title: priceTitle("Buy Clip", ice.buy.last_price, icebergClipLabel(ice.buy)) });
+        levels.push({ price: ice.buy.last_price, color: "#16a34a", title: priceTitle(DT("dash_buy_clip"), ice.buy.last_price, icebergClipLabel(ice.buy)) });
       }
     }
     if (ice.sell && ice.sell.active) {
-      levels.push({ price: ice.sell.target_price, color: "#f97316", title: priceTitle("Entry Sell", ice.sell.target_price, icebergEntryLabel(ice.sell)) });
-      if (ice.sell.tp) levels.push({ price: ice.sell.tp, color: "#38bdf8", title: priceTitle("Entry TP", ice.sell.tp, "") });
-      if (ice.sell.sl) levels.push({ price: ice.sell.sl, color: "#ef4444", title: priceTitle("Entry SL", ice.sell.sl, "") });
+      levels.push({ price: ice.sell.target_price, color: "#f97316", title: priceTitle(DT("dash_entry_sell"), ice.sell.target_price, icebergEntryLabel(ice.sell)) });
+      if (ice.sell.tp) levels.push({ price: ice.sell.tp, color: "#38bdf8", title: priceTitle(DT("dash_entry_tp"), ice.sell.tp, "") });
+      if (ice.sell.sl) levels.push({ price: ice.sell.sl, color: "#ef4444", title: priceTitle(DT("dash_entry_sl"), ice.sell.sl, "") });
       if (ice.sell.order_id && ice.sell.last_price) {
-        levels.push({ price: ice.sell.last_price, color: "#ea580c", title: priceTitle("Sell Clip", ice.sell.last_price, icebergClipLabel(ice.sell)) });
+        levels.push({ price: ice.sell.last_price, color: "#ea580c", title: priceTitle(DT("dash_sell_clip"), ice.sell.last_price, icebergClipLabel(ice.sell)) });
       }
     }
     const tp = data.iceberg_tp || {};
     if (tp.long && (tp.long.active || tp.long.paused)) {
-      if (tp.long.tp_target) levels.push({ price: tp.long.tp_target, color: "#60a5fa", title: priceTitle("TP Long", tp.long.tp_target, tpInfoLabel(tp.long)) });
-      if (tp.long.sl_target) levels.push({ price: tp.long.sl_target, color: "#ef4444", title: priceTitle("SL Long", tp.long.sl_target, "") });
-      if (tp.long.tp_order_price) levels.push({ price: tp.long.tp_order_price, color: "#0ea5e9", title: priceTitle("TP Clip", tp.long.tp_order_price, tpInfoLabel(tp.long)) });
+      if (tp.long.tp_target) levels.push({ price: tp.long.tp_target, color: "#60a5fa", title: priceTitle(DT("dash_tp_long"), tp.long.tp_target, tpInfoLabel(tp.long)) });
+      if (tp.long.sl_target) levels.push({ price: tp.long.sl_target, color: "#ef4444", title: priceTitle(DT("dash_sl_long"), tp.long.sl_target, "") });
+      if (tp.long.tp_order_price) levels.push({ price: tp.long.tp_order_price, color: "#0ea5e9", title: priceTitle(DT("dash_tp_clip"), tp.long.tp_order_price, tpInfoLabel(tp.long)) });
     }
     if (tp.short && (tp.short.active || tp.short.paused)) {
-      if (tp.short.tp_target) levels.push({ price: tp.short.tp_target, color: "#f59e0b", title: priceTitle("TP Short", tp.short.tp_target, tpInfoLabel(tp.short)) });
-      if (tp.short.sl_target) levels.push({ price: tp.short.sl_target, color: "#ef4444", title: priceTitle("SL Short", tp.short.sl_target, "") });
-      if (tp.short.tp_order_price) levels.push({ price: tp.short.tp_order_price, color: "#d97706", title: priceTitle("TP Clip", tp.short.tp_order_price, tpInfoLabel(tp.short)) });
+      if (tp.short.tp_target) levels.push({ price: tp.short.tp_target, color: "#f59e0b", title: priceTitle(DT("dash_tp_short"), tp.short.tp_target, tpInfoLabel(tp.short)) });
+      if (tp.short.sl_target) levels.push({ price: tp.short.sl_target, color: "#ef4444", title: priceTitle(DT("dash_sl_short"), tp.short.sl_target, "") });
+      if (tp.short.tp_order_price) levels.push({ price: tp.short.tp_order_price, color: "#d97706", title: priceTitle(DT("dash_tp_clip"), tp.short.tp_order_price, tpInfoLabel(tp.short)) });
     }
     chartOverlay.lines = levels.filter(level => Number(level.price) > 0).map(level => {
       if (level.group) return level;
@@ -2958,7 +3151,7 @@ EXTRA_SCRIPT = """
       "6h": { label: "6H", sec: 6 * 60 * 60 },
       "24h": { label: "24H", sec: 24 * 60 * 60 },
       "1d": { label: "1D", sec: 24 * 60 * 60 },
-      "all": { label: "All", sec: 0 },
+      "all": { label: DT("dash_all"), sec: 0 },
     };
     rangeWrap.querySelectorAll(".range-btn").forEach(btn => {
         btn.addEventListener("click", () => {
@@ -3022,11 +3215,11 @@ EXTRA_SCRIPT = """
     const rem = fmtQty(ice.remaining_qty);
     const total = fmtQty(ice.total_qty);
     const clip = fmtQty(ice.clip_qty);
-    const state = ice.order_id ? "posted" : "waiting";
+    const state = ice.order_id ? DT("dash_posted") : DT("dash_waiting_state");
     const ready = (ice.activation_ready === null || ice.activation_ready === undefined)
       ? "--"
-      : (ice.activation_ready ? "ready" : "wait");
-    return `T ${target} TP ${tp} SL ${sl}\\nRem ${rem}/${total} Clip ${clip} ${state} ${ready}`;
+      : (ice.activation_ready ? DT("dash_ready") : DT("dash_waiting_state"));
+    return `${DT("dash_target_short")} ${target} ${DT("dash_tp")} ${tp} ${DT("dash_sl")} ${sl}\\n${DT("dash_remaining_short")} ${rem}/${total} ${DT("dash_clip")} ${clip} ${state} ${ready}`;
   }
 
   function formatTpIceberg(tp) {
@@ -3037,19 +3230,19 @@ EXTRA_SCRIPT = """
     const clipQty = fmtQty(tp.tp_order_qty);
     const clipPrice = fmtPrice(tp.tp_order_price);
     const clip = (tp.tp_order_qty && tp.tp_order_price) ? `${clipQty} @ ${clipPrice}` : "--";
-    const state = tp.paused ? "paused" : (tp.tp_order_id ? "posted" : "waiting");
+    const state = tp.paused ? DT("dash_paused") : (tp.tp_order_id ? DT("dash_posted") : DT("dash_waiting_state"));
     const ready = (tp.activation_ready === null || tp.activation_ready === undefined)
       ? "--"
-      : (tp.activation_ready ? "ready" : "wait");
-    return `TP ${target} SL ${sl}\\nSize ${size} Clip ${clip} ${state} ${ready}`;
+      : (tp.activation_ready ? DT("dash_ready") : DT("dash_waiting_state"));
+    return `${DT("dash_tp")} ${target} ${DT("dash_sl")} ${sl}\\n${DT("dash_size")} ${size} ${DT("dash_clip")} ${clip} ${state} ${ready}`;
   }
 
   function icebergStateLabel(ice) {
     if (!ice || !ice.active) return "";
-    if (ice.order_id) return "posted";
-    if (ice.activation_ready === true) return "ready";
-    if (ice.activation_ready === false) return "wait";
-    return "wait";
+    if (ice.order_id) return DT("dash_posted");
+    if (ice.activation_ready === true) return DT("dash_ready");
+    if (ice.activation_ready === false) return DT("dash_waiting_state");
+    return DT("dash_waiting_state");
   }
 
   function icebergFillLabel(ice) {
@@ -3064,9 +3257,9 @@ EXTRA_SCRIPT = """
     if (!ice || !ice.active) return "";
     const parts = [];
     const total = Number(ice.total_qty || 0);
-    if (total > 0) parts.push(`Size ${fmtQty(total)}`);
+    if (total > 0) parts.push(`${DT("dash_size")} ${fmtQty(total)}`);
     const fill = icebergFillLabel(ice);
-    if (fill) parts.push(`Fill ${fill}`);
+    if (fill) parts.push(`${DT("dash_fill")} ${fill}`);
     const state = icebergStateLabel(ice);
     if (state) parts.push(state);
     return parts.join(" ");
@@ -3076,7 +3269,7 @@ EXTRA_SCRIPT = """
     if (!ice || !ice.active) return "";
     const parts = [];
     const clip = Number(ice.clip_qty || 0);
-    if (clip > 0) parts.push(`Clip ${fmtQty(clip)}`);
+    if (clip > 0) parts.push(`${DT("dash_clip")} ${fmtQty(clip)}`);
     const state = icebergStateLabel(ice);
     if (state) parts.push(state);
     return parts.join(" ");
@@ -3084,20 +3277,20 @@ EXTRA_SCRIPT = """
 
   function tpStateLabel(tp) {
     if (!tp) return "";
-    if (tp.paused) return "paused";
-    if (tp.tp_order_id) return "posted";
-    if (tp.activation_ready === true) return "ready";
-    if (tp.activation_ready === false) return "wait";
-    return "wait";
+    if (tp.paused) return DT("dash_paused");
+    if (tp.tp_order_id) return DT("dash_posted");
+    if (tp.activation_ready === true) return DT("dash_ready");
+    if (tp.activation_ready === false) return DT("dash_waiting_state");
+    return DT("dash_waiting_state");
   }
 
   function tpInfoLabel(tp) {
     if (!tp || (!tp.active && !tp.paused)) return "";
     const parts = [];
     const size = Number(tp.size || 0);
-    if (size > 0) parts.push(`Size ${fmtQty(size)}`);
+    if (size > 0) parts.push(`${DT("dash_size")} ${fmtQty(size)}`);
     const clip = Number(tp.tp_order_qty || 0);
-    if (clip > 0) parts.push(`Clip ${fmtQty(clip)}`);
+    if (clip > 0) parts.push(`${DT("dash_clip")} ${fmtQty(clip)}`);
     const state = tpStateLabel(tp);
     if (state) parts.push(state);
     return parts.join(" ");
@@ -3132,6 +3325,7 @@ EXTRA_SCRIPT = """
     ensureCard();
     ensurePerfCard();
     ensureIcebergCard();
+    ensureDonateUI();
     ensureChartSection();
     bindIcebergControls();
     bindChartRangeControls();
@@ -3154,7 +3348,7 @@ EXTRA_SCRIPT = """
       if (dashKey && data.symbol && dashKey !== data.symbol) tags.push(dashKey);
       if (modelLabel && modelLabel !== data.symbol && modelLabel !== dashKey) tags.push(modelLabel);
       const tagText = tags.length ? ` (${tags.join(" / ")})` : "";
-      chartTitle.textContent = `${base}${tagText} Chart`;
+      chartTitle.textContent = `${base}${tagText} ${DT("dash_chart")}`;
     }
     const chartSub = document.getElementById("chartSub");
     if (chartSub) {
@@ -3163,10 +3357,10 @@ EXTRA_SCRIPT = """
       if (dashKey && data.symbol && dashKey !== data.symbol) tags.push(dashKey);
       if (modelLabel && modelLabel !== data.symbol && modelLabel !== dashKey) tags.push(modelLabel);
       const tag = tags.length ? ` | ${tags.join(" / ")}` : "";
-      chartSub.textContent = data.ts ? `Updated ${data.ts}${tag}` : "Waiting for data...";
+      chartSub.textContent = data.ts ? `${DT("dash_updated")} ${data.ts}${tag}` : DT("dash_waiting");
     }
     const chartStatus = document.getElementById("chartStatus");
-    if (chartStatus) chartStatus.textContent = data.health?.status || "Live";
+    if (chartStatus) chartStatus.textContent = data.health?.status || DT("dash_live");
     const dash = data.dashboard || {};
     const price = dash.price;
     const priceEl = document.getElementById("dashPrice");
@@ -3201,19 +3395,19 @@ EXTRA_SCRIPT = """
     const tpLong = tp.long || {};
     const tpShort = tp.short || {};
     const statusParts = [];
-    if (buy.active) statusParts.push("Entry Buy");
-    if (sell.active) statusParts.push("Entry Sell");
+    if (buy.active) statusParts.push(DT("dash_entry_buy"));
+    if (sell.active) statusParts.push(DT("dash_entry_sell"));
     if (tpLong.active) {
-      statusParts.push("TP Long");
+      statusParts.push(DT("dash_tp_long"));
     } else if (tpLong.paused) {
-      statusParts.push("TP Long (paused)");
+      statusParts.push(`${DT("dash_tp_long")} (${DT("dash_paused")})`);
     }
     if (tpShort.active) {
-      statusParts.push("TP Short");
+      statusParts.push(DT("dash_tp_short"));
     } else if (tpShort.paused) {
-      statusParts.push("TP Short (paused)");
+      statusParts.push(`${DT("dash_tp_short")} (${DT("dash_paused")})`);
     }
-    const statusText = statusParts.length ? statusParts.join(" & ") : "Idle";
+    const statusText = statusParts.length ? statusParts.join(" & ") : DT("dash_idle");
     const statusEl = document.getElementById("dashIcebergStatus");
     if (statusEl) statusEl.textContent = statusText;
     const buyEl = document.getElementById("dashIcebergBuy");
@@ -3226,7 +3420,7 @@ EXTRA_SCRIPT = """
     if (tpShortEl) tpShortEl.textContent = formatTpIceberg(tpShort);
     const l1 = ice.l1 || {};
     const l1Text = (l1.bid && l1.ask)
-      ? `${fmtPrice(l1.bid)} / ${fmtPrice(l1.ask)} (${fmt(l1.age_sec, 1)}s | exch ${fmt(l1.exchange_age_sec, 1)}s | ${l1.source || "n/a"})`
+      ? `${fmtPrice(l1.bid)} / ${fmtPrice(l1.ask)} (${fmt(l1.age_sec, 1)}s | ${DT("dash_exchange_short")} ${fmt(l1.exchange_age_sec, 1)}s | ${l1.source || DT("dash_na")})`
       : "--";
     const l1El = document.getElementById("dashIcebergL1");
     if (l1El) l1El.textContent = l1Text;
@@ -3314,7 +3508,7 @@ EXTRA_SCRIPT = """
 """
 
 
-def inject_dashboard_html(html: str) -> str:
+def inject_dashboard_html(html: str, lang: str = None) -> str:
     if "dashMarketCard" in html and "dashPerfCard" in html and "dashIcebergCard" in html:
         return html
     marker = "</body>"
@@ -3323,12 +3517,34 @@ def inject_dashboard_html(html: str) -> str:
     return html + EXTRA_SCRIPT
 
 
+def inject_translations(html: str) -> str:
+    """Inject translation strings into the dashboard HTML."""
+    translations = get_dashboard_translations()
+    if not translations:
+        return html
+
+    # Create JavaScript translation object
+    import json
+    trans_json = json.dumps(translations, ensure_ascii=False)
+    trans_script = f"""<script>
+window.DASH_TRANS = {trans_json};
+</script>
+"""
+
+    # Inject before the first <script> tag or at end of <head>
+    if "<script>" in html:
+        return html.replace("<script>", trans_script + "<script>", 1)
+    elif "</head>" in html:
+        return html.replace("</head>", trans_script + "</head>")
+    return html
+
+
 HTML_PAGE = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Live Trading Dashboard</title>
+  <title id="pageTitle">Live Trading Dashboard</title>
   <style>
     :root {
       --bg1: #0f172a;
@@ -3506,6 +3722,156 @@ HTML_PAGE = """<!doctype html>
     const fmtSec = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}s`;
     const fmtMs = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}ms`;
 
+    // Translation helper
+    const T = (key) => (window.DASH_TRANS && window.DASH_TRANS[key]) || key.replace("dash_", "").replace(/_/g, " ");
+    const formatT = (key, vars = {}) => {
+      let text = T(key);
+      Object.entries(vars).forEach(([k, v]) => {
+        text = text.replace(`{${k}}`, v);
+      });
+      return text;
+    };
+    function applyTranslations() {
+      const trans = window.DASH_TRANS || {};
+      if (!Object.keys(trans).length) return;
+
+      const title = document.getElementById("pageTitle");
+      if (title) title.textContent = T("dash_title");
+      document.title = T("dash_title");
+      const headerTitle = document.querySelector("header h1");
+      if (headerTitle) headerTitle.textContent = T("dash_title");
+      const symbol = document.getElementById("symbol");
+      if (symbol && !symbol.dataset.updated) symbol.textContent = T("dash_title");
+      const subline = document.getElementById("subline");
+      if (subline && !subline.dataset.updated) subline.textContent = T("dash_waiting");
+      const pill = document.getElementById("statusPill");
+      if (pill && !pill.dataset.updated) pill.textContent = T("dash_offline");
+      const accountSub = document.getElementById("accountSub");
+      if (accountSub && !accountSub.dataset.updated) accountSub.textContent = T("dash_waiting_balance");
+      const balanceNote = document.getElementById("balanceNote");
+      if (balanceNote && !balanceNote.dataset.updated) balanceNote.textContent = T("dash_flow_note");
+      const detailSub = document.getElementById("detailSub");
+      if (detailSub && !detailSub.dataset.updated) detailSub.textContent = T("dash_no_data_loaded");
+      const donateClose = document.getElementById("donateClose");
+      if (donateClose) donateClose.setAttribute("aria-label", T("dash_close"));
+
+      const textMap = {
+        "Account Balance": "dash_account_balance",
+        "Traders": "dash_traders",
+        "Total Balance": "dash_total_balance",
+        "Unified Account": "dash_unified_account",
+        "Funding Account": "dash_funding_account",
+        "Performance": "dash_performance",
+        "Balance Curve (Raw + Flow-Adjusted)": "dash_balance_curve",
+        "Curve Diagnostics": "dash_curve_diagnostics",
+        "Profiles": "dash_profiles",
+        "Equity and PnL": "dash_equity_pnl",
+        "Equity & PnL": "dash_equity_pnl",
+        "Position": "dash_position",
+        "Health": "dash_health",
+        "Model": "dash_model",
+        "Signal": "dash_signal",
+        "Data Quality": "dash_data_quality",
+        "Latency": "dash_latency",
+        "Orders": "dash_orders",
+        "Errors": "dash_errors",
+        "Features": "dash_features",
+        "Signal Stream": "dash_signal_stream",
+        "Available": "dash_available",
+        "Share": "dash_share",
+        "Updated": "dash_updated",
+        "Flow Events": "dash_flow_events",
+        "Max DD": "dash_max_dd",
+        "Volatility": "dash_volatility",
+        "Stability": "dash_stability",
+        "Smoothness": "dash_smoothness",
+        "Trend / Day": "dash_trend_day",
+        "Raw Return": "dash_raw_return",
+        "Points": "dash_points",
+        "Daily PnL": "dash_daily_pnl",
+        "Unrealized": "dash_unrealized",
+        "Size": "dash_size",
+        "Entry": "dash_entry",
+        "Mark": "dash_mark",
+        "TP / SL": "dash_tp_sl",
+        "Sentiment": "dash_sentiment",
+        "Regime": "dash_regime",
+        "Trade Enabled": "dash_trade_enabled",
+        "Drift Alerts": "dash_drift_alerts",
+        "Pred Long": "dash_pred_long",
+        "Pred Short": "dash_pred_short",
+        "Dir Long": "dash_dir_long",
+        "Dir Short": "dash_dir_short",
+        "Threshold": "dash_threshold",
+        "Pred Bar": "dash_pred_bar",
+        "Dir Threshold": "dash_dir_threshold",
+        "Aggressive": "dash_aggressive",
+        "Dir Bar": "dash_dir_bar",
+        "Model Path": "dash_model_path",
+        "Keys Profile": "dash_keys_profile",
+        "Side": "dash_side",
+        "Entry Price": "dash_entry_price",
+        "TP Price": "dash_tp_price",
+        "SL Price": "dash_sl_price",
+        "Time": "dash_time",
+        "Macro %": "dash_macro_pct",
+        "OB Density": "dash_ob_density",
+        "Trade Continuity": "dash_trade_continuity",
+        "Lag Trade / Bar": "dash_lag_trade_bar",
+        "WS Trade": "dash_ws_trade",
+        "WS OB": "dash_ws_ob",
+        "OB Lag": "dash_ob_lag",
+        "Last Reconcile": "dash_last_reconcile",
+        "Source": "dash_source",
+        "Protective": "dash_protective",
+        "Last Runtime": "dash_last_runtime",
+        "Last API": "dash_last_api",
+        "Active Signals": "dash_active_signals",
+        "Signals": "dash_signals",
+        "Direction": "dash_direction",
+        "Dir": "dash_direction_short",
+        "Agg": "dash_aggressive_short",
+        "Levels": "dash_levels",
+        "TP/SL": "dash_tp_sl",
+        "Sound Off": "dash_sound_off",
+        "Sound On": "dash_sound_on",
+        "All": "dash_all",
+        "Split Scale": "dash_split_scale",
+        "Shared Scale": "dash_shared_scale",
+        "Raw Curve": "dash_raw_curve",
+        "Flow-Adjusted": "dash_flow_adjusted",
+        "Raw": "dash_raw",
+        "Flow-adjusted": "dash_flow_adjusted",
+        "Save": "dash_save",
+        "Reset": "dash_reset",
+        "Signal Mode": "dash_signal_mode",
+        "Automated Mode": "dash_automated_mode",
+        "Show All": "dash_show_all",
+        "No data loaded": "dash_no_data_loaded",
+        "Flow-adjusted removes large deposits/withdrawals.": "dash_flow_note",
+        "Donate & Referral link": "dash_donate_referral",
+        "Contributions support me directly and help improve this tool.": "dash_donate_note",
+        "Bitcoin (BTC)": "dash_bitcoin",
+        "Ethereum (ETH)": "dash_ethereum",
+        "Bybit referral link": "dash_referral_link",
+      };
+
+      const apply = (el) => {
+        const key = textMap[el.textContent.trim()];
+        if (key) el.textContent = T(key);
+      };
+
+      document.querySelectorAll(
+        "h2, h3, .row > span:first-child, .nav-btn, .signal-strip__label, .toggle-btn, .signal-btn, .range-btn"
+      ).forEach(apply);
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", applyTranslations);
+    } else {
+      applyTranslations();
+    }
+
     function sparkline(canvas, values, color) {
       const ctx = canvas.getContext("2d");
       const w = canvas.width = canvas.clientWidth;
@@ -3529,9 +3895,12 @@ HTML_PAGE = """<!doctype html>
 
     function updateLatest(data) {
       if (!data || !data.symbol) return;
-      document.getElementById("symbol").textContent = `Live Trading Dashboard - ${data.symbol}`;
-      document.getElementById("subline").textContent = `Startup: ${data.startup_time} - Uptime: ${Math.round(data.uptime_sec)}s`;
-      document.getElementById("statusPill").textContent = data.trade_enabled ? "Trading Enabled" : "Trading Paused";
+      document.getElementById("symbol").textContent = `${T("dash_title")} - ${data.symbol}`;
+      document.getElementById("symbol").dataset.updated = "1";
+      document.getElementById("subline").textContent = `${T("dash_startup")}: ${data.startup_time} - ${T("dash_uptime")}: ${Math.round(data.uptime_sec)}s`;
+      document.getElementById("subline").dataset.updated = "1";
+      document.getElementById("statusPill").textContent = data.trade_enabled ? T("dash_trading_enabled") : T("dash_trading_paused");
+      document.getElementById("statusPill").dataset.updated = "1";
       document.getElementById("statusPill").className = "pill " + (data.trade_enabled ? "ok" : "warn");
 
       document.getElementById("equityVal").textContent = data.equity ? fmt(data.equity, 4) : "--";
@@ -3549,8 +3918,8 @@ HTML_PAGE = """<!doctype html>
       document.getElementById("healthVal").textContent = data.health.status || "--";
       document.getElementById("sentimentVal").textContent = data.health.sentiment || "--";
       document.getElementById("regimeVal").textContent = data.health.regime || "--";
-      document.getElementById("tradeEnabled").textContent = data.trade_enabled ? "Yes" : "No";
-      const drift = data.drift.alerts && data.drift.alerts.length ? data.drift.alerts.join(", ") : "None";
+      document.getElementById("tradeEnabled").textContent = data.trade_enabled ? T("dash_yes") : T("dash_no");
+      const drift = data.drift.alerts && data.drift.alerts.length ? data.drift.alerts.join(", ") : T("dash_none");
       document.getElementById("driftAlerts").textContent = drift;
 
       document.getElementById("barsVal").textContent = data.data_health.bars || 0;
@@ -3647,7 +4016,17 @@ HTML_PAGE = """<!doctype html>
 </html>
 """
 
-HTML_TEMPLATE_PATH = Path(__file__).with_name("live_dashboard.html")
+def resource_path(name: str) -> Path:
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", "")
+        if base:
+            candidate = Path(base) / name
+            if candidate.exists():
+                return candidate
+    return Path(__file__).with_name(name)
+
+
+HTML_TEMPLATE_PATH = resource_path("live_dashboard.html")
 if HTML_TEMPLATE_PATH.exists():
     try:
         HTML_PAGE = HTML_TEMPLATE_PATH.read_text(encoding="utf-8")
@@ -3655,25 +4034,54 @@ if HTML_TEMPLATE_PATH.exists():
         pass
 HTML_PAGE = inject_dashboard_html(HTML_PAGE)
 
+# Cache for translated HTML per language
+_HTML_CACHE = {}
+
+def get_translated_html() -> str:
+    """Get HTML with translations for current language."""
+    lang = get_language()
+    if lang not in _HTML_CACHE:
+        translations = get_dashboard_translations()
+        print(f"[DEBUG] Language: {lang}, translations count: {len(translations)}")
+        if translations:
+            print(f"[DEBUG] Sample keys: {list(translations.keys())[:5]}")
+        translated = inject_translations(HTML_PAGE)
+        has_trans = "DASH_TRANS" in translated
+        print(f"[DEBUG] DASH_TRANS injected: {has_trans}")
+        _HTML_CACHE[lang] = translated
+    return _HTML_CACHE[lang]
+
 
 class MetricsHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     metrics_dir: Path = Path(".")
     symbols_filter = None
     fixed_files = None
     history_limit: int = 200
     balance_monitor = None
-    static_dir: Path = Path(__file__).with_name("static")
+    static_dir: Path = resource_path("static")
 
     def _send(self, status, payload, content_type="application/json"):
+        try:
+            if isinstance(payload, (dict, list)):
+                data = json.dumps(payload, default=str).encode("utf-8")
+            elif isinstance(payload, str):
+                data = payload.encode("utf-8")
+            else:
+                data = payload if isinstance(payload, (bytes, bytearray)) else b""
+        except Exception:
+            data = b""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        if isinstance(payload, (dict, list)):
-            payload = json.dumps(payload, default=str).encode("utf-8")
-        elif isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def _resolve_files(self):
         if self.fixed_files:
@@ -3724,7 +4132,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            return self._send(200, HTML_PAGE, "text/html; charset=utf-8")
+            return self._send(200, get_translated_html(), "text/html; charset=utf-8")
 
         if parsed.path.startswith("/static/"):
             rel_path = parsed.path.replace("/static/", "", 1)
@@ -4067,6 +4475,7 @@ class SignalNotifier:
         fixed_files=None,
         symbols_filter=None,
         max_seen: int = 200,
+        include_aggressive: bool = True,
     ):
         self.webhook_url = webhook_url
         self.telegram_token = telegram_token
@@ -4077,11 +4486,13 @@ class SignalNotifier:
         self.fixed_files = fixed_files
         self.symbols_filter = symbols_filter
         self.max_seen = max(20, int(max_seen))
+        self.include_aggressive = include_aggressive
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._bootstrapped = False
         self._seen = {}
         self._seen_set = {}
+        self._seen_aggressive = {}
 
     def start(self):
         if self.webhook_url or (self.telegram_token and self.telegram_chat_id):
@@ -4196,10 +4607,31 @@ class SignalNotifier:
     def _seen_signal(self, entry_key: str, signal_id: str) -> bool:
         return signal_id in self._seen_set.get(entry_key, set())
 
-    def _format_signal_message(self, display: str, signal: dict) -> str:
+    def _remember_aggressive(self, entry_key: str, side: str, bar_time: int) -> None:
+        if entry_key not in self._seen_aggressive:
+            self._seen_aggressive[entry_key] = {}
+        self._seen_aggressive[entry_key][side] = bar_time
+
+    def _seen_aggressive_side(self, entry_key: str, side: str) -> Optional[int]:
+        return self._seen_aggressive.get(entry_key, {}).get(side)
+
+    def _has_threshold(self, latest: dict, meta: dict, key: str, param_key: Optional[str] = None) -> bool:
+        direction = latest.get("direction")
+        if isinstance(direction, dict) and key in direction and direction.get(key) is not None:
+            return True
+        params = meta.get("params") if isinstance(meta, dict) else None
+        lookup = param_key or key
+        if isinstance(params, dict) and lookup in params and params.get(lookup) is not None:
+            return True
+        return False
+
+    def _format_signal_message(self, display: str, signal: dict, threshold_override: Optional[float] = None) -> str:
         side_raw = str(signal.get("side") or "").lower()
         side = "LONG" if side_raw == "buy" else "SHORT" if side_raw == "sell" else side_raw.upper() or "SIGNAL"
         pred = safe_float(signal.get("pred"), 0.0)
+        threshold = safe_float(signal.get("threshold"), self.min_pred)
+        if threshold_override is not None:
+            threshold = threshold_override
         tick = safe_float(signal.get("tick_size"), 0.0)
         entry = self._fmt_price(signal.get("entry_price") or signal.get("target"), tick)
         tp = self._fmt_price(signal.get("tp"), tick)
@@ -4208,7 +4640,7 @@ class SignalNotifier:
         timeframe = signal.get("timeframe") or ""
         mode = signal.get("mode") or ""
         lines = [
-            f"{display} {side} signal {pred:.3f} (>= {self.min_pred:.2f})",
+            f"{display} {side} signal {pred:.3f} (>= {threshold:.2f})",
             f"Entry {entry} | TP {tp} | SL {sl}",
         ]
         if ts:
@@ -4218,6 +4650,38 @@ class SignalNotifier:
         if mode:
             lines.append(f"Mode: {mode}")
         return "\n".join(lines)
+
+    def _format_aggressive_message(
+        self,
+        display: str,
+        side: str,
+        pred: float,
+        aggressive: float,
+        threshold: Optional[float],
+        bar_time: Optional[int],
+        ts: Optional[str],
+    ) -> str:
+        side_label = "LONG" if side == "long" else "SHORT"
+        lines = [f"{display} DIR {side_label} {pred:.3f} (>= {aggressive:.2f})"]
+        if threshold is not None:
+            lines.append(f"Dir Threshold {threshold:.2f} | Bar {bar_time or 'n/a'}")
+        else:
+            lines.append(f"Bar {bar_time or 'n/a'}")
+        if ts:
+            lines.append(f"Time: {ts}")
+        return "\n".join(lines)
+
+    def _direction_bar_time(self, direction: dict, latest: dict) -> Optional[int]:
+        bar_time = normalize_bar_time(direction.get("bar_time")) if isinstance(direction, dict) else None
+        if bar_time is None:
+            bar_time = normalize_bar_time((latest.get("market") or {}).get("last_bar_time"))
+        if bar_time is None:
+            bar_time = normalize_bar_time(latest.get("bar_time"))
+        if bar_time is None:
+            ts = parse_ts(latest.get("ts")) if latest else None
+            if ts:
+                bar_time = int(ts)
+        return bar_time
 
     def _prime_seen(self, entry_key: str, signals_path: Path) -> None:
         signals = tail_jsonl(signals_path, limit=self.max_seen, max_bytes=256 * 1024)
@@ -4236,6 +4700,10 @@ class SignalNotifier:
             if not self._bootstrapped:
                 for entry_key, path in entries:
                     latest = read_latest(path)
+                    if not latest:
+                        continue
+                    latest = apply_dash_meta(latest, entry_key)
+                    latest, meta = apply_model_meta(latest, path)
                     symbol = resolve_latest_symbol(latest, entry_key)
                     key_signals = self.metrics_dir / f"signals_{entry_key}.jsonl"
                     if key_signals.exists() and key_signals.stat().st_size > 0:
@@ -4251,12 +4719,73 @@ class SignalNotifier:
                         else:
                             continue
                     self._prime_seen(entry_key, signals_path)
+                    if self.include_aggressive:
+                        has_aggressive = self._has_threshold(
+                            latest, meta, "aggressive_threshold", "aggressive_threshold"
+                        )
+                        if has_aggressive:
+                            direction = resolve_direction_info(latest, meta)
+                            aggressive = maybe_float(direction.get("aggressive_threshold")) if direction else None
+                            source = direction.get("source") if direction else None
+                            bar_time = self._direction_bar_time(direction or {}, latest)
+                            if aggressive is not None and source != "pass" and bar_time:
+                                pred_long = maybe_float(direction.get("pred_long")) if direction else None
+                                pred_short = maybe_float(direction.get("pred_short")) if direction else None
+                                if pred_long is not None and pred_long >= aggressive:
+                                    self._remember_aggressive(entry_key, "long", bar_time)
+                                if pred_short is not None and pred_short >= aggressive:
+                                    self._remember_aggressive(entry_key, "short", bar_time)
                 self._bootstrapped = True
                 time.sleep(self.poll_sec)
                 continue
             for entry_key, path in entries:
                 latest = read_latest(path)
-                display, symbol = format_model_display(latest or {}, entry_key, path)
+                if not latest:
+                    continue
+                latest = apply_dash_meta(latest, entry_key)
+                latest, meta = apply_model_meta(latest, path)
+                display, symbol = format_model_display(latest, entry_key, path)
+                has_direction = self._has_threshold(latest, meta, "threshold", "direction_threshold")
+                has_aggressive = self._has_threshold(
+                    latest, meta, "aggressive_threshold", "aggressive_threshold"
+                )
+                is_new = has_direction and has_aggressive
+                direction = resolve_direction_info(latest, meta) if (has_direction or has_aggressive) else None
+                if self.include_aggressive and has_aggressive and direction:
+                    aggressive = maybe_float(direction.get("aggressive_threshold"))
+                    source = direction.get("source")
+                    bar_time = self._direction_bar_time(direction, latest)
+                    if aggressive is not None and source != "pass" and bar_time:
+                        pred_long = maybe_float(direction.get("pred_long"))
+                        if pred_long is not None and pred_long >= aggressive:
+                            last_seen = self._seen_aggressive_side(entry_key, "long")
+                            if last_seen is None or bar_time > last_seen:
+                                message = self._format_aggressive_message(
+                                    display,
+                                    "long",
+                                    pred_long,
+                                    aggressive,
+                                    maybe_float(direction.get("threshold")),
+                                    bar_time,
+                                    latest.get("ts"),
+                                )
+                                self._send(message)
+                                self._remember_aggressive(entry_key, "long", bar_time)
+                        pred_short = maybe_float(direction.get("pred_short"))
+                        if pred_short is not None and pred_short >= aggressive:
+                            last_seen = self._seen_aggressive_side(entry_key, "short")
+                            if last_seen is None or bar_time > last_seen:
+                                message = self._format_aggressive_message(
+                                    display,
+                                    "short",
+                                    pred_short,
+                                    aggressive,
+                                    maybe_float(direction.get("threshold")),
+                                    bar_time,
+                                    latest.get("ts"),
+                                )
+                                self._send(message)
+                                self._remember_aggressive(entry_key, "short", bar_time)
                 key_signals = self.metrics_dir / f"signals_{entry_key}.jsonl"
                 if key_signals.exists() and key_signals.stat().st_size > 0:
                     signals_path = key_signals
@@ -4287,14 +4816,216 @@ class SignalNotifier:
                 )
                 for signal in sorted_signals:
                     pred = safe_float(signal.get("pred"), 0.0)
-                    if pred < self.min_pred:
+                    if is_new:
+                        threshold = maybe_float(signal.get("threshold"))
+                        min_pred = threshold if threshold is not None else self.min_pred
+                    else:
+                        min_pred = self.min_pred
+                    if pred < min_pred:
                         continue
                     signal_id = self._signal_key(signal)
                     if not signal_id or self._seen_signal(entry_key, signal_id):
                         continue
-                    message = self._format_signal_message(display, signal)
+                    message = self._format_signal_message(display, signal, min_pred)
                     self._send(message)
                     self._remember_signal(entry_key, signal_id)
+            time.sleep(self.poll_sec)
+
+
+class PredictionNotifier:
+    def __init__(
+        self,
+        webhook_url: str,
+        telegram_token: str,
+        telegram_chat_id: str,
+        metrics_dir: Path,
+        poll_sec: float = 5.0,
+        min_pred: float = 0.9,
+        fixed_files=None,
+        symbols_filter=None,
+    ):
+        self.webhook_url = webhook_url
+        self.telegram_token = telegram_token
+        self.telegram_chat_id = telegram_chat_id
+        self.metrics_dir = metrics_dir
+        self.poll_sec = poll_sec
+        self.min_pred = max(0.0, float(min_pred))
+        self.fixed_files = fixed_files
+        self.symbols_filter = symbols_filter
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._bootstrapped = False
+        self._seen = {}
+
+    def start(self):
+        if self.webhook_url or (self.telegram_token and self.telegram_chat_id):
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _send_discord(self, content: str) -> None:
+        if not self.webhook_url:
+            return
+        payload = json.dumps({"content": content}).encode("utf-8")
+        req = Request(
+            self.webhook_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "live-dashboard/1.0",
+            },
+        )
+        try:
+            with urlopen(req, timeout=10) as resp:
+                resp.read()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            print(f"Prediction notify (discord) failed: HTTP {exc.code} {exc.reason} {detail}")
+        except URLError as exc:
+            print(f"Prediction notify (discord) failed: {exc}")
+        except Exception as exc:
+            print(f"Prediction notify (discord) error: {exc}")
+
+    def _send_telegram(self, content: str) -> None:
+        if not self.telegram_token or not self.telegram_chat_id:
+            return
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        payload = json.dumps({"chat_id": self.telegram_chat_id, "text": content}).encode("utf-8")
+        req = Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "live-dashboard/1.0",
+            },
+        )
+        try:
+            with urlopen(req, timeout=10) as resp:
+                resp.read()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            print(f"Prediction notify (telegram) failed: HTTP {exc.code} {exc.reason} {detail}")
+        except URLError as exc:
+            print(f"Prediction notify (telegram) failed: {exc}")
+        except Exception as exc:
+            print(f"Prediction notify (telegram) error: {exc}")
+
+    def _send(self, content: str) -> None:
+        self._send_discord(content)
+        self._send_telegram(content)
+
+    def _seen_key(self, entry_key: str, side: str) -> Optional[int]:
+        return self._seen.get(entry_key, {}).get(side)
+
+    def _remember(self, entry_key: str, side: str, bar_time: int) -> None:
+        if entry_key not in self._seen:
+            self._seen[entry_key] = {}
+        self._seen[entry_key][side] = bar_time
+
+    def _prediction_bar_time(self, prediction: dict, latest: dict) -> Optional[int]:
+        bar_time = normalize_bar_time(prediction.get("bar_time"))
+        if bar_time is None:
+            bar_time = normalize_bar_time((latest.get("market") or {}).get("last_bar_time"))
+        if bar_time is None:
+            bar_time = normalize_bar_time(latest.get("bar_time"))
+        if bar_time is None:
+            ts = parse_ts(latest.get("ts")) if latest else None
+            if ts:
+                bar_time = int(ts)
+        return bar_time
+
+    def _format_prediction_message(
+        self,
+        display: str,
+        side: str,
+        pred: float,
+        threshold: float,
+        bar_time: Optional[int],
+        ts: Optional[str],
+    ) -> str:
+        side_label = "LONG" if side == "long" else "SHORT"
+        lines = [f"{display} PRED {side_label} {pred:.3f} (>= {threshold:.2f})"]
+        lines.append(f"Bar {bar_time or 'n/a'}")
+        if ts:
+            lines.append(f"Time: {ts}")
+        return "\n".join(lines)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.fixed_files:
+                file_map = self.fixed_files
+            else:
+                file_map = discover_metrics_entries(self.metrics_dir, self.symbols_filter)
+            entries = list(file_map.items())
+            if not self._bootstrapped:
+                for entry_key, path in entries:
+                    latest = read_latest(path)
+                    if not latest:
+                        continue
+                    latest = apply_dash_meta(latest, entry_key)
+                    prediction = latest.get("prediction") or (latest.get("health") or {}).get("last_prediction") or {}
+                    bar_time = self._prediction_bar_time(prediction, latest)
+                    pred_long = maybe_float(prediction.get("pred_long"))
+                    pred_short = maybe_float(prediction.get("pred_short"))
+                    if pred_long is not None and pred_long >= self.min_pred and bar_time:
+                        self._remember(entry_key, "long", bar_time)
+                    if pred_short is not None and pred_short >= self.min_pred and bar_time:
+                        self._remember(entry_key, "short", bar_time)
+                self._bootstrapped = True
+                time.sleep(self.poll_sec)
+                continue
+
+            for entry_key, path in entries:
+                latest = read_latest(path)
+                if not latest:
+                    continue
+                latest = apply_dash_meta(latest, entry_key)
+                display, _symbol = format_model_display(latest, entry_key, path)
+                prediction = latest.get("prediction") or (latest.get("health") or {}).get("last_prediction") or {}
+                bar_time = self._prediction_bar_time(prediction, latest)
+                if not bar_time:
+                    continue
+                ts_text = latest.get("ts")
+
+                pred_long = maybe_float(prediction.get("pred_long"))
+                if pred_long is not None and pred_long >= self.min_pred:
+                    last_seen = self._seen_key(entry_key, "long")
+                    if last_seen is None or bar_time > last_seen:
+                        message = self._format_prediction_message(
+                            display,
+                            "long",
+                            pred_long,
+                            self.min_pred,
+                            bar_time,
+                            ts_text,
+                        )
+                        self._send(message)
+                        self._remember(entry_key, "long", bar_time)
+
+                pred_short = maybe_float(prediction.get("pred_short"))
+                if pred_short is not None and pred_short >= self.min_pred:
+                    last_seen = self._seen_key(entry_key, "short")
+                    if last_seen is None or bar_time > last_seen:
+                        message = self._format_prediction_message(
+                            display,
+                            "short",
+                            pred_short,
+                            self.min_pred,
+                            bar_time,
+                            ts_text,
+                        )
+                        self._send(message)
+                        self._remember(entry_key, "short", bar_time)
+
             time.sleep(self.poll_sec)
 
 
@@ -4444,6 +5175,7 @@ class DirectionNotifier:
                     aggressive = maybe_float(direction.get("aggressive_threshold"))
                     if aggressive is None:
                         continue
+                    threshold = maybe_float(direction.get("threshold"))
                     pred_long = maybe_float(direction.get("pred_long"))
                     pred_short = maybe_float(direction.get("pred_short"))
                     if pred_long is not None and pred_long >= aggressive and bar_time:
@@ -4506,7 +5238,7 @@ class DirectionNotifier:
             time.sleep(self.poll_sec)
 
 
-def main():
+def main(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(description="Live Trading Dashboard")
     parser.add_argument("--metrics-dir", type=str, default=".")
     parser.add_argument("--symbols", type=str, default="")
@@ -4529,8 +5261,53 @@ def main():
     parser.add_argument("--notify-cooldown-sec", type=float, default=60.0)
     parser.add_argument("--notify-drawdown-pct", type=float, default=10.0)
     parser.add_argument("--notify-signal-threshold", type=float, default=0.9)
+    parser.add_argument(
+        "--notify-system",
+        dest="notify_system",
+        action="store_true",
+        help="Enable system alerts (default).",
+    )
+    parser.add_argument(
+        "--no-notify-system",
+        dest="notify_system",
+        action="store_false",
+        help="Disable system alerts.",
+    )
+    parser.add_argument(
+        "--notify-signals",
+        dest="notify_signals",
+        action="store_true",
+        help="Enable signal alerts (default).",
+    )
+    parser.add_argument(
+        "--no-notify-signals",
+        dest="notify_signals",
+        action="store_false",
+        help="Disable signal alerts.",
+    )
+    parser.add_argument(
+        "--notify-direction",
+        dest="notify_direction",
+        action="store_true",
+        help="Enable direction alerts (default).",
+    )
+    parser.add_argument(
+        "--no-notify-direction",
+        dest="notify_direction",
+        action="store_false",
+        help="Disable direction alerts.",
+    )
     parser.add_argument("--reset-stats", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--lang", type=str, default="", help="Language code (en, es). Auto-detects if not specified.")
+    parser.set_defaults(notify_system=True, notify_signals=True, notify_direction=True)
+    args = parser.parse_args(argv)
+
+    # Initialize language
+    if args.lang:
+        set_language(args.lang)
+    else:
+        set_language(detect_system_language())
+    print(f"Dashboard language: {get_language()}")
 
     MetricsHandler.metrics_dir = Path(args.metrics_dir)
     symbols_filter = None
@@ -4584,44 +5361,49 @@ def main():
     webhook = args.discord_webhook or os.getenv("DISCORD_WEBHOOK_URL", "")
     telegram_token = args.telegram_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = args.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
-    signal_threshold = args.notify_signal_threshold
-    env_threshold = os.getenv("SIGNAL_NOTIFY_THRESHOLD", "")
-    if env_threshold:
-        signal_threshold = safe_float(env_threshold, signal_threshold)
-    notifier = DiscordNotifier(
-        webhook_url=webhook,
-        metrics_dir=MetricsHandler.metrics_dir,
-        poll_sec=args.notify_poll_sec,
-        offline_sec=args.notify_offline_sec,
-        cooldown_sec=args.notify_cooldown_sec,
-        drawdown_pct=args.notify_drawdown_pct,
-        fixed_files=MetricsHandler.fixed_files,
-        symbols_filter=MetricsHandler.symbols_filter,
-    )
-    notifier.start()
-    signal_notifier = SignalNotifier(
-        webhook_url=webhook,
-        telegram_token=telegram_token,
-        telegram_chat_id=telegram_chat_id,
-        metrics_dir=MetricsHandler.metrics_dir,
-        poll_sec=args.notify_poll_sec,
-        min_pred=signal_threshold,
-        fixed_files=MetricsHandler.fixed_files,
-        symbols_filter=MetricsHandler.symbols_filter,
-    )
-    signal_notifier.start()
-    direction_notifier = DirectionNotifier(
-        webhook_url=webhook,
-        telegram_token=telegram_token,
-        telegram_chat_id=telegram_chat_id,
-        metrics_dir=MetricsHandler.metrics_dir,
-        poll_sec=args.notify_poll_sec,
-        fixed_files=MetricsHandler.fixed_files,
-        symbols_filter=MetricsHandler.symbols_filter,
-    )
-    direction_notifier.start()
+    if args.notify_system:
+        notifier = DiscordNotifier(
+            webhook_url=webhook,
+            metrics_dir=MetricsHandler.metrics_dir,
+            poll_sec=args.notify_poll_sec,
+            offline_sec=args.notify_offline_sec,
+            cooldown_sec=args.notify_cooldown_sec,
+            drawdown_pct=args.notify_drawdown_pct,
+            fixed_files=MetricsHandler.fixed_files,
+            symbols_filter=MetricsHandler.symbols_filter,
+        )
+        notifier.start()
+    if args.notify_signals:
+        signal_threshold = args.notify_signal_threshold
+        env_threshold = os.getenv("SIGNAL_NOTIFY_THRESHOLD", "")
+        if env_threshold:
+            signal_threshold = safe_float(env_threshold, signal_threshold)
+        signal_notifier = SignalNotifier(
+            webhook_url=webhook,
+            telegram_token=telegram_token,
+            telegram_chat_id=telegram_chat_id,
+            metrics_dir=MetricsHandler.metrics_dir,
+            poll_sec=args.notify_poll_sec,
+            min_pred=signal_threshold,
+            fixed_files=MetricsHandler.fixed_files,
+            symbols_filter=MetricsHandler.symbols_filter,
+            include_aggressive=True,
+        )
+        signal_notifier.start()
+    if args.notify_direction and not args.notify_signals:
+        direction_notifier = DirectionNotifier(
+            webhook_url=webhook,
+            telegram_token=telegram_token,
+            telegram_chat_id=telegram_chat_id,
+            metrics_dir=MetricsHandler.metrics_dir,
+            poll_sec=args.notify_poll_sec,
+            fixed_files=MetricsHandler.fixed_files,
+            symbols_filter=MetricsHandler.symbols_filter,
+        )
+        direction_notifier.start()
 
-    server = HTTPServer((args.host, args.port), MetricsHandler)
+    server = ThreadingHTTPServer((args.host, args.port), MetricsHandler)
+    server.daemon_threads = True
     print(f"Dashboard running on http://{args.host}:{args.port}")
     if MetricsHandler.fixed_files:
         print(f"Reading metrics: {list(MetricsHandler.fixed_files.values())[0]}")

@@ -15,3 +15,6 @@ pybit>=5.0.0
 
 # Binance
 binance-futures-connector>=3.5.0
+
+# UI
+customtkinter>=5.2.2

@@ -32,7 +32,7 @@ This manual provides detailed instructions on how to operate the **PurpleSky Qua
     ```
 
 ### 1.3 API Keys
-Create a file named `keys.json` in the root directory. This file stores your exchange credentials. **Never commit this file to Git.**
+Create a file named `key_profiles.json` in the root directory. This file stores your exchange credentials. **Never commit this file to Git.**
 
 **Format:**
 ```json
@@ -100,7 +100,7 @@ python train.py --symbol FARTCOINUSDT --data-dir data/FARTCOINUSDT_Binance --tri
     *   **Model:** Tree Depth, Learning Rate.
 4.  **Selection:** Picks the best trial based on Sortino Ratio.
 5.  **Validation:** Tests the winner on the final 15% of data (Holdout).
-6.  **Saving:** Saves the model to `models_v9/FARTCOINUSDT/...`.
+6.  **Saving:** Saves the model to `models/FARTCOINUSDT/...`.
 
 ---
 
@@ -112,7 +112,7 @@ The `live_trading_v2.py` script is the execution engine.
 Always start with a Dry Run to verify connections and logic without risking funds.
 
 ```bash
-python live_trading_v2.py --symbol FARTCOINUSDT --keys-file keys.json --dry-run
+python live_trading_v2.py --symbol FARTCOINUSDT --keys-file key_profiles.json --dry-run
 ```
 *   **Behavior:** Simulates orders locally. No API calls are sent to the exchange for placement.
 *   **Logs:** Check the logs to see "Placing Buy Limit..." messages.
@@ -121,7 +121,7 @@ python live_trading_v2.py --symbol FARTCOINUSDT --keys-file keys.json --dry-run
 When confident, remove the `--dry-run` flag.
 
 ```bash
-python live_trading_v2.py --symbol FARTCOINUSDT --keys-file keys.json
+python live_trading_v2.py --symbol FARTCOINUSDT --keys-file key_profiles.json
 ```
 
 **Optional Arguments:**
@@ -144,7 +144,7 @@ PurpleSky includes a lightweight local web dashboard.
     ```bash
     python live_dashboard.py
     ```
-2.  Open your browser to: `http://localhost:8050`
+2.  Open your browser to: `http://localhost:9007`
 
 **Features:**
 *   **Live Chart:** Candlestick chart with Buy/Sell markers.

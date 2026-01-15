@@ -43,6 +43,18 @@ def extract_err_code(message: str) -> Optional[int]:
         return None
 
 
+def safe_log_message(value: object) -> str:
+    text = str(value)
+    if not text:
+        return ""
+    text = text.replace("\u2192", "->")
+    try:
+        text.encode("ascii")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def _step_decimals(step: float) -> int:
     try:
         if step <= 0:
@@ -154,7 +166,7 @@ class ExchangeClient:
             # So this check is mostly informational unless we enforce it per position.
             return True
         except Exception as e:
-            logger.error(f"Failed to check Margin Mode: {e}")
+            logger.error(f"Failed to check Margin Mode: {safe_log_message(e)}")
             return False
 
     def enforce_position_mode(self, position_mode: str) -> bool:
@@ -180,7 +192,7 @@ class ExchangeClient:
             logger.info(f"Enforced {mode_label} Mode.")
             return True
         except Exception as e:
-            msg = str(e)
+            msg = safe_log_message(e)
             # 110043/110025: Position mode not modified (already correct) -> Success
             if "110043" in msg or "110025" in msg:
                 logger.info(f"Already in {mode_label} Mode (Verified).")
@@ -191,7 +203,7 @@ class ExchangeClient:
                     f"Could not switch mode (Positions exist). ASSUMING {mode_label}. Please verify manually!"
                 )
                 return True
-            logger.error(f"Error enforcing {mode_label} Mode: {e}")
+            logger.error(f"Error enforcing {mode_label} Mode: {msg}")
             return False
 
     def enforce_oneway_mode(self) -> bool:
@@ -228,7 +240,7 @@ class ExchangeClient:
             
             return drift
         except Exception as e:
-            logger.error(f"Time Sync Check failed: {e}")
+            logger.error(f"Time Sync Check failed: {safe_log_message(e)}")
             return 0.0
 
     def fetch_recent_trades(self, limit: int = 1000) -> pd.DataFrame:
@@ -262,7 +274,7 @@ class ExchangeClient:
             return df.sort_values('timestamp')
             
         except Exception as e:
-            logger.error(f"Error fetching trades: {e}")
+            logger.error(f"Error fetching trades: {safe_log_message(e)}")
             return pd.DataFrame()
 
     def fetch_kline(self, interval: str = "15", limit: int = 200, **kwargs) -> pd.DataFrame:
@@ -302,7 +314,7 @@ class ExchangeClient:
             return df
             
         except Exception as e:
-            logger.error(f"Error fetching klines: {e}")
+            logger.error(f"Error fetching klines: {safe_log_message(e)}")
             return pd.DataFrame()
 
     def set_leverage(self, leverage: int = 10):
@@ -319,7 +331,7 @@ class ExchangeClient:
             logger.info(f"Leverage set to {leverage}x.")
         except Exception as e:
             # Common error: "leverage not modified" (already set). We ignore it.
-            msg = str(e)
+            msg = safe_log_message(e)
             if "not modified" not in msg and "110043" not in msg:
                 logger.warning(f"Could not set leverage: {msg}")
 
@@ -335,7 +347,7 @@ class ExchangeClient:
             )
             return resp.get('result', {}).get('list', [])
         except Exception as e:
-            logger.error(f"Error fetching closed PnL: {e}")
+            logger.error(f"Error fetching closed PnL: {safe_log_message(e)}")
             return []
 
     def fetch_orderbook(self, limit: int = 200) -> Dict:
@@ -355,7 +367,7 @@ class ExchangeClient:
             # logger.debug(f"OB Fetched. TS: {res.get('ts')}")
             return res
         except Exception as e:
-            logger.error(f"Error fetching orderbook: {e}")
+            logger.error(f"Error fetching orderbook: {safe_log_message(e)}")
             return {}
 
     def _safe_float(self, value, default=0.0) -> float:
@@ -389,7 +401,7 @@ class ExchangeClient:
                     return size
             return 0.0
         except Exception as e:
-            logger.error(f"Error getting position: {e}")
+            logger.error(f"Error getting position: {safe_log_message(e)}")
             return 0.0
 
     def get_position_details(self) -> Dict:
@@ -428,7 +440,7 @@ class ExchangeClient:
                     }
             return {}
         except Exception as e:
-            logger.error(f"Error getting position details: {e}")
+            logger.error(f"Error getting position details: {safe_log_message(e)}")
             return {}
 
     def close_all_positions(self):
@@ -461,7 +473,7 @@ class ExchangeClient:
                         positionIdx=p.get('positionIdx', 0) # Important for Hedge Mode
                     )
         except Exception as e:
-            logger.error(f"Error in close_all_positions: {e}")
+            logger.error(f"Error in close_all_positions: {safe_log_message(e)}")
 
     def get_wallet_balance(self) -> Dict[str, float]:
         """Get Unified Account Balance with Fallback."""
@@ -510,7 +522,7 @@ class ExchangeClient:
                 'total_balance': coin_bal
             }
         except Exception as e:
-            logger.error(f"Error getting balance: {e}")
+            logger.error(f"Error getting balance: {safe_log_message(e)}")
             return {'equity': 0.0, 'available': 0.0, 'total_balance': 0.0}
 
     def get_open_orders(self) -> List[Dict]:
@@ -522,7 +534,7 @@ class ExchangeClient:
             )
             return resp.get('result', {}).get('list', [])
         except Exception as e:
-            logger.error(f"Error getting orders: {e}")
+            logger.error(f"Error getting orders: {safe_log_message(e)}")
             return []
 
     def fetch_instrument_info(self) -> Dict:
@@ -576,7 +588,7 @@ class ExchangeClient:
 
             return dict(self.instrument_info)
         except Exception as e:
-            logger.error(f"Error fetching instrument info: {e}")
+            logger.error(f"Error fetching instrument info: {safe_log_message(e)}")
             return {}
 
     def place_limit_order(
@@ -679,7 +691,7 @@ class ExchangeClient:
             self._apply_broker_id(params)
             self.session.cancel_all_orders(**params)
         except Exception as e:
-            logger.error(f"Error canceling orders: {e}")
+            logger.error(f"Error canceling orders: {safe_log_message(e)}")
 
     def market_close(self, side: str, qty: float, position_idx: Optional[int] = None):
         """Immediately close position at market price."""
@@ -702,7 +714,7 @@ class ExchangeClient:
             self.session.place_order(**params)
             logger.info(f"Market Close sent: {side_to_send} {qty}")
         except Exception as e:
-            logger.error(f"Error market closing: {e}")
+            logger.error(f"Error market closing: {safe_log_message(e)}")
 
     def place_tp_sl(self, side: str, qty: float, tp: float, sl: float, position_idx: Optional[int] = None):
         """
@@ -724,4 +736,4 @@ class ExchangeClient:
             self._apply_broker_id(params)
             self.session.set_trading_stop(**params)
         except Exception as e:
-            logger.error(f"Error setting TP/SL: {e}")
+            logger.error(f"Error setting TP/SL: {safe_log_message(e)}")

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Live Trading Dashboard</title>
+  <title id="pageTitle">Live Trading Dashboard</title>
   <style>
     :root {
       --bg1: #0f172a;
@@ -595,6 +595,10 @@
       border-color: rgba(34,197,94,0.6);
       box-shadow: 0 0 0 2px rgba(34,197,94,0.15);
     }
+    .toggle-btn.donate-btn.active {
+      border-color: rgba(168,85,247,0.7);
+      box-shadow: 0 0 0 2px rgba(168,85,247,0.2);
+    }
     .range-group {
       display: flex;
       gap: 6px;
@@ -679,6 +683,54 @@
       box-shadow: 0 10px 20px rgba(0,0,0,0.35);
       white-space: nowrap;
     }
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+    }
+    .modal.open { display: flex; }
+    .modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.72);
+      backdrop-filter: blur(2px);
+    }
+    .modal-card {
+      position: relative;
+      z-index: 1;
+      background: #0b1220;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 12px;
+      width: min(520px, calc(100% - 32px));
+      padding: 16px 18px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.45);
+    }
+    .modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .modal-head h3 { margin: 0; font-size: 16px; }
+    .modal-body .row { margin-top: 10px; }
+    .modal-body .row span:last-child { text-align: right; }
+    .icon-btn {
+      background: transparent;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+      color: var(--text);
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+    }
+    .icon-btn:hover { border-color: #60a5fa; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -692,15 +744,30 @@
       <div class="sub" id="subline">Waiting for metrics...</div>
     </div>
     <div class="header-actions">
+      <button class="toggle-btn active donate-btn" id="donateToggle" type="button">Donate & Referral link</button>
       <button class="toggle-btn" id="soundToggle" type="button">Sound Off</button>
       <div class="pill" id="statusPill">Offline</div>
     </div>
   </header>
+  <div class="modal" id="donateModal" aria-hidden="true">
+    <div class="modal-backdrop" data-close="true"></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="donateTitle">
+      <div class="modal-head">
+        <h3 id="donateTitle">Donate & Referral link</h3>
+        <button class="icon-btn" id="donateClose" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="sub" id="donateNote">Contributions support me directly and help improve this tool.</div>
+        <div class="row"><span>Bitcoin (BTC)</span><span class="mono">1PucNiXsUCzfrMqUGCPfwgdyE3BL8Xnrrp</span></div>
+        <div class="row"><span>Ethereum (ETH)</span><span class="mono">0x58ef00f47d6e94dfc486a2ed9b3dd3cfaf3c9714</span></div>
+        <div class="row"><span>Bybit referral link</span><span class="mono">https://www.bybit.com/invite?ref=14VP14Z</span></div>
+      </div>
+    </div>
+  </div>
 
   <nav class="nav-tabs">
     <button class="nav-btn active" id="tabAccount" data-view="account">Account Balance</button>
     <button class="nav-btn" id="tabTraders" data-view="traders">Traders</button>
-    <button class="nav-btn" id="tabChart" data-view="chart">Chart</button>
   </nav>
 
   <section id="accountSection" class="section active">
@@ -899,6 +966,7 @@
                 <button class="toggle-btn active" data-indicator="direction">Dir</button>
                 <button class="toggle-btn active" data-indicator="aggressive">Agg</button>
                 <button class="toggle-btn active" data-indicator="levels">Levels</button>
+                <button class="toggle-btn active" data-indicator="orders">TP/SL</button>
               </div>
               <button class="signal-btn" id="signalClear">Show All</button>
             </div>
@@ -910,47 +978,163 @@
     </section>
   </section>
 
-  <section id="chartSection" class="section">
-    <div class="detail-header">
-      <div>
-        <h2 id="chartTitle">Chart</h2>
-        <div class="sub" id="chartSub">Select a model to view price.</div>
-      </div>
-      <div class="pill" id="chartStatus">--</div>
-    </div>
-    <div class="account-chart">
-      <div class="chart-header">
-        <div>
-          <h3>Price and Iceberg Levels</h3>
-          <div class="sub" id="icebergChartMeta">--</div>
-        </div>
-        <div class="chart-controls">
-          <div class="range-group" id="chartRange">
-            <button class="range-btn active" data-range="15m">15M</button>
-            <button class="range-btn" data-range="30m">30M</button>
-            <button class="range-btn" data-range="1h">1H</button>
-            <button class="range-btn" data-range="4h">4H</button>
-            <button class="range-btn" data-range="6h">6H</button>
-            <button class="range-btn" data-range="24h">24H</button>
-            <button class="range-btn" data-range="1d">1D</button>
-          </div>
-          <div class="toggle-group" id="chartLegend">
-            <button class="toggle-btn active" data-legend="pred">Pred</button>
-            <button class="toggle-btn active" data-legend="dir">Dir</button>
-            <button class="toggle-btn active" data-legend="gate">Gate</button>
-            <button class="toggle-btn active" data-legend="orders">Orders</button>
-          </div>
-        </div>
-      </div>
-      <div id="icebergChart" class="chart-large"></div>
-    </div>
-  </section>
-
   <script>
     const fmt = (v, d=2) => (v === null || v === undefined) ? "--" : Number(v).toFixed(d);
     const fmtPct = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}%`;
     const fmtSec = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}s`;
     const fmtMs = (v) => (v === null || v === undefined) ? "--" : `${Number(v).toFixed(1)}ms`;
+
+    // Translation helper
+    const T = (key) => (window.DASH_TRANS && window.DASH_TRANS[key]) || key.replace("dash_", "").replace(/_/g, " ");
+    const formatT = (key, vars = {}) => {
+      let text = T(key);
+      Object.entries(vars).forEach(([k, v]) => {
+        text = text.replace(`{${k}}`, v);
+      });
+      return text;
+    };
+    function applyTranslations() {
+      const trans = window.DASH_TRANS || {};
+      if (!Object.keys(trans).length) return;
+
+      const title = document.getElementById("pageTitle");
+      if (title) title.textContent = T("dash_title");
+      document.title = T("dash_title");
+      const headerTitle = document.querySelector("header h1");
+      if (headerTitle) headerTitle.textContent = T("dash_title");
+      const symbol = document.getElementById("symbol");
+      if (symbol && !symbol.dataset.updated) symbol.textContent = T("dash_title");
+      const subline = document.getElementById("subline");
+      if (subline && !subline.dataset.updated) subline.textContent = T("dash_waiting");
+      const pill = document.getElementById("statusPill");
+      if (pill && !pill.dataset.updated) pill.textContent = T("dash_offline");
+      const accountSub = document.getElementById("accountSub");
+      if (accountSub && !accountSub.dataset.updated) accountSub.textContent = T("dash_waiting_balance");
+      const balanceNote = document.getElementById("balanceNote");
+      if (balanceNote && !balanceNote.dataset.updated) balanceNote.textContent = T("dash_flow_note");
+      const detailSub = document.getElementById("detailSub");
+      if (detailSub && !detailSub.dataset.updated) detailSub.textContent = T("dash_no_data_loaded");
+      const donateClose = document.getElementById("donateClose");
+      if (donateClose) donateClose.setAttribute("aria-label", T("dash_close"));
+      const donateNote = document.getElementById("donateNote");
+      if (donateNote) donateNote.textContent = T("dash_donate_note");
+
+      const textMap = {
+        "Account Balance": "dash_account_balance",
+        "Traders": "dash_traders",
+        "Total Balance": "dash_total_balance",
+        "Unified Account": "dash_unified_account",
+        "Funding Account": "dash_funding_account",
+        "Performance": "dash_performance",
+        "Balance Curve (Raw + Flow-Adjusted)": "dash_balance_curve",
+        "Curve Diagnostics": "dash_curve_diagnostics",
+        "Profiles": "dash_profiles",
+        "Equity and PnL": "dash_equity_pnl",
+        "Equity & PnL": "dash_equity_pnl",
+        "Position": "dash_position",
+        "Health": "dash_health",
+        "Model": "dash_model",
+        "Signal": "dash_signal",
+        "Data Quality": "dash_data_quality",
+        "Latency": "dash_latency",
+        "Orders": "dash_orders",
+        "Errors": "dash_errors",
+        "Features": "dash_features",
+        "Signal Stream": "dash_signal_stream",
+        "Available": "dash_available",
+        "Share": "dash_share",
+        "Updated": "dash_updated",
+        "Flow Events": "dash_flow_events",
+        "Max DD": "dash_max_dd",
+        "Volatility": "dash_volatility",
+        "Stability": "dash_stability",
+        "Smoothness": "dash_smoothness",
+        "Trend / Day": "dash_trend_day",
+        "Raw Return": "dash_raw_return",
+        "Points": "dash_points",
+        "Daily PnL": "dash_daily_pnl",
+        "Unrealized": "dash_unrealized",
+        "Size": "dash_size",
+        "Entry": "dash_entry",
+        "Mark": "dash_mark",
+        "TP / SL": "dash_tp_sl",
+        "Sentiment": "dash_sentiment",
+        "Regime": "dash_regime",
+        "Trade Enabled": "dash_trade_enabled",
+        "Drift Alerts": "dash_drift_alerts",
+        "Pred Long": "dash_pred_long",
+        "Pred Short": "dash_pred_short",
+        "Dir Long": "dash_dir_long",
+        "Dir Short": "dash_dir_short",
+        "Threshold": "dash_threshold",
+        "Pred Bar": "dash_pred_bar",
+        "Dir Threshold": "dash_dir_threshold",
+        "Aggressive": "dash_aggressive",
+        "Dir Bar": "dash_dir_bar",
+        "Model Path": "dash_model_path",
+        "Keys Profile": "dash_keys_profile",
+        "Side": "dash_side",
+        "Entry Price": "dash_entry_price",
+        "TP Price": "dash_tp_price",
+        "SL Price": "dash_sl_price",
+        "Time": "dash_time",
+        "Macro %": "dash_macro_pct",
+        "OB Density": "dash_ob_density",
+        "Trade Continuity": "dash_trade_continuity",
+        "Lag Trade / Bar": "dash_lag_trade_bar",
+        "WS Trade": "dash_ws_trade",
+        "WS OB": "dash_ws_ob",
+        "OB Lag": "dash_ob_lag",
+        "Last Reconcile": "dash_last_reconcile",
+        "Source": "dash_source",
+        "Protective": "dash_protective",
+        "Last Runtime": "dash_last_runtime",
+        "Last API": "dash_last_api",
+        "Active Signals": "dash_active_signals",
+        "Signals": "dash_signals",
+        "Direction": "dash_direction",
+        "Dir": "dash_direction_short",
+        "Agg": "dash_aggressive_short",
+        "Levels": "dash_levels",
+        "TP/SL": "dash_tp_sl",
+        "Sound Off": "dash_sound_off",
+        "Sound On": "dash_sound_on",
+        "All": "dash_all",
+        "Split Scale": "dash_split_scale",
+        "Shared Scale": "dash_shared_scale",
+        "Raw Curve": "dash_raw_curve",
+        "Flow-Adjusted": "dash_flow_adjusted",
+        "Raw": "dash_raw",
+        "Flow-adjusted": "dash_flow_adjusted",
+        "Save": "dash_save",
+        "Reset": "dash_reset",
+        "Signal Mode": "dash_signal_mode",
+        "Automated Mode": "dash_automated_mode",
+        "Show All": "dash_show_all",
+        "No data loaded": "dash_no_data_loaded",
+        "Flow-adjusted removes large deposits/withdrawals.": "dash_flow_note",
+        "Donate & Referral link": "dash_donate_referral",
+        "Contributions support me directly and help improve this tool.": "dash_donate_note",
+        "Bitcoin (BTC)": "dash_bitcoin",
+        "Ethereum (ETH)": "dash_ethereum",
+        "Bybit referral link": "dash_referral_link",
+      };
+
+      const apply = (el) => {
+        const key = textMap[el.textContent.trim()];
+        if (key) el.textContent = T(key);
+      };
+
+      document.querySelectorAll(
+        "h2, h3, .row > span:first-child, .nav-btn, .signal-strip__label, .toggle-btn, .signal-btn, .range-btn"
+      ).forEach(apply);
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", applyTranslations);
+    } else {
+      applyTranslations();
+    }
     const numOrNaN = (value) => {
       if (value === null || value === undefined || value === "") return NaN;
       const num = Number(value);
@@ -998,7 +1182,7 @@
       }
     };
     const SIGNAL_LEGEND_KEY = "dash_signal_legend_v1";
-    const defaultSignalLegend = { signals: true, direction: true, aggressive: true, levels: true };
+    const defaultSignalLegend = { signals: true, direction: true, aggressive: true, levels: true, orders: true };
     const loadSignalLegend = () => {
       try {
         const raw = localStorage.getItem(SIGNAL_LEGEND_KEY);
@@ -1017,12 +1201,49 @@
       }
     };
     const TRADER_MODE_KEY = "dash_trader_mode_v1";
+    const normalizeTraderMode = (value) => {
+      const mode = String(value || "").toLowerCase();
+      if (mode === "signal") return "signal";
+      if (mode === "auto") return "auto";
+      return "";
+    };
+    const normalizeView = (value) => {
+      const view = String(value || "").toLowerCase();
+      if (view === "account") return "account";
+      if (view === "traders") return "traders";
+      return "";
+    };
+    const loadView = () => {
+      try {
+        const params = new URLSearchParams(window.location.search || "");
+        const paramView = normalizeView(params.get("view") || params.get("tab"));
+        if (paramView) return paramView;
+        const paramMode = normalizeTraderMode(params.get("mode"));
+        if (paramMode === "signal") return "traders";
+      } catch (err) {
+        return "account";
+      }
+      return "account";
+    };
     const loadTraderMode = () => {
+      try {
+        const params = new URLSearchParams(window.location.search || "");
+        const paramMode = normalizeTraderMode(params.get("mode"));
+        if (paramMode) {
+          try {
+            localStorage.setItem(TRADER_MODE_KEY, paramMode);
+          } catch (err) {
+            return paramMode;
+          }
+          return paramMode;
+        }
+      } catch (err) {
+      }
       try {
         const raw = localStorage.getItem(TRADER_MODE_KEY);
         if (!raw) return "auto";
-        const mode = String(raw);
-        return mode === "signal" ? "signal" : "auto";
+        const mode = normalizeTraderMode(raw);
+        return mode || "auto";
       } catch (err) {
         return "auto";
       }
@@ -1042,7 +1263,7 @@
       latestMap: {},
       items: [],
       lastHistoryKey: null,
-      view: "account",
+      view: loadView(),
       balanceRange: "all",
       balanceScale: "split",
       balanceShowRaw: true,
@@ -1165,11 +1386,15 @@
       return "";
     }
 
+    function sideLabelFromKey(key, emptyLabel) {
+      if (key === "long") return T("dash_long");
+      if (key === "short") return T("dash_short");
+      if (!key) return emptyLabel;
+      return key.toString().toUpperCase();
+    }
+
     function signalSideLabel(side) {
-      const key = signalSideKey(side);
-      if (key === "long") return "LONG";
-      if (key === "short") return "SHORT";
-      return "--";
+      return sideLabelFromKey(signalSideKey(side), "--");
     }
 
     function computeSignalTargets(signal, entry) {
@@ -1372,10 +1597,10 @@
 
       ctx.fillStyle = "rgba(148,163,184,0.8)";
       ctx.font = "11px Space Grotesk, sans-serif";
-      const rawLabel = `Raw ${fmt(maxRaw, 2)} / ${fmt(minRaw, 2)}`;
+      const rawLabel = `${T("dash_raw")} ${fmt(maxRaw, 2)} / ${fmt(minRaw, 2)}`;
       ctx.fillText(rawLabel, pad, pad + 2);
       if (!useShared) {
-        const adjLabel = `Adj ${fmt(maxAdj, 2)} / ${fmt(minAdj, 2)}`;
+        const adjLabel = `${T("dash_adjusted")} ${fmt(maxAdj, 2)} / ${fmt(minAdj, 2)}`;
         const textWidth = ctx.measureText(adjLabel).width;
         ctx.fillText(adjLabel, w - textWidth - pad, pad + 2);
       }
@@ -1406,12 +1631,12 @@
         tooltip.style.display = "block";
         const parts = [];
         if (raw !== null && raw !== undefined) {
-          parts.push(`Raw: ${fmt(raw, 4)}`);
+          parts.push(`${T("dash_raw")}: ${fmt(raw, 4)}`);
         }
         if (adj !== null && adj !== undefined) {
-          parts.push(`Adj: ${fmt(adj, 4)}`);
+          parts.push(`${T("dash_adjusted")}: ${fmt(adj, 4)}`);
         }
-        tooltip.textContent = `${timeText} | ${parts.length ? parts.join(" | ") : "No series visible"}`;
+        tooltip.textContent = `${timeText} | ${parts.length ? parts.join(" | ") : T("dash_no_series_visible")}`;
         const left = Math.min(cardRect.width - tooltip.offsetWidth - 8, Math.max(8, (rect.left - cardRect.left) + x + 12));
         tooltip.style.left = `${left}px`;
         tooltip.style.top = `${Math.max(8, (rect.top - cardRect.top) + (evt.clientY - rect.top) - 24)}px`;
@@ -1607,7 +1832,7 @@
       const btn = document.getElementById("soundToggle");
       if (!btn) return;
       btn.classList.toggle("active", state.soundEnabled);
-      btn.textContent = state.soundEnabled ? "Sound On" : "Sound Off";
+      btn.textContent = state.soundEnabled ? T("dash_sound_on") : T("dash_sound_off");
     }
 
     function ensureFaviconLink() {
@@ -1839,12 +2064,12 @@
         const side = (aggressiveSide || entry.side || "dual").toLowerCase();
         let sideLabel = "";
         if (aggressiveSide) {
-          const aggLabel = aggressiveSide === "dual" ? "Dual" : aggressiveSide;
-          sideLabel = `Aggressive ${aggLabel}`;
+          const aggLabel = aggressiveSide === "dual" ? T("dash_dual") : sideLabelFromKey(aggressiveSide, aggressiveSide);
+          sideLabel = `${T("dash_aggressive")} ${aggLabel}`;
         } else if (side === "dual") {
-          sideLabel = "Dual";
+          sideLabel = T("dash_dual");
         } else {
-          sideLabel = side;
+          sideLabel = sideLabelFromKey(side, side);
         }
         chip.type = "button";
         chip.className = `signal-chip ${side}${isAggressive ? " aggressive" : ""}`;
@@ -1882,10 +2107,10 @@
         const keyB = entryKey(b) || "";
         return String(keyA).localeCompare(String(keyB));
       });
-      document.getElementById("statusPill").textContent = `${entries.length} models`;
+      document.getElementById("statusPill").textContent = formatT("dash_models_count", { count: entries.length });
       const subline = document.getElementById("subline");
       if (subline) {
-        subline.textContent = `Active models: ${entries.length} | Updated: ${new Date().toLocaleTimeString()}`;
+        subline.textContent = `${formatT("dash_active_models", { count: entries.length })} | ${formatT("dash_updated_at", { time: new Date().toLocaleTimeString() })}`;
       }
       renderSignalStrip(entries);
       if (!state.selected || !state.latestMap[state.selected]) {
@@ -1933,16 +2158,26 @@
           labelWrap.appendChild(dot);
           const tag = document.createElement("span");
           tag.className = "signal-tag " + (signalState.side || "");
-          tag.textContent = signalState.side === "dual" ? "DUAL" : signalState.side.toUpperCase();
+          tag.textContent = signalState.side === "dual" ? T("dash_dual") : sideLabelFromKey(signalState.side, signalState.side);
           labelWrap.appendChild(tag);
         }
         const badge = document.createElement("span");
-        if (item.signal_only) {
+        const warmup = item.warmup || {};
+        const warmupTargetRaw = Number(warmup.target || 0);
+        const warmupCountRaw = Number(warmup.count || 0);
+        const warmupTarget = Number.isFinite(warmupTargetRaw) ? Math.max(0, Math.round(warmupTargetRaw)) : 0;
+        const warmupCount = Number.isFinite(warmupCountRaw) ? Math.max(0, Math.round(warmupCountRaw)) : 0;
+        const warmingUp = !item.signal_only && !item.dry_run && warmupTarget > 0 && warmupCount < warmupTarget;
+        if (warmingUp) {
+          const shown = Math.min(warmupCount, warmupTarget);
+          badge.className = "badge warn";
+          badge.textContent = `${T("dash_warming_up")} ${shown}/${warmupTarget}`;
+        } else if (item.signal_only) {
           badge.className = "badge ok";
-          badge.textContent = "SIGNAL";
+          badge.textContent = T("dash_badge_signal");
         } else {
           badge.className = "badge " + (item.trade_enabled ? "ok" : "warn");
-          badge.textContent = item.trade_enabled ? "ON" : "OFF";
+          badge.textContent = item.trade_enabled ? T("dash_badge_on") : T("dash_badge_off");
         }
         title.appendChild(labelWrap);
         title.appendChild(badge);
@@ -1953,26 +2188,26 @@
         equity.textContent = item.equity ? fmt(item.equity, 4) : "--";
         card.appendChild(equity);
 
-        let signalText = "None";
+        let signalText = T("dash_none");
         if (signalState.active) {
           if (signalState.side === "long") {
-            signalText = `LONG ${fmt(signalState.predLong, 3)}`;
+            signalText = `${T("dash_long")} ${fmt(signalState.predLong, 3)}`;
           } else if (signalState.side === "short") {
-            signalText = `SHORT ${fmt(signalState.predShort, 3)}`;
+            signalText = `${T("dash_short")} ${fmt(signalState.predShort, 3)}`;
           } else {
             const peak = Math.max(signalState.predLong, signalState.predShort);
-            signalText = `DUAL ${fmt(peak, 3)}`;
+            signalText = `${T("dash_dual")} ${fmt(peak, 3)}`;
           }
         }
         const rows = [
-          ["Model", modelLabel(item)],
-          ["Daily PnL", fmt(item.daily_pnl, 4)],
-          ["Position", formatPosition(item.position)],
-          ["Health", item.health?.status || "--"],
-          ["Signal", signalText],
-          ["OB Density", fmtPct(item.data_health?.ob_density_pct)],
-          ["Lag Trade", fmtSec(item.latency?.lag_trade_sec)],
-          ["Last Update", item.ts || "--"],
+          [T("dash_model"), modelLabel(item)],
+          [T("dash_daily_pnl"), fmt(item.daily_pnl, 4)],
+          [T("dash_position"), formatPosition(item.position)],
+          [T("dash_health"), item.health?.status || "--"],
+          [T("dash_signal"), signalText],
+          [T("dash_ob_density"), fmtPct(item.data_health?.ob_density_pct)],
+          [T("dash_lag_trade"), fmtSec(item.latency?.lag_trade_sec)],
+          [T("dash_last_update"), item.ts || "--"],
         ];
         rows.forEach(([k, v]) => {
           const row = document.createElement("div");
@@ -2018,34 +2253,18 @@
       state.view = view;
       const accountSection = document.getElementById("accountSection");
       const tradersSection = document.getElementById("tradersSection");
-      const chartSection = document.getElementById("chartSection");
       const tabAccount = document.getElementById("tabAccount");
       const tabTraders = document.getElementById("tabTraders");
-      const tabChart = document.getElementById("tabChart");
       if (view === "account") {
         accountSection.classList.add("active");
         tradersSection.classList.remove("active");
-        chartSection.classList.remove("active");
         tabAccount.classList.add("active");
         tabTraders.classList.remove("active");
-        tabChart.classList.remove("active");
-      } else if (view === "chart") {
-        chartSection.classList.add("active");
-        accountSection.classList.remove("active");
-        tradersSection.classList.remove("active");
-        tabChart.classList.add("active");
-        tabAccount.classList.remove("active");
-        tabTraders.classList.remove("active");
-        if (typeof window.refreshIcebergChart === "function") {
-          window.refreshIcebergChart();
-        }
       } else {
         tradersSection.classList.add("active");
         accountSection.classList.remove("active");
-        chartSection.classList.remove("active");
         tabTraders.classList.add("active");
         tabAccount.classList.remove("active");
-        tabChart.classList.remove("active");
         if (state.selected) {
           fetchHistory(state.selected);
           refreshSignals(state.selected, state.selectedLabel || state.selectedSymbol);
@@ -2055,7 +2274,8 @@
 
     function formatPosition(pos) {
       if (!pos) return "--";
-      const side = pos.side || "Flat";
+      const sideKey = signalSideKey(pos.side);
+      const side = sideKey ? sideLabelFromKey(sideKey, "--") : T("dash_flat");
       const size = pos.size ? Number(pos.size).toFixed(4) : "0.0000";
       return `${side} ${size}`;
     }
@@ -2104,16 +2324,16 @@
       }
       const tagText = tagParts.length ? ` (${tagParts.join(" / ")})` : "";
       const modelText = modelLabel(data);
-      const modelTag = modelText && modelText !== "--" ? ` | Model: ${modelText}` : "";
-      document.getElementById("detailTitle").textContent = `Selected: ${displayName}${tagText}`;
-      document.getElementById("detailSub").textContent = `Startup: ${data.startup_time || "--"} | Uptime: ${Math.round(data.uptime_sec || 0)}s | Last: ${data.ts || "--"}${modelTag}`;
+      const modelTag = modelText && modelText !== "--" ? ` | ${T("dash_model")}: ${modelText}` : "";
+      document.getElementById("detailTitle").textContent = `${T("dash_selected")}: ${displayName}${tagText}`;
+      document.getElementById("detailSub").textContent = `${T("dash_startup")}: ${data.startup_time || "--"} | ${T("dash_uptime")}: ${Math.round(data.uptime_sec || 0)}s | ${T("dash_last")}: ${data.ts || "--"}${modelTag}`;
       syncAliasControls(key, symbol);
       const detailStatus = document.getElementById("detailStatus");
       if (data.signal_only) {
-        detailStatus.textContent = "Signal Only";
+        detailStatus.textContent = T("dash_signal_only");
         detailStatus.className = "pill signal";
       } else {
-        detailStatus.textContent = data.trade_enabled ? "Trading Enabled" : "Trading Paused";
+        detailStatus.textContent = data.trade_enabled ? T("dash_trading_enabled") : T("dash_trading_paused");
         detailStatus.className = "pill " + (data.trade_enabled ? "ok" : "warn");
       }
 
@@ -2132,8 +2352,8 @@
       healthEl.className = "value " + healthClass(health.status);
       document.getElementById("sentimentVal").textContent = health.sentiment || "--";
       document.getElementById("regimeVal").textContent = health.regime || "--";
-      document.getElementById("tradeEnabled").textContent = data.signal_only ? "Signal Only" : (data.trade_enabled ? "Yes" : "No");
-      const driftText = drift.alerts && drift.alerts.length ? drift.alerts.join(", ") : "None";
+      document.getElementById("tradeEnabled").textContent = data.signal_only ? T("dash_signal_only") : (data.trade_enabled ? T("dash_yes") : T("dash_no"));
+      const driftText = drift.alerts && drift.alerts.length ? drift.alerts.join(", ") : T("dash_none");
       document.getElementById("driftAlerts").textContent = driftText;
 
       document.getElementById("barsVal").textContent = dataHealth.bars || 0;
@@ -2195,7 +2415,7 @@
       const signalStatusEl = document.getElementById("signalStatus");
       if (activeSignal) {
         const sideKey = signalSideKey(activeSignal.side);
-        signalStatusEl.textContent = sideKey === "short" ? "Signal Short" : "Signal Long";
+        signalStatusEl.textContent = sideKey === "short" ? T("dash_signal_short") : T("dash_signal_long");
         signalStatusEl.className = "value " + (sideKey === "short" ? "bad" : "ok");
         document.getElementById("signalSide").textContent = signalSideLabel(activeSignal.side);
         document.getElementById("signalEntry").textContent = formatSignalPrice(activeSignal.entry_price || activeSignal.target, activeSignal.tick_size);
@@ -2203,7 +2423,7 @@
         document.getElementById("signalSL").textContent = formatSignalPrice(activeSignal.sl, activeSignal.tick_size);
         document.getElementById("signalTime").textContent = formatSignalTime(activeSignal);
       } else {
-        signalStatusEl.textContent = "No Signal";
+        signalStatusEl.textContent = T("dash_no_signal");
         signalStatusEl.className = "value muted";
         document.getElementById("signalSide").textContent = "--";
         document.getElementById("signalEntry").textContent = "--";
@@ -2293,7 +2513,7 @@
       script.onerror = () => {
         state.signalChartLoading = false;
         const sub = document.getElementById("signalSub");
-        if (sub) sub.textContent = "Signal chart library failed to load.";
+        if (sub) sub.textContent = T("dash_chart_failed");
       };
       document.head.appendChild(script);
     }
@@ -2335,6 +2555,7 @@
 
       const candles = state.signalCandles || [];
       const signals = state.signalHistory || [];
+      const latestItem = state.latestMap ? state.latestMap[state.selected] : null;
       const sub = document.getElementById("signalSub");
       if (!candles.length) {
         if (sub) sub.textContent = "Waiting for candle data...";
@@ -2358,6 +2579,7 @@
       const showDirection = isSignalIndicatorEnabled("direction");
       const showAggressive = showDirection && isSignalIndicatorEnabled("aggressive");
       const showLevels = isSignalIndicatorEnabled("levels");
+      const showOrders = isSignalIndicatorEnabled("orders");
       const longPoints = [];
       const shortPoints = [];
       const directionPoints = [];
@@ -2435,7 +2657,6 @@
           }, tsMs);
         });
       } else {
-        const latestItem = state.latestMap ? state.latestMap[state.selected] : null;
         const direction = latestItem && latestItem.direction ? latestItem.direction : {};
         const barTime = normalizeBarTime(direction.bar_time);
         recordDirection(barTime, {
@@ -2485,13 +2706,86 @@
       const markLineData = [];
       if (focusSignal && showLevels) {
         if (focusSignal.entry_price > 0) {
-          markLineData.push({ yAxis: focusSignal.entry_price, name: "Entry" });
+          markLineData.push({ yAxis: focusSignal.entry_price, name: T("dash_entry") });
         }
         if (focusSignal.tp > 0) {
-          markLineData.push({ yAxis: focusSignal.tp, name: "TP" });
+          markLineData.push({ yAxis: focusSignal.tp, name: T("dash_tp") });
         }
         if (focusSignal.sl > 0) {
-          markLineData.push({ yAxis: focusSignal.sl, name: "SL" });
+          markLineData.push({ yAxis: focusSignal.sl, name: T("dash_sl") });
+        }
+      }
+      if (showOrders && latestItem) {
+        const protective = (latestItem.dashboard && latestItem.dashboard.protective_orders) || [];
+        const seenLevels = new Set();
+        const addLine = (price, label, color) => {
+          if (!Number.isFinite(price) || price <= 0) return;
+          const key = `${label}:${price.toFixed(6)}`;
+          if (seenLevels.has(key)) return;
+          seenLevels.add(key);
+          markLineData.push({
+            yAxis: price,
+            name: label,
+            lineStyle: { color, type: "dashed", width: 1, opacity: 0.9 },
+            label: { formatter: label, color, position: "end" }
+          });
+        };
+        const labelSide = (order) => {
+          const idx = Number(order.position_idx || 0);
+          if (idx === 1) return "Long";
+          if (idx === 2) return "Short";
+          const side = String(order.side || "").toLowerCase();
+          if (side === "sell") return "Long";
+          if (side === "buy") return "Short";
+          return "";
+        };
+        const classifyKind = (order) => {
+          const orderType = String(order.order_type || "").toLowerCase();
+          const stopType = String(order.stop_order_type || "").toLowerCase();
+          const orderFilter = String(order.order_filter || "").toLowerCase();
+          const createType = String(order.create_type || "").toLowerCase();
+          const text = `${orderType} ${stopType} ${orderFilter} ${createType}`;
+          if (text.includes("takeprofit")) return "tp";
+          if (text.includes("stoploss")) return "sl";
+          if (text.includes("stop")) return "sl";
+          if (order.reduce_only) return "tp";
+          return "tp";
+        };
+        protective.forEach(order => {
+          const kind = classifyKind(order);
+          const sideLabel = labelSide(order);
+          const label = `${kind.toUpperCase()} ${sideLabel || ""}`.trim();
+          const price = Number(order.trigger_price || order.price || 0);
+          const color = kind === "sl" ? "#ef4444" : "#22c55e";
+          addLine(price, label, color);
+        });
+        const pos = latestItem.position || {};
+        const positions = latestItem.positions || {};
+        const addStop = (price, sideLabel) => {
+          const base = T("dash_sl");
+          const label = sideLabel ? `${base} ${sideLabel}` : base;
+          addLine(price, label, "#ef4444");
+        };
+        const addTp = (price, sideLabel) => {
+          const base = T("dash_tp");
+          const label = sideLabel ? `${base} ${sideLabel}` : base;
+          addLine(price, label, "#22c55e");
+        };
+        const stopLong = Number(positions.long?.stop_loss || 0);
+        const stopShort = Number(positions.short?.stop_loss || 0);
+        if (stopLong > 0) addStop(stopLong, T("dash_long"));
+        if (stopShort > 0) addStop(stopShort, T("dash_short"));
+        const tpLong = Number(positions.long?.take_profit || 0);
+        const tpShort = Number(positions.short?.take_profit || 0);
+        if (tpLong > 0) addTp(tpLong, T("dash_long"));
+        if (tpShort > 0) addTp(tpShort, T("dash_short"));
+        const stopSingle = Number(pos.stop_loss || 0);
+        if (stopSingle > 0 && !stopLong && !stopShort) {
+          addStop(stopSingle, "");
+        }
+        const tpSingle = Number(pos.take_profit || 0);
+        if (tpSingle > 0 && !tpLong && !tpShort) {
+          addTp(tpSingle, "");
         }
       }
       const zoom = state.signalZoomActive ? state.signalZoom : null;
@@ -2520,15 +2814,15 @@
               if (item.data && item.data.signal) {
                 const sig = item.data.signal;
                 signalInfo = [
-                  `Signal: ${signalSideLabel(sig.side)} (${fmt(sig.pred, 3)})`,
-                  `Entry: ${formatSignalPrice(sig.entry_price, sig.tick_size)}`,
-                  `TP: ${formatSignalPrice(sig.tp, sig.tick_size)} | SL: ${formatSignalPrice(sig.sl, sig.tick_size)}`,
-                  `Time: ${formatSignalTime(sig)}`
+                  `${T("dash_signal")}: ${signalSideLabel(sig.side)} (${fmt(sig.pred, 3)})`,
+                  `${T("dash_entry")}: ${formatSignalPrice(sig.entry_price, sig.tick_size)}`,
+                  `${T("dash_tp")}: ${formatSignalPrice(sig.tp, sig.tick_size)} | ${T("dash_sl")}: ${formatSignalPrice(sig.sl, sig.tick_size)}`,
+                  `${T("dash_time")}: ${formatSignalTime(sig)}`
                 ].join("<br/>");
               }
               if (item.data && item.data.direction) {
                 const dir = item.data.direction;
-                const tag = dir.aggressive ? "AGG" : "DIR";
+                const tag = dir.aggressive ? T("dash_aggressive_short") : T("dash_direction_short");
                 directionInfo = `${tag} ${signalSideLabel(dir.side)} (${fmt(dir.pred, 3)})`;
               }
             });
@@ -2562,7 +2856,7 @@
         ],
         series: [
           {
-            name: "Price",
+            name: T("dash_price"),
             type: "candlestick",
             data: candleData,
             itemStyle: {
@@ -2582,7 +2876,7 @@
             } : undefined
           },
           {
-            name: "Direction",
+            name: T("dash_direction"),
             type: "scatter",
             data: (showDirection || showAggressive) ? directionPoints : [],
             symbol: "circle",
@@ -2591,7 +2885,7 @@
             label: { show: false }
           },
           {
-            name: "Signal Long",
+            name: T("dash_signal_long"),
             type: "scatter",
             data: showSignals ? longPoints : [],
             symbol: "triangle",
@@ -2606,7 +2900,7 @@
             }
           },
           {
-            name: "Signal Short",
+            name: T("dash_signal_short"),
             type: "scatter",
             data: showSignals ? shortPoints : [],
             symbol: "triangle",
@@ -2626,7 +2920,7 @@
 
       state.signalChart.setOption(option, { notMerge: true, lazyUpdate: true });
       if (sub && state.signalSymbol) {
-        sub.textContent = `${state.signalSymbol} | Signals: ${signals.length} | Showing: ${visibleSignals.length}`;
+        sub.textContent = `${state.signalSymbol} | ${T("dash_signals")}: ${signals.length} | ${T("dash_showing")}: ${visibleSignals.length}`;
       }
     }
 
@@ -2670,18 +2964,18 @@
 
         const top = document.createElement("div");
         top.className = "signal-side " + (sideKey || "long");
-        top.textContent = `${signalSideLabel(sig.side)} signal`;
+        top.textContent = `${signalSideLabel(sig.side)} ${T("dash_signal_label")}`;
 
         const meta = document.createElement("div");
         meta.className = "signal-meta";
-        meta.textContent = `${formatSignalTime(sig)} | Pred ${fmt(sig.pred, 3)}`;
+        meta.textContent = `${formatSignalTime(sig)} | ${T("dash_pred")} ${fmt(sig.pred, 3)}`;
 
         const values = document.createElement("div");
         values.className = "signal-values";
         values.innerHTML = `
-          <div><strong>${formatSignalPrice(sig.entry_price, sig.tick_size)}</strong><span>Entry Price</span></div>
-          <div><strong>${formatSignalPrice(sig.tp, sig.tick_size)}</strong><span>TP Price</span></div>
-          <div><strong>${formatSignalPrice(sig.sl, sig.tick_size)}</strong><span>SL Price</span></div>
+          <div><strong>${formatSignalPrice(sig.entry_price, sig.tick_size)}</strong><span>${T("dash_entry_price")}</span></div>
+          <div><strong>${formatSignalPrice(sig.tp, sig.tick_size)}</strong><span>${T("dash_tp_price")}</span></div>
+          <div><strong>${formatSignalPrice(sig.sl, sig.tick_size)}</strong><span>${T("dash_sl_price")}</span></div>
         `;
 
         item.appendChild(top);
@@ -2826,7 +3120,8 @@
         const sub = document.createElement("span");
         const unified = item.unified_equity ? fmt(item.unified_equity, 4) : "--";
         const funding = item.funding_equity ? fmt(item.funding_equity, 4) : "--";
-        const fundingErr = item.funding_error ? ` | Funding: ${item.funding_error}` : "";
+        const fundingLabel = T("dash_funding");
+        const fundingErr = item.funding_error ? ` | ${fundingLabel}: ${item.funding_error}` : "";
         sub.textContent = `U:${unified} / F:${funding}${fundingErr}`;
         left.appendChild(name);
         left.appendChild(sub);
@@ -2870,17 +3165,20 @@
       document.getElementById("aggFlows").textContent = stats.flow_events ?? "--";
       const fundingStatus = document.getElementById("aggFundingStatus");
       if (fundingStatus) {
-        fundingStatus.textContent = data.funding_error ? data.funding_error : "OK";
+        fundingStatus.textContent = data.funding_error ? data.funding_error : T("dash_ok");
         fundingStatus.className = data.funding_error ? "bad" : "ok";
       }
 
       const accountSub = document.getElementById("accountSub");
       if (accountSub) {
-        accountSub.textContent = `Total (Unified + Funding): ${total ? fmt(total, 4) : "--"} | Updated: ${data.ts || "--"}`;
+        accountSub.textContent = formatT("dash_total_unified_funding", {
+          total: total ? fmt(total, 4) : "--",
+          updated: data.ts || "--"
+        });
       }
       const accountStatus = document.getElementById("accountStatus");
       if (accountStatus) {
-        accountStatus.textContent = data.funding_error ? "Funding Error" : (total > 0 ? "Live" : "No Data");
+        accountStatus.textContent = data.funding_error ? T("dash_funding_error") : (total > 0 ? T("dash_live") : T("dash_no_data"));
       }
 
       document.getElementById("aggReturn").textContent = stats.total_return_pct === null || stats.total_return_pct === undefined
@@ -2910,7 +3208,7 @@
         state.balanceFlowPct = stats.flow_threshold_pct;
         const note = document.getElementById("balanceNote");
         if (note) {
-          note.textContent = `Flow threshold: ${fmt(stats.flow_threshold_pct, 1)}% (large deposits/withdrawals removed).`;
+          note.textContent = formatT("dash_flow_threshold_note", { pct: fmt(stats.flow_threshold_pct, 1) });
         }
       }
       renderProfiles(data.profiles || []);
@@ -3033,7 +3331,6 @@
 
     document.getElementById("tabAccount").addEventListener("click", () => setView("account"));
     document.getElementById("tabTraders").addEventListener("click", () => setView("traders"));
-    document.getElementById("tabChart").addEventListener("click", () => setView("chart"));
     const aliasInput = document.getElementById("aliasInput");
     const aliasSave = document.getElementById("aliasSave");
     const aliasClear = document.getElementById("aliasClear");
@@ -3106,6 +3403,30 @@
         }
       });
       syncSoundToggle();
+    }
+    const donateToggle = document.getElementById("donateToggle");
+    const donateModal = document.getElementById("donateModal");
+    const donateClose = document.getElementById("donateClose");
+    const donateBackdrop = donateModal ? donateModal.querySelector("[data-close]") : null;
+    const openDonate = () => {
+      if (!donateModal) return;
+      donateModal.classList.add("open");
+      donateModal.setAttribute("aria-hidden", "false");
+    };
+    const closeDonate = () => {
+      if (!donateModal) return;
+      donateModal.classList.remove("open");
+      donateModal.setAttribute("aria-hidden", "true");
+    };
+    if (donateToggle && donateModal && !donateToggle.dataset.bound) {
+      donateToggle.addEventListener("click", openDonate);
+      if (donateClose) donateClose.addEventListener("click", closeDonate);
+      if (donateBackdrop) donateBackdrop.addEventListener("click", closeDonate);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeDonate();
+      });
+      donateToggle.dataset.bound = "1";
+      donateModal.dataset.bound = "1";
     }
     const traderModeToggle = document.getElementById("traderModeToggle");
     if (traderModeToggle) {
