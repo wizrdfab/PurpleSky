@@ -162,7 +162,7 @@ Contact & Support
 
 * Bug Reports: If you find a bug, please open an Issue here: ../../issues
 * Feature Requests: Have an idea? Start a discussion in the Issues tab.
-* Business Inquiries: servicios.de.mercado.fzf@gmail.com
+* Business Inquiries: contact@purple-sky.online
 
 Community
 ---------

@@ -160,7 +160,7 @@ Contacto y Soporte
 
 * Reportes de Bugs: Si encuentras un bug, por favor abre un Issue aquí: ../../issues
 * Solicitudes de Funciones: ¿Tienes una idea? Inicia una discusión en la pestaña de Issues.
-* Consultas de Negocio: servicios.de.mercado.fzf@gmail.com
+* Consultas de Negocio: contact@purple-sky.online
 
 Comunidad
 ---------
