@@ -1,0 +1,32 @@
+# Set the default behavior, in case people don't have core.autocrlf set.
+* text=auto
+
+# Explicitly declare text files you want to always be normalized and converted
+# to native line endings on checkout.
+*.py text
+*.js text
+*.html text
+*.css text
+*.md text
+*.txt text
+*.json text
+*.yml text
+*.yaml text
+*.gitignore text
+*.gitattributes text
+
+# Declare files that will always be CRLF in the working directory.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Declare files that will always be LF in the working directory.
+*.sh text eol=lf
+
+# Denote all binary files that should not be converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pkl binary
+*.pdf binary
