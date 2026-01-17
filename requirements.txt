@@ -18,3 +18,5 @@ binance-futures-connector>=3.5.0
 
 # UI
 customtkinter>=5.2.2
+polars>=0.20.0
+pyarrow>=14.0.0
