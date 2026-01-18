@@ -90,6 +90,15 @@ class ModelConfig:
     direction_threshold: float = 0.5 # Dynamic Threshold for Direction Model
     aggressive_threshold: float = 0.8 # Threshold for Market Order Override
 
+    # --- LSTM Hybrid Ensemble ---
+    use_lstm_ensemble: bool = True
+    lstm_hidden_size: int = 64
+    lstm_layers: int = 2
+    sequence_length: int = 60
+    lstm_dropout: float = 0.1
+    lstm_epochs: int = 10
+    lstm_batch_size: int = 64
+
 @dataclass
 class GlobalConfig:
     data: DataConfig = field(default_factory=DataConfig)

@@ -351,16 +351,15 @@ class AutoML:
         save_path = CONF.model.model_dir / f"rank_{rank}"
         save_path.mkdir(parents=True, exist_ok=True)
         
-        # Save ModelManager (Models A & B)
+        # Save ModelManager (Models A & B + LSTM & Gate)
         # Note: res['model_manager'] is the object
         mm = res['model_manager']
-        joblib.dump(mm.model_long, save_path / "model_long.pkl")
-        joblib.dump(mm.model_short, save_path / "model_short.pkl")
-        if mm.dir_model_long:
-            joblib.dump(mm.dir_model_long, save_path / "dir_model_long.pkl")
-            joblib.dump(mm.dir_model_short, save_path / "dir_model_short.pkl")
+        
+        # Point ModelManager to the correct rank folder
+        mm.config.model_dir = save_path
+        mm.save_models()
             
-        joblib.dump(res['features'], save_path / "features.pkl")
+        # Params saving remains the same
         params = dict(res.get('params', {}))
         params.setdefault("symbol", self.args.symbol)
         params.setdefault("timeframe", self.args.timeframe)
