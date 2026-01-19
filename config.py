@@ -92,12 +92,15 @@ class ModelConfig:
 
     # --- LSTM Hybrid Ensemble ---
     use_lstm_ensemble: bool = True
-    lstm_hidden_size: int = 64
-    lstm_layers: int = 2
+    lstm_hidden_size: int = 32
+    lstm_layers: int = 1
     sequence_length: int = 60
-    lstm_dropout: float = 0.1
-    lstm_epochs: int = 10
+    lstm_dropout: float = 0.8
+    lstm_epochs: int = 50
     lstm_batch_size: int = 64
+    lstm_weight_decay: float = 1e-5
+    lstm_patience: int = 10
+    lstm_learning_rate: float = 0.0001
 
 @dataclass
 class GlobalConfig:

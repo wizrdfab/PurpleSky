@@ -31,8 +31,12 @@ from config import ModelConfig
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, dropout):
         super(LSTMModel, self).__init__()
+        # nn.LSTM dropout only applies between layers (requires num_layers > 1)
+        # We'll use 0 for the internal LSTM dropout if num_layers == 1 to avoid the warning
+        internal_dropout = dropout if num_layers > 1 else 0
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                            batch_first=True, dropout=dropout)
+                            batch_first=True, dropout=internal_dropout)
+        self.dropout_layer = nn.Dropout(dropout)
         self.fc_long = nn.Linear(hidden_size, 1)
         self.fc_short = nn.Linear(hidden_size, 1)
         self.sigmoid = nn.Sigmoid()
@@ -42,6 +46,9 @@ class LSTMModel(nn.Module):
         out, _ = self.lstm(x)
         # Take last time step
         last_out = out[:, -1, :]
+        
+        # Apply explicit dropout
+        last_out = self.dropout_layer(last_out)
         
         pred_long = self.sigmoid(self.fc_long(last_out))
         pred_short = self.sigmoid(self.fc_short(last_out))
@@ -131,17 +138,17 @@ class ModelManager:
         train_end = int(n * self.config.train_ratio)
         val_end = int(n * (self.config.train_ratio + self.config.val_ratio))
         
-        X = df[feature_cols]
+        lgb_feats = [f for f in feature_cols if f != 'close']
+        X_train_lgb = df[lgb_feats].iloc[:train_end]
+        X_val_lgb = df[lgb_feats].iloc[train_end:val_end]
+        
         y_long = df['target_long']
         y_short = df['target_short']
         
         y_dir_long = df.get('target_dir_long', pd.Series(0, index=df.index))
         y_dir_short = df.get('target_dir_short', pd.Series(0, index=df.index))
         
-        X_train = X.iloc[:train_end]
-        X_val = X.iloc[train_end:val_end]
-        
-        print(f"Train: {len(X_train)} | Val: {len(X_val)}")
+        print(f"Train: {len(X_train_lgb)} | Val: {len(X_val_lgb)}")
         
         params = {
             'objective': 'binary',
@@ -164,15 +171,15 @@ class ModelManager:
         if self.config.use_meta_labeling:
             print("Training Direction Models (Model A)...")
             self.dir_model_long = lgb.train(
-                params, lgb.Dataset(X_train, label=y_dir_long.iloc[:train_end]),
+                params, lgb.Dataset(X_train_lgb, label=y_dir_long.iloc[:train_end]),
                 num_boost_round=self.config.n_estimators // 2,
-                valid_sets=[lgb.Dataset(X_val, label=y_dir_long.iloc[train_end:val_end])],
+                valid_sets=[lgb.Dataset(X_val_lgb, label=y_dir_long.iloc[train_end:val_end])],
                 callbacks=[lgb.early_stopping(stopping_rounds=self.config.early_stopping_rounds), lgb.log_evaluation(0)]
             )
             self.dir_model_short = lgb.train(
-                params, lgb.Dataset(X_train, label=y_dir_short.iloc[:train_end]),
+                params, lgb.Dataset(X_train_lgb, label=y_dir_short.iloc[:train_end]),
                 num_boost_round=self.config.n_estimators // 2,
-                valid_sets=[lgb.Dataset(X_val, label=y_dir_short.iloc[train_end:val_end])],
+                valid_sets=[lgb.Dataset(X_val_lgb, label=y_dir_short.iloc[train_end:val_end])],
                 callbacks=[lgb.early_stopping(stopping_rounds=self.config.early_stopping_rounds), lgb.log_evaluation(0)]
             )
         
@@ -180,17 +187,17 @@ class ModelManager:
         print("Training LightGBM Execution Models (Model B)...")
         self.model_long = lgb.train(
             params,
-            lgb.Dataset(X_train, label=y_long.iloc[:train_end]),
+            lgb.Dataset(X_train_lgb, label=y_long.iloc[:train_end]),
             num_boost_round=self.config.n_estimators,
-            valid_sets=[lgb.Dataset(X_val, label=y_long.iloc[train_end:val_end])],
+            valid_sets=[lgb.Dataset(X_val_lgb, label=y_long.iloc[train_end:val_end])],
             callbacks=[lgb.early_stopping(stopping_rounds=self.config.early_stopping_rounds), lgb.log_evaluation(0)]
         )
         
         self.model_short = lgb.train(
             params,
-            lgb.Dataset(X_train, label=y_short.iloc[:train_end]),
+            lgb.Dataset(X_train_lgb, label=y_short.iloc[:train_end]),
             num_boost_round=self.config.n_estimators,
-            valid_sets=[lgb.Dataset(X_val, label=y_short.iloc[train_end:val_end])],
+            valid_sets=[lgb.Dataset(X_val_lgb, label=y_short.iloc[train_end:val_end])],
             callbacks=[lgb.early_stopping(stopping_rounds=self.config.early_stopping_rounds), lgb.log_evaluation(0)]
         )
 
@@ -199,22 +206,26 @@ class ModelManager:
             print("Training LSTM & Gating Network (Hybrid Ensemble)...")
             
             # Prepare Data for LSTM
-            # We train on the same Train Split
-            X_full_scaled = self.prepare_sequences(df, fit_scaler=True) # Fit on full, but we slice indices
+            # Fit scaler ONLY on training data to avoid leakage
+            train_df = df.iloc[:train_end]
+            val_df = df.iloc[train_end:val_end]
             
-            # Slice Scaled Data
-            # Note: SequenceDataset handles the lookback, so we need to be careful with indices.
-            # We use the train_end index, but the dataset will need data prior to idx 0? 
-            # No, standard is idx 0 -> sequence 0..seq_len.
+            train_np = self.prepare_sequences(train_df, fit_scaler=True)
+            val_np = self.prepare_sequences(val_df, fit_scaler=False)
             
-            train_np = X_full_scaled[:train_end]
             y_long_np = y_long.values[:train_end]
             y_short_np = y_short.values[:train_end]
             
-            # Create Dataset
-            dataset = SequenceDataset(train_np, y_long_np, y_short_np, self.config.sequence_length)
-            loader = DataLoader(dataset, batch_size=self.config.lstm_batch_size, shuffle=True)
+            y_long_val = y_long.values[train_end:val_end]
+            y_short_val = y_short.values[train_end:val_end]
+
+            # Create Datasets
+            train_dataset = SequenceDataset(train_np, y_long_np, y_short_np, self.config.sequence_length)
+            train_loader = DataLoader(train_dataset, batch_size=self.config.lstm_batch_size, shuffle=True)
             
+            val_dataset = SequenceDataset(val_np, y_long_val, y_short_val, self.config.sequence_length)
+            val_loader = DataLoader(val_dataset, batch_size=self.config.lstm_batch_size, shuffle=False)
+
             # Init Models
             self.lstm_model = LSTMModel(
                 input_size=len(feature_cols),
@@ -228,60 +239,41 @@ class ModelManager:
             ).to(self.device)
             
             # Optimizers
-            optimizer = optim.Adam(list(self.lstm_model.parameters()) + list(self.gating_model.parameters()), lr=0.001)
+            optimizer = optim.Adam(
+                list(self.lstm_model.parameters()) + list(self.gating_model.parameters()), 
+                lr=self.config.lstm_learning_rate,
+                weight_decay=self.config.lstm_weight_decay
+            )
             criterion = nn.BCELoss()
             
             # Generate LightGBM predictions for the training set (needed for Gating training)
             # We use raw scores? No, probabilities.
             print("  > Generating LightGBM priors for Gating training...")
-            lgb_pred_long = self.model_long.predict(X_train)
-            lgb_pred_short = self.model_short.predict(X_train)
-            
-            # We need to align LGB predictions with LSTM sequences
-            # LSTM at index i corresponds to target at i + seq_len - 1
-            # So we need LGB pred at i + seq_len - 1
-            lgb_long_tensor = torch.tensor(lgb_pred_long, dtype=torch.float32).to(self.device)
-            lgb_short_tensor = torch.tensor(lgb_pred_short, dtype=torch.float32).to(self.device)
+            lgb_pred_long = self.model_long.predict(X_train_lgb)
+            lgb_pred_short = self.model_short.predict(X_train_lgb)
             
             # Map context columns indices
             ctx_indices = [feature_cols.index(c) for c in self.context_cols]
             
-            self.lstm_model.train()
-            self.gating_model.train()
-            
+            # Early Stopping Variables
+            best_val_loss = float('inf')
+            patience_counter = 0
+            best_model_state = None
+
             for epoch in range(self.config.lstm_epochs):
+                self.lstm_model.train()
                 epoch_loss = 0
                 count = 0
                 
-                for x_seq, y_l, y_s in loader:
+                for x_seq, y_l, y_s in train_loader:
                     x_seq, y_l, y_s = x_seq.to(self.device), y_l.to(self.device), y_s.to(self.device)
                     
+                    # Optional: Add small noise to inputs for regularization
+                    if self.lstm_model.training:
+                        x_seq = x_seq + torch.randn_like(x_seq) * 0.05
+
                     # 1. LSTM Forward
                     lstm_l, lstm_s = self.lstm_model(x_seq)
-                    
-                    # 2. Gating Forward
-                    # Context is the LAST time step of the sequence, restricted to context cols
-                    # x_seq: (batch, seq, features) -> last step: (batch, features)
-                    last_step_feats = x_seq[:, -1, :]
-                    context_input = last_step_feats[:, ctx_indices]
-                    gate_weight = self.gating_model(context_input) # (batch, 1) -> Alpha
-                    
-                    # 3. Combine
-                    # We need the corresponding LGB preds.
-                    # This is tricky in shuffled DataLoader. 
-                    # Solution: Pre-calculate LGB preds is hard if shuffled.
-                    # Alternative: We effectively need to pass the "LGB Prediction" as a feature or look it up.
-                    # Simplification: We will run the Gating Training in a simpler way or accept that we need to lookup indices.
-                    # 
-                    # FIX: Let's train LSTM independently first. Then train Gate?
-                    # Or simpler: Just average them for now (0.5/0.5) to ensure stability, 
-                    # OR: Just run LSTM and let the gate be fixed 0.5 initially if this is complex.
-                    #
-                    # Better Fix for "Training Script":
-                    # We are in a custom training loop. We can't easily sync shuffled indices with external LGB array.
-                    # We will train LSTM purely on Target first (Standard LSTM).
-                    # Then we use the Gate to ensemble at inference time, or train Gate separately.
-                    # For this implementation, let's train LSTM on Targets directly.
                     
                     # Loss for LSTM (Pure LSTM Training)
                     loss_l = criterion(lstm_l.squeeze(), y_l)
@@ -294,44 +286,64 @@ class ModelManager:
                     
                     epoch_loss += loss.item()
                     count += 1
-                    
-                print(f"  > Epoch {epoch+1}/{self.config.lstm_epochs} | Loss: {epoch_loss/count:.4f}")
+                
+                # Validation Phase
+                self.lstm_model.eval()
+                val_loss = 0
+                val_count = 0
+                with torch.no_grad():
+                    for x_v, y_vl, y_vs in val_loader:
+                        x_v, y_vl, y_vs = x_v.to(self.device), y_vl.to(self.device), y_vs.to(self.device)
+                        pl, ps = self.lstm_model(x_v)
+                        v_loss = criterion(pl.squeeze(), y_vl) + criterion(ps.squeeze(), y_vs)
+                        val_loss += v_loss.item()
+                        val_count += 1
+                
+                avg_val_loss = val_loss / val_count if val_count > 0 else float('inf')
+                print(f"  > Epoch {epoch+1}/{self.config.lstm_epochs} | Train Loss: {epoch_loss/count:.4f} | Val Loss: {avg_val_loss:.4f}")
 
-            # Note: We are currently NOT training the Gating Network parameters effectively here 
-            # because we detached the "MoE" logic from the training loop to avoid indexing complexity.
-            # In a robust implementation, we would include LGB prediction in the Dataset.
-            # For now, we will leave the Gating Network initialized (random/trained) but
-            # primarily rely on the LSTM being trained. 
-            # To make the Gate useful, let's do a quick post-training of the Gate using the Validation Set.
+                # Early Stopping Logic
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                    best_model_state = self.lstm_model.state_dict()
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.config.lstm_patience:
+                        print(f"  > Early stopping triggered at epoch {epoch+1}")
+                        break
             
-            self.train_gate_on_validation(X_val, y_long.iloc[train_end:val_end], y_short.iloc[train_end:val_end], feature_cols)
+            # Restore best model
+            if best_model_state:
+                self.lstm_model.load_state_dict(best_model_state)
+
+            self.train_gate_on_validation(df.iloc[train_end:val_end], feature_cols)
 
 
-    def train_gate_on_validation(self, X_val, y_val_l, y_val_s, feature_cols):
+    def train_gate_on_validation(self, df_val, feature_cols):
         print("Optimizing Gating Network on Validation Set...")
+        lgb_feats = [f for f in feature_cols if f != 'close']
+        
         # Get LGB Preds
-        p_lgb_l = self.model_long.predict(X_val)
-        p_lgb_s = self.model_short.predict(X_val)
+        p_lgb_l = self.model_long.predict(df_val[lgb_feats])
+        p_lgb_s = self.model_short.predict(df_val[lgb_feats])
+        
+        # Get Targets
+        y_val_l = df_val['target_long']
+        y_val_s = df_val['target_short']
         
         # Get LSTM Preds
-        X_scaled = self.prepare_sequences(pd.DataFrame(X_val, columns=feature_cols), fit_scaler=False)
-        # We need sequences. This is tricky for validation slice if we don't have lookback.
-        # We assume X_val is large enough.
-        # Ideally we need X_val extended by lookback.
-        # We'll skip complex data splicing for this MVP and just truncate start.
+        X_scaled = self.prepare_sequences(df_val, fit_scaler=False)
         
         seq_len = self.config.sequence_length
-        if len(X_val) <= seq_len: return
+        if len(df_val) <= seq_len: return
         
         dataset = SequenceDataset(X_scaled, y_val_l.values, y_val_s.values, seq_len)
         loader = DataLoader(dataset, batch_size=256, shuffle=False)
         
         # We need LGB preds aligned.
-        # Dataset produces y at idx+seq_len-1.
-        # So we need LGB preds at [seq_len-1:]
         p_lgb_l = p_lgb_l[seq_len:]
         p_lgb_s = p_lgb_s[seq_len:]
-        # Truncate to match loader length
         
         optimizer = optim.Adam(self.gating_model.parameters(), lr=0.01)
         criterion = nn.BCELoss()
@@ -377,11 +389,11 @@ class ModelManager:
 
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
         if not self.model_long: raise Exception("Not trained")
-        X = df[self.feature_cols]
+        lgb_feats = [f for f in self.feature_cols if f != 'close']
         
         # 1. LightGBM Preds
-        lgb_long = self.model_long.predict(X)
-        lgb_short = self.model_short.predict(X)
+        lgb_long = self.model_long.predict(df[lgb_feats])
+        lgb_short = self.model_short.predict(df[lgb_feats])
         
         if self.config.use_lstm_ensemble and self.lstm_model:
             # 2. LSTM Preds
@@ -461,8 +473,8 @@ class ModelManager:
         
         # Direction Preds
         if self.dir_model_long:
-            df['pred_dir_long'] = self.dir_model_long.predict(X)
-            df['pred_dir_short'] = self.dir_model_short.predict(X)
+            df['pred_dir_long'] = self.dir_model_long.predict(df[lgb_feats])
+            df['pred_dir_short'] = self.dir_model_short.predict(df[lgb_feats])
         else:
             df['pred_dir_long'] = 1.0 
             df['pred_dir_short'] = 1.0

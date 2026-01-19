@@ -231,7 +231,7 @@ class AutoML:
         pass
 
     def get_feature_list(self, df):
-        excludes = ['open', 'high', 'low', 'close', 'volume', 'vwap', 'datetime', 'target_long', 'target_short', 'pred_long', 'pred_short',
+        excludes = ['open', 'high', 'low', 'volume', 'vwap', 'datetime', 'target_long', 'target_short', 'pred_long', 'pred_short',
                     'vol_delta', 'buy_vol', 'vol_sell', 'trade_count', 'sell_vol', 'dollar_val', 'total_val',
                     'ob_imbalance_last', 'ob_spread_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean',
                     'ob_micro_dev_std', 'ob_micro_dev_last', 'ob_micro_dev_mean', 'ob_imbalance_mean',
