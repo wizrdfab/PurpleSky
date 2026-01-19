@@ -160,6 +160,8 @@ class AutoML:
         conf.model.max_depth = p['max_depth']
         conf.model.num_leaves = p['num_leaves']
         conf.model.model_threshold = p['model_threshold']
+        conf.model.direction_threshold = p.get('direction_threshold', conf.model.direction_threshold)
+        conf.model.aggressive_threshold = p.get('aggressive_threshold', conf.model.aggressive_threshold)
         conf.model.min_child_samples = 40
         
         # Regenerate Labels with OPTIMIZED Strategy Params
@@ -250,15 +252,15 @@ class AutoML:
         return all_features
 
     def objective(self, trial):
-        offset, tp, sl = trial.suggest_float('limit_offset_atr', 0.5, 1.5), trial.suggest_float('take_profit_atr', 0.5, 2.5), trial.suggest_float('stop_loss_atr', 1.0, 4.0)
+        offset, tp, sl = trial.suggest_float('limit_offset_atr', 0.5, 2.0), trial.suggest_float('take_profit_atr', 1.0, 3.0), trial.suggest_float('stop_loss_atr', 1.0, 2.5)
         
         # Constrained Search Space to prevent Overfitting (SNIPER MODE)
         lr = trial.suggest_float('learning_rate', 0.005, 0.05, log=True)
-        depth = trial.suggest_int('max_depth', 2, 4)
-        leaves = trial.suggest_int('num_leaves', 4, 16)
+        depth = trial.suggest_int('max_depth', 3, 6)
+        leaves = trial.suggest_int('num_leaves', 8, 64)
         min_child = 40
         
-        thresh = trial.suggest_float('model_threshold', 0.60, 0.93)
+        thresh = trial.suggest_float('model_threshold', 0.70, 0.95)
         dir_thresh = trial.suggest_float('direction_threshold', 0.35, 0.65)
         agg_thresh = trial.suggest_float('aggressive_threshold', 0.75, 0.98)
         
@@ -309,10 +311,13 @@ class AutoML:
             # Simple Backtest (Direction logic is not applied in optimization loop to keep it fast)
             res = Backtester(conf).run(val_f, threshold=thresh)
             
-            # Revert to standard selective requirement
-            scores.append(res['sortino'] * np.log(res['trades']) if res['trades'] >= 3 else -0.1)
+            # Drawdown-Adjusted Score: Sortino * log(trades) penalized by Max Drawdown
+            # We use (1 + DD*5) as a divisor to heavily punish high drawdowns
+            base_score = res['sortino'] * np.log(res['trades']) if res['trades'] >= 3 else -0.1
+            dd_penalty = 1.0 + (res['max_drawdown'] * 5.0)
+            scores.append(base_score / dd_penalty)
             
-        return np.mean(scores)
+        return np.mean(scores) - 0.5 * np.std(scores)
 
     def verify_candidate(self, params, trial_number, val_score):
         conf = copy.deepcopy(CONF)

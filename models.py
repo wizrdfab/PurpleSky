@@ -163,6 +163,7 @@ class ModelManager:
             'rate_drop': self.config.rate_drop,
             'extra_trees': self.config.extra_trees,
             'skip_drop': 0.5,
+            'is_unbalance': True,
             'n_jobs': -1,
             'verbosity': -1
         }
@@ -270,8 +271,8 @@ class ModelManager:
                     lstm_l, lstm_s = self.lstm_model(x_seq)
                     
                     # Loss for LSTM (Pure LSTM Training)
-                    loss_l = criterion(lstm_l.squeeze(), y_l)
-                    loss_s = criterion(lstm_s.squeeze(), y_s)
+                    loss_l = criterion(lstm_l.view(-1), y_l)
+                    loss_s = criterion(lstm_s.view(-1), y_s)
                     loss = loss_l + loss_s
                     
                     optimizer.zero_grad()
@@ -289,7 +290,7 @@ class ModelManager:
                     for x_v, y_vl, y_vs in val_loader:
                         x_v, y_vl, y_vs = x_v.to(self.device), y_vl.to(self.device), y_vs.to(self.device)
                         pl, ps = self.lstm_model(x_v)
-                        v_loss = criterion(pl.squeeze(), y_vl) + criterion(ps.squeeze(), y_vs)
+                        v_loss = criterion(pl.view(-1), y_vl) + criterion(ps.view(-1), y_vs)
                         val_loss += v_loss.item()
                         val_count += 1
                 
@@ -371,8 +372,8 @@ class ModelManager:
                 alpha = self.gating_model(context)
                 
                 # Ensemble
-                ens_l = alpha.squeeze() * lgb_l + (1 - alpha.squeeze()) * lstm_l.squeeze()
-                ens_s = alpha.squeeze() * lgb_s + (1 - alpha.squeeze()) * lstm_s.squeeze()
+                ens_l = alpha.view(-1) * lgb_l + (1 - alpha.view(-1)) * lstm_l.view(-1)
+                ens_s = alpha.view(-1) * lgb_s + (1 - alpha.view(-1)) * lstm_s.view(-1)
                 
                 loss = criterion(ens_l, y_l_t) + criterion(ens_s, y_s_t)
                 

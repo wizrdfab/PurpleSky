@@ -189,11 +189,18 @@ class FeatureEngine:
         df['vol_macro'] = vol_24h / vol_30d.replace(0, 1)
 
         # 9. Volatility Regimes (Expansion/Compression)
-        # Volatility Z-Score (Shock detection)
-        # Using NATR to be price-invariant
         atr_mean = df['natr'].rolling(24).mean()
         atr_std = df['natr'].rolling(24).std().replace(0, np.nan)
         df['atr_z'] = (df['natr'] - atr_mean) / atr_std
+        
+        # 10. Macro Context (The "Big Picture")
+        # 3-day Trend Distance
+        ema_3d = df['close'].ewm(span=864, min_periods=100).mean()
+        df['macro_dist_3d'] = (df['close'] - ema_3d) / df['atr'].replace(0, 1)
+        
+        # 1-day Trend Distance
+        ema_1d = df['close'].ewm(span=288, min_periods=50).mean()
+        df['macro_dist_1d'] = (df['close'] - ema_1d) / df['atr'].replace(0, 1)
         
         # Volatility Regime (Intraday vs Daily)
         # Ratio > 1.0 = Expanding/High Vol -> Trend Risk

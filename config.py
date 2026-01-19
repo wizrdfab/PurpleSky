@@ -37,10 +37,10 @@ class DataConfig:
 class StrategyConfig:
     base_limit_offset_atr: float = 0.88
     
-    time_limit_bars: int = 36        
-    max_holding_bars: int = 144       
+    time_limit_bars: int = 60        
+    max_holding_bars: int = 180       
     stop_loss_atr: float = 3.9       
-    take_profit_atr: float = 0.8     
+    take_profit_atr: float = 1.2     
     maker_fee: float = 0.0002
     taker_fee: float = 0.0006
     risk_per_trade: float = 0.04    
@@ -96,7 +96,7 @@ class ModelConfig:
     lstm_layers: int = 1
     sequence_length: int = 60
     lstm_dropout: float = 0.8
-    lstm_epochs: int = 50
+    lstm_epochs: int = 100
     lstm_batch_size: int = 64
     lstm_weight_decay: float = 1e-5
     lstm_patience: int = 10

@@ -1,0 +1,14 @@
+{
+    "limit_offset_atr": 0.6782880858831246,
+    "take_profit_atr": 1.8695548651752019,
+    "stop_loss_atr": 2.216584571849469,
+    "learning_rate": 0.04490705446487975,
+    "max_depth": 3,
+    "num_leaves": 11,
+    "model_threshold": 0.6485211826664435,
+    "direction_threshold": 0.3928341117514903,
+    "aggressive_threshold": 0.83016253277254,
+    "symbol": "ZECUSDT",
+    "timeframe": "5m",
+    "ob_levels": 50
+}
