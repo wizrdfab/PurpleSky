@@ -80,7 +80,7 @@ class SequenceDataset(Dataset):
         self.seq_len = seq_len
         
     def __len__(self):
-        return len(self.X) - self.seq_len
+        return len(self.X) - self.seq_len + 1
     
     def __getitem__(self, idx):
         # Input: X[idx : idx+seq_len]
@@ -246,12 +246,6 @@ class ModelManager:
             )
             criterion = nn.BCELoss()
             
-            # Generate LightGBM predictions for the training set (needed for Gating training)
-            # We use raw scores? No, probabilities.
-            print("  > Generating LightGBM priors for Gating training...")
-            lgb_pred_long = self.model_long.predict(X_train_lgb)
-            lgb_pred_short = self.model_short.predict(X_train_lgb)
-            
             # Map context columns indices
             ctx_indices = [feature_cols.index(c) for c in self.context_cols]
             
@@ -336,14 +330,14 @@ class ModelManager:
         X_scaled = self.prepare_sequences(df_val, fit_scaler=False)
         
         seq_len = self.config.sequence_length
-        if len(df_val) <= seq_len: return
+        if len(df_val) < seq_len: return
         
         dataset = SequenceDataset(X_scaled, y_val_l.values, y_val_s.values, seq_len)
         loader = DataLoader(dataset, batch_size=256, shuffle=False)
         
-        # We need LGB preds aligned.
-        p_lgb_l = p_lgb_l[seq_len:]
-        p_lgb_s = p_lgb_s[seq_len:]
+        # Align LGB predictions with Dataset targets (first target is at index seq_len - 1)
+        p_lgb_l = p_lgb_l[seq_len - 1:]
+        p_lgb_s = p_lgb_s[seq_len - 1:]
         
         optimizer = optim.Adam(self.gating_model.parameters(), lr=0.01)
         criterion = nn.BCELoss()
@@ -450,14 +444,14 @@ class ModelManager:
                 valid_s = np.concatenate(preds_s_list).flatten()
                 valid_g = np.concatenate(gates_list).flatten()
                 
-                # Fill the valid range [seq_len:]
-                # (Dataset length is N - seq_len, shifted by seq_len)
-                lstm_long[seq_len:] = valid_l
-                lstm_short[seq_len:] = valid_s
-                gate_vals[seq_len:] = valid_g
+                # Fill the valid range starting from seq_len - 1
+                # (SequenceDataset starts producing targets at index seq_len - 1)
+                lstm_long[seq_len - 1:] = valid_l
+                lstm_short[seq_len - 1:] = valid_s
+                gate_vals[seq_len - 1:] = valid_g
                 
                 # Fallback for start: Use LGB only (Gate = 1.0)
-                gate_vals[:seq_len] = 1.0
+                gate_vals[:seq_len - 1] = 1.0
             
             # 3. Combine
             df['pred_long'] = gate_vals * lgb_long + (1 - gate_vals) * lstm_long
