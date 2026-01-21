@@ -1,0 +1,16 @@
+Endpoint: POST /v5/order/create
+Description: Place order.
+Params:
+- category: linear
+- symbol: e.g. BTCUSDT
+- side: Buy, Sell
+- orderType: Market, Limit
+- qty: string
+- price: string (for Limit)
+- timeInForce: GTC, IOC, FOK
+- reduceOnly: true/false
+- stopLoss: string
+- takeProfit: string
+Response:
+- orderId
+- orderLinkId

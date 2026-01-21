@@ -43,7 +43,7 @@ class StrategyConfig:
     take_profit_atr: float = 1.2     
     maker_fee: float = 0.0002
     taker_fee: float = 0.0006
-    risk_per_trade: float = 0.04    
+    risk_per_trade: float = 0.013    
     max_positions: int = 3
 
 @dataclass

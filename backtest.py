@@ -53,6 +53,8 @@ def run_backtest_kernel(
     history_pnl = np.zeros(10000, dtype=np.float64)
     history_side = np.zeros(10000, dtype=np.int64)
     history_equity = np.zeros(10000, dtype=np.float64)
+    history_entry_idx = np.zeros(10000, dtype=np.int64)
+    history_exit_idx = np.zeros(10000, dtype=np.int64)
     history_count = 0
     
     for i in range(n):
@@ -167,6 +169,8 @@ def run_backtest_kernel(
                         history_pnl[history_count] = pnl
                         history_side[history_count] = int(side)
                         history_equity[history_count] = equity
+                        history_entry_idx[history_count] = entry_idx
+                        history_exit_idx[history_count] = i
                         history_count += 1
                     # Clear Position
                     positions[p_idx, :] = 0
@@ -277,6 +281,8 @@ def run_backtest_kernel(
                         history_pnl[history_count] = pnl
                         history_side[history_count] = int(side)
                         history_equity[history_count] = equity
+                        history_entry_idx[history_count] = entry_idx
+                        history_exit_idx[history_count] = i
                         history_count += 1
                     
                     positions[p_idx, :] = 0
@@ -347,7 +353,7 @@ def run_backtest_kernel(
                 active_sell[1] = i
                 active_sell[2] = 1
 
-    return equity_curve, history_pnl[:history_count], history_side[:history_count], history_equity[:history_count]
+    return equity_curve, history_pnl[:history_count], history_side[:history_count], history_equity[:history_count], history_entry_idx[:history_count], history_exit_idx[:history_count]
 
 
 class Backtester:
@@ -412,7 +418,7 @@ class Backtester:
             tick_counts = np.zeros(n, dtype=np.int64)
 
         # Run Kernel
-        eq_curve, h_pnl, h_side, h_eq = run_backtest_kernel(
+        eq_curve, h_pnl, h_side, h_eq, h_entry, h_exit = run_backtest_kernel(
             highs, lows, opens, closes, atrs,
             p_long, p_short, p_dir_long, p_dir_short,
             ticks_flat, tick_offsets, tick_counts,
@@ -437,11 +443,26 @@ class Backtester:
         
         # Reconstruct History
         self.history = []
+        
+        # Extract Timestamps
+        if 'datetime' in df.columns:
+            times = df['datetime'].values
+        elif isinstance(df.index, pd.DatetimeIndex):
+            times = df.index.values
+        else:
+             # Fallback if no datetime available
+            times = np.arange(len(df))
+
         for j in range(len(h_pnl)):
+            entry_t = times[h_entry[j]] if h_entry[j] < len(times) else None
+            exit_t = times[h_exit[j]] if h_exit[j] < len(times) else None
+            
             self.history.append({
                 'pnl': h_pnl[j],
                 'side': h_side[j],
-                'equity': h_eq[j]
+                'equity': h_eq[j],
+                'entry_time': entry_t,
+                'exit_time': exit_t
             })
             
         return self._stats()

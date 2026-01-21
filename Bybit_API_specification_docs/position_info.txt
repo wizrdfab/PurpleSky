@@ -1,0 +1,13 @@
+Endpoint: GET /v5/position/list
+Description: Real-time position data.
+Params:
+- category: linear
+- symbol: e.g. BTCUSDT
+Response:
+- list:
+  - symbol
+  - side
+  - size
+  - avgPrice
+  - unrealisedPnl
+  - positionIdx (0=OneWay, 1=Buy, 2=Sell)

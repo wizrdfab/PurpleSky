@@ -120,6 +120,19 @@ def main():
     
     res = bt.run(df_pred, threshold=threshold)
     
+    print("\n" + " [ TRADE LOG ] ".center(80, "="))
+    print(f"{'Entry Time':<30} | {'Side':<6} | {'PnL':<10} | {'Exit Time':<30}")
+    print("-" * 85)
+    
+    for t in bt.history:
+        side_str = "LONG" if t['side'] == 1 else "SHORT"
+        # Convert numpy datetime64 to string for cleaner display if needed, but str() usually works
+        entry_str = str(t['entry_time'])
+        exit_str = str(t['exit_time'])
+        pnl_val = t['pnl']
+        
+        print(f"{entry_str:<30} | {side_str:<6} | {pnl_val:>10.2f} | {exit_str:<30}")
+
     print("\n" + " [ MODEL TEST PERFORMANCE - 15% HOLDOUT ] ".center(60, "="))
     metrics = [
         ("Total Return", f"{res['total_return']:.2%}"),
