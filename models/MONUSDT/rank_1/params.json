@@ -1,0 +1,14 @@
+{
+    "limit_offset_atr": 0.8745401188473625,
+    "take_profit_atr": 2.4014286128198323,
+    "stop_loss_atr": 3.1959818254342154,
+    "learning_rate": 0.019843966652221864,
+    "max_depth": 2,
+    "num_leaves": 6,
+    "model_threshold": 0.6191675920155058,
+    "direction_threshold": 0.6098528437324806,
+    "aggressive_threshold": 0.888256452700938,
+    "symbol": "MONUSDT",
+    "timeframe": "5m",
+    "ob_levels": 150
+}

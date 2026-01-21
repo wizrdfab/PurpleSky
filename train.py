@@ -160,6 +160,8 @@ class AutoML:
         conf.model.max_depth = p['max_depth']
         conf.model.num_leaves = p['num_leaves']
         conf.model.model_threshold = p['model_threshold']
+        conf.model.direction_threshold = p.get('direction_threshold', conf.model.direction_threshold)
+        conf.model.aggressive_threshold = p.get('aggressive_threshold', conf.model.aggressive_threshold)
         conf.model.min_child_samples = 40
         
         # Regenerate Labels with OPTIMIZED Strategy Params
@@ -231,11 +233,11 @@ class AutoML:
         pass
 
     def get_feature_list(self, df):
-        excludes = ['open', 'high', 'low', 'close', 'volume', 'vwap', 'datetime', 'target_long', 'target_short', 'pred_long', 'pred_short',
+        excludes = ['open', 'high', 'low', 'volume', 'vwap', 'datetime', 'target_long', 'target_short', 'pred_long', 'pred_short',
                     'vol_delta', 'buy_vol', 'vol_sell', 'trade_count', 'sell_vol', 'dollar_val', 'total_val',
                     'ob_imbalance_last', 'ob_spread_mean', 'ob_bid_depth_mean', 'ob_ask_depth_mean',
                     'ob_micro_dev_std', 'ob_micro_dev_last', 'ob_micro_dev_mean', 'ob_imbalance_mean',
-                    'target_dir_long', 'target_dir_short', 'pred_dir_long', 'pred_dir_short', 'atr']
+                    'target_dir_long', 'target_dir_short', 'pred_dir_long', 'pred_dir_short', 'atr', 'price_path']
         ob_whitelist = ['ob_imbalance_z', 'ob_spread_ratio', 'ob_bid_impulse', 'ob_ask_impulse', 'ob_depth_ratio', 'ob_spread_bps', 'ob_depth_log_ratio', 'price_liq_div', 'liq_dominance', 'micro_dev_vol', 'ob_imb_trend', 'micro_pressure', 'bid_depth_chg', 'ask_depth_chg', 'spread_z', 'ob_slope_ratio', 'bid_slope_z', 'ob_bid_elasticity', 'ob_ask_elasticity', 'ob_bid_integrity_mean', 'ob_ask_integrity_mean', 'ob_integrity_skew', 'bid_integrity_chg', 'ask_integrity_chg']
         
         all_features = [c for c in df.columns if (c not in excludes and not c.startswith('ob_')) or c in ob_whitelist]
@@ -250,15 +252,15 @@ class AutoML:
         return all_features
 
     def objective(self, trial):
-        offset, tp, sl = trial.suggest_float('limit_offset_atr', 0.5, 1.5), trial.suggest_float('take_profit_atr', 0.5, 2.5), trial.suggest_float('stop_loss_atr', 1.0, 4.0)
+        offset, tp, sl = trial.suggest_float('limit_offset_atr', 0.5, 2.0), trial.suggest_float('take_profit_atr', 1.0, 3.0), trial.suggest_float('stop_loss_atr', 1.0, 2.5)
         
         # Constrained Search Space to prevent Overfitting (SNIPER MODE)
         lr = trial.suggest_float('learning_rate', 0.005, 0.05, log=True)
-        depth = trial.suggest_int('max_depth', 2, 4)
-        leaves = trial.suggest_int('num_leaves', 4, 16)
+        depth = trial.suggest_int('max_depth', 3, 6)
+        leaves = trial.suggest_int('num_leaves', 8, 64)
         min_child = 40
         
-        thresh = trial.suggest_float('model_threshold', 0.60, 0.93)
+        thresh = trial.suggest_float('model_threshold', 0.70, 0.95)
         dir_thresh = trial.suggest_float('direction_threshold', 0.35, 0.65)
         agg_thresh = trial.suggest_float('aggressive_threshold', 0.75, 0.98)
         
@@ -309,10 +311,13 @@ class AutoML:
             # Simple Backtest (Direction logic is not applied in optimization loop to keep it fast)
             res = Backtester(conf).run(val_f, threshold=thresh)
             
-            # Revert to standard selective requirement
-            scores.append(res['sortino'] * np.log(res['trades']) if res['trades'] >= 3 else -0.1)
+            # Drawdown-Adjusted Score: Sortino * log(trades) penalized by Max Drawdown
+            # We use (1 + DD*5) as a divisor to heavily punish high drawdowns
+            base_score = res['sortino'] * np.log(res['trades']) if res['trades'] >= 3 else -0.1
+            dd_penalty = 1.0 + (res['max_drawdown'] * 5.0)
+            scores.append(base_score / dd_penalty)
             
-        return np.mean(scores)
+        return np.mean(scores) - 0.5 * np.std(scores)
 
     def verify_candidate(self, params, trial_number, val_score):
         conf = copy.deepcopy(CONF)
@@ -351,16 +356,15 @@ class AutoML:
         save_path = CONF.model.model_dir / f"rank_{rank}"
         save_path.mkdir(parents=True, exist_ok=True)
         
-        # Save ModelManager (Models A & B)
+        # Save ModelManager (Models A & B + LSTM & Gate)
         # Note: res['model_manager'] is the object
         mm = res['model_manager']
-        joblib.dump(mm.model_long, save_path / "model_long.pkl")
-        joblib.dump(mm.model_short, save_path / "model_short.pkl")
-        if mm.dir_model_long:
-            joblib.dump(mm.dir_model_long, save_path / "dir_model_long.pkl")
-            joblib.dump(mm.dir_model_short, save_path / "dir_model_short.pkl")
+        
+        # Point ModelManager to the correct rank folder
+        mm.config.model_dir = save_path
+        mm.save_models()
             
-        joblib.dump(res['features'], save_path / "features.pkl")
+        # Params saving remains the same
         params = dict(res.get('params', {}))
         params.setdefault("symbol", self.args.symbol)
         params.setdefault("timeframe", self.args.timeframe)

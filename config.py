@@ -37,13 +37,13 @@ class DataConfig:
 class StrategyConfig:
     base_limit_offset_atr: float = 0.88
     
-    time_limit_bars: int = 36        
-    max_holding_bars: int = 144       
+    time_limit_bars: int = 60        
+    max_holding_bars: int = 180       
     stop_loss_atr: float = 3.9       
-    take_profit_atr: float = 0.8     
+    take_profit_atr: float = 1.2     
     maker_fee: float = 0.0002
     taker_fee: float = 0.0006
-    risk_per_trade: float = 0.04    
+    risk_per_trade: float = 0.013    
     max_positions: int = 3
 
 @dataclass
@@ -89,6 +89,18 @@ class ModelConfig:
     use_meta_labeling: bool = True
     direction_threshold: float = 0.5 # Dynamic Threshold for Direction Model
     aggressive_threshold: float = 0.8 # Threshold for Market Order Override
+
+    # --- LSTM Hybrid Ensemble ---
+    use_lstm_ensemble: bool = True
+    lstm_hidden_size: int = 32
+    lstm_layers: int = 1
+    sequence_length: int = 60
+    lstm_dropout: float = 0.8
+    lstm_epochs: int = 100
+    lstm_batch_size: int = 64
+    lstm_weight_decay: float = 1e-5
+    lstm_patience: int = 10
+    lstm_learning_rate: float = 0.0001
 
 @dataclass
 class GlobalConfig:

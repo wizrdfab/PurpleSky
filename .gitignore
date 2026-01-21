@@ -186,4 +186,7 @@ data_collector.log
 
 key_profiles_local.json
 
-live_trading.log
+# --- User requested exclusions ---
+keys.json
+history_FARTCOINUSDT_5m.csv
+Bybit_API_specification_docs/

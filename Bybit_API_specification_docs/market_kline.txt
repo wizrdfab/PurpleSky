@@ -1,0 +1,9 @@
+Endpoint: GET /v5/market/kline
+Description: Historical klines (candlesticks).
+Params:
+- category: linear (default), spot, inverse
+- symbol: e.g. BTCUSDT
+- interval: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, M, W
+- limit: [1, 1000]
+Response:
+- list: [[startTime, open, high, low, close, volume, turnover], ...]
