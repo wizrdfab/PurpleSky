@@ -7,6 +7,7 @@ import json
 import traceback
 import signal
 import sys
+import uuid
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -72,10 +73,36 @@ class LiveBot:
         self.running = True
         self.warmup_bars = 50 
         self.real_ob_bars_count = 0
+        self.pending_limits = {} # {oid: {'entry_time': ts, 'side': ..., 'size': ...}}
+        
+        # Taker Flow Tracking
+        self.bar_taker_buy_vol = 0.0
+        self.bar_taker_total_vol = 0.0
+        
+        # Load Instrument Info
+        self.instrument_info = self.rest_api.get_instrument_info(self.symbol)
+        if not self.instrument_info:
+            logger.warning("Failed to fetch instrument info. Using defaults.")
+            self.instrument_info = {'tick_size': 0.1, 'qty_step': 0.001, 'min_qty': 0.001, 'min_notional': 5.0}
+        
+        logger.info(f"Instrument Info: {self.instrument_info}")
+        
+        # Check Clock Drift
+        self.rest_api.check_clock_drift()
         
         # Graceful Shutdown
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
+
+    def normalize_price(self, price):
+        tick = self.instrument_info['tick_size']
+        return round(round(price / tick) * tick, 8)
+
+    def normalize_qty(self, qty):
+        step = self.instrument_info['qty_step']
+        min_q = self.instrument_info['min_qty']
+        if qty < min_q: return 0.0
+        return round(round(qty / step) * step, 8)
 
     def _tf_to_seconds(self, tf):
         units = {'m': 60, 'h': 3600, 'd': 86400}
@@ -124,16 +151,20 @@ class LiveBot:
             if not self.bars.empty:
                 self.last_bar_time = int(self.bars.iloc[-1]['timestamp'])
         else:
-            logger.info("No history file found. Fetching from exchange...")
-            klines = self.rest_api.get_public_klines(self.symbol, self.timeframe, limit=200)
+            logger.info("No history file found. Fetching 10,000 bars from exchange...")
+            klines = self.rest_api.get_public_klines(self.symbol, self.timeframe, limit=10000)
             if klines:
                 self.bars = pd.DataFrame(klines)
                 for col in self.model_manager.feature_cols:
                     if col not in self.bars.columns and col not in ['open','high','low','close','volume','timestamp']:
                         self.bars[col] = 0.0
                 self.last_bar_time = int(self.bars.iloc[-1]['timestamp'])
+            else:
+                logger.warning("Exchange returned no history. Starting with empty buffer.")
+                self.bars = pd.DataFrame()
         
-        self.bars['timestamp'] = self.bars['timestamp'].astype(int)
+        if not self.bars.empty:
+            self.bars['timestamp'] = self.bars['timestamp'].astype(int)
 
     def run(self):
         self._load_history()
@@ -142,6 +173,7 @@ class LiveBot:
         logger.info("Connecting WS...")
         self.ws_api.subscribe_orderbook(self.symbol, self.local_book)
         self.ws_api.subscribe_kline(self.symbol, self.timeframe)
+        self.ws_api.subscribe_trades(self.symbol, self.on_public_trade)
         self.ws_api.subscribe_private(self.on_position_update, self.on_execution_update)
         
         logger.info("Starting Main Loop...")
@@ -174,6 +206,18 @@ class LiveBot:
                 traceback.print_exc()
                 time.sleep(5)
 
+    def on_public_trade(self, msg):
+        """Processes public trade stream to track taker flow."""
+        for trade in msg.get('data', []):
+            try:
+                sz = float(trade.get('v', 0))
+                side = trade.get('S') # 'Buy' or 'Sell'
+                self.bar_taker_total_vol += sz
+                if side == 'Buy':
+                    self.bar_taker_buy_vol += sz
+            except Exception as e:
+                logger.error(f"Error processing public trade: {e}")
+
     def on_position_update(self, msg):
         # Update Virtual Position Manager? 
         # For now, VPM is master, exchange is slave. We reconcile periodically.
@@ -183,6 +227,26 @@ class LiveBot:
         # Log fills
         for item in msg.get('data', []):
             logger.info(f"EXECUTION: {item.get('side')} {item.get('execQty')} @ {item.get('execPrice')}")
+            
+            link_id = item.get('orderLinkId', '')
+            if link_id and link_id.startswith('LIMIT-'):
+                logger.info(f"Detected Limit Fill {link_id}. Adding to VPM.")
+                
+                side = item['side']
+                price = float(item['execPrice'])
+                qty = float(item['execQty'])
+                
+                # Fallback SL/TP since we don't have ATR access here easily
+                # Assuming 1% SL, 2% TP
+                sl_dist = price * 0.01
+                if side == "Buy":
+                    sl = price - sl_dist
+                    tp = price + (sl_dist * 2)
+                else:
+                    sl = price + sl_dist
+                    tp = price - (sl_dist * 2)
+                    
+                self.vpm.add_trade(side, price, qty, sl, tp, check_debounce=False)
 
     def on_bar_close(self, ws_kline):
         logger.info(f"Bar Closing: {datetime.fromtimestamp(int(ws_kline['start'])/1000)}")
@@ -190,17 +254,34 @@ class LiveBot:
         # 1. Finalize OB Stats
         ob_stats = self.ob_agg.finalize()
         if not ob_stats:
-             # Minimal patch
-            ob_stats = {k: 0.0 for k in ['ob_spread_mean', 'ob_micro_dev_std']} 
+             # Comprehensive fallbacks for all metrics the FeatureEngine expects
+            keys = [
+                'ob_spread_mean', 'ob_micro_dev_mean', 'ob_micro_dev_std', 'ob_micro_dev_last',
+                'ob_imbalance_mean', 'ob_imbalance_last', 'ob_bid_depth_mean', 'ob_ask_depth_mean',
+                'ob_bid_slope_mean', 'ob_ask_slope_mean', 'ob_bid_integrity_mean', 'ob_ask_integrity_mean'
+            ]
+            ob_stats = {k: 0.0 for k in keys} 
         
-        # 2. Construct Bar
+        # 2. Calculate Taker Buy Ratio
+        taker_buy_ratio = 0.5
+        if self.bar_taker_total_vol > 0:
+            taker_buy_ratio = self.bar_taker_buy_vol / self.bar_taker_total_vol
+        
+        logger.info(f"Taker Flow: Buy Vol={self.bar_taker_buy_vol:.2f}, Total Vol={self.bar_taker_total_vol:.2f}, Ratio={taker_buy_ratio:.4f}")
+        
+        # Reset counters for next bar
+        self.bar_taker_buy_vol = 0.0
+        self.bar_taker_total_vol = 0.0
+
+        # 3. Construct Bar
         row = {
             'timestamp': int(ws_kline['start']),
             'open': float(ws_kline['open']),
             'high': float(ws_kline['high']),
             'low': float(ws_kline['low']),
             'close': float(ws_kline['close']),
-            'volume': float(ws_kline['volume'])
+            'volume': float(ws_kline['volume']),
+            'taker_buy_ratio': taker_buy_ratio
         }
         row.update(ob_stats)
         
@@ -219,107 +300,323 @@ class LiveBot:
             logger.info(f"Warmup: {self.real_ob_bars_count}/{self.warmup_bars} real OB bars.")
             return
 
-        # 4. Feature Calc
-        df_feats = self.feature_engine.calculate_features(self.bars.iloc[-300:]) 
-        current_row = df_feats.iloc[[-1]].copy()
+        # 4. Feature Calc (Using 10,000 bar window for macro stability)
+        df_feats = self.feature_engine.calculate_features(self.bars.iloc[-10000:]) 
         
-        # 5. Predict
-        preds = self.model_manager.predict(current_row)
+        # --- COMPREHENSIVE DATA INTEGRITY & FEATURE REPORT ---
+        logger.info(">>> [SYSTEM METRICS]")
+        
+        # 1. History & Gap Check
+        hist_len = len(self.bars)
+        gap_msg = "First Bar"
+        if hist_len >= 2:
+            delta = self.bars.iloc[-1]['timestamp'] - self.bars.iloc[-2]['timestamp']
+            expected = self.tf_seconds * 1000
+            if delta == expected:
+                gap_msg = "OK (Continuous)"
+            else:
+                gap_msg = f"!!! GAP DETECTED (Delta={delta}ms, Exp={expected}ms) !!!"
+
+        # 2. Latency Check (Processing Lag)
+        bar_end_time = row['timestamp'] + (self.tf_seconds * 1000)
+        now_ms = int(time.time() * 1000)
+        lag_ms = now_ms - bar_end_time
+        lag_msg = f"{lag_ms}ms"
+        if lag_ms > 5000: lag_msg += " (HIGH LATENCY)"
+
+        # 3. Data Quality (NaNs & OB)
+        nan_count = current_row.isna().sum().sum()
+        nan_msg = "OK" if nan_count == 0 else f"!!! WARNING: {nan_count} NaNs Detected !!!"
+        
+        ob_spread = row.get('ob_spread_mean', 0)
+        ob_status = "OK" if ob_spread > 0 else "!!! STALE/EMPTY ORDERBOOK !!!"
+
+        logger.info(f"    History:       {hist_len} bars | Continuity: {gap_msg}")
+        logger.info(f"    Processing Lag:{lag_msg}")
+        logger.info(f"    Data Quality:  {nan_msg}")
+        logger.info(f"    OB State:      {ob_status} (Spread: {ob_spread:.8f})")
+        logger.info(f"    Warmup:        {self.real_ob_bars_count}/{self.warmup_bars}")
+        
+        logger.info(">>> [ALL MODEL FEATURES]")
+        feature_data = []
+        for col in self.model_manager.feature_cols:
+            if col in current_row.columns:
+                val = current_row[col].iloc[0]
+                feature_data.append(f"{col}: {val:.6f}")
+            else:
+                feature_data.append(f"{col}: MISSING!")
+        
+        # Print features in chunks of 4 per line for readability
+        for i in range(0, len(feature_data), 4):
+            logger.info("    " + " | ".join(feature_data[i:i+4]))
+        
+        logger.info(">>> [END REPORT]")
+        # ------------------------------------------------------
+        
+        # 5. Predict (Optimized: only pass last 100 bars to satisfy LSTM sequence_length=60)
+        preds_full = self.model_manager.predict(df_feats.iloc[-100:])
+        preds = preds_full.iloc[[-1]]
+        
         p_long = preds['pred_long'].iloc[0]
         p_short = preds['pred_short'].iloc[0]
         p_dir_long = preds['pred_dir_long'].iloc[0] if 'pred_dir_long' in preds else 1.0
         p_dir_short = preds['pred_dir_short'].iloc[0] if 'pred_dir_short' in preds else 1.0
         
-        atr = current_row['atr'].iloc[0]
-        close = current_row['close'].iloc[0]
+        atr = preds['atr'].iloc[0]
+        close = preds['close'].iloc[0]
         
+        # Log specific LSTM metrics if they exist
+        if 'gate_weight' in preds.columns:
+            logger.info(f"LSTM Context: Gate Weight={preds['gate_weight'].iloc[0]:.4f} (LGB vs LSTM)")
+
         logger.info(f"Preds: Long={p_long:.2f} (Dir={p_dir_long:.2f}), Short={p_short:.2f} (Dir={p_dir_short:.2f})")
         
         # 6. Execute Strategy
         self.execute_logic(p_long, p_short, p_dir_long, p_dir_short, close, atr)
+        
+        # 7. Management
+        self.check_order_expiry()
+        self.manage_exits()
 
     def execute_logic(self, p_long, p_short, p_dir_long, p_dir_short, close, atr):
         thresh = CONF.model.model_threshold
         dir_thresh = CONF.model.direction_threshold
         agg_thresh = CONF.model.aggressive_threshold
         
-        signal_side = None
-        
+        # Check Long
         if p_dir_long > agg_thresh:
-            signal_side = "Buy"
             logger.info("Signal: Aggressive Buy")
-        elif p_dir_short > agg_thresh:
-            signal_side = "Sell"
-            logger.info("Signal: Aggressive Sell")
+            self._execute_trade("Buy", close, atr, "Market")
         elif p_long > thresh and p_dir_long > dir_thresh:
-            signal_side = "Buy"
-            logger.info("Signal: Standard Buy")
+            logger.info("Signal: Standard Buy (Limit)")
+            limit_p = close - (atr * CONF.strategy.base_limit_offset_atr)
+            self._execute_trade("Buy", limit_p, atr, "Limit")
+            
+        # Check Short
+        if p_dir_short > agg_thresh:
+            logger.info("Signal: Aggressive Sell")
+            self._execute_trade("Sell", close, atr, "Market")
         elif p_short > thresh and p_dir_short > dir_thresh:
-            signal_side = "Sell"
-            logger.info("Signal: Standard Sell")
-            
-        if signal_side:
-            wallet = self.rest_api.get_wallet_balance("USDT")
-            if wallet <= 0: return
+            logger.info("Signal: Standard Sell (Limit)")
+            limit_p = close + (atr * CONF.strategy.base_limit_offset_atr)
+            self._execute_trade("Sell", limit_p, atr, "Limit")
 
-            risk_amt = wallet * self.risk_per_trade
-            sl_dist = atr * CONF.strategy.stop_loss_atr
-            if sl_dist == 0: sl_dist = close * 0.01
-            
-            size_qty = risk_amt / sl_dist
-            size_qty = round(size_qty, 3) 
-            
-            if size_qty <= 0: return
+    def _execute_trade(self, side, price, atr, order_type):
+        logger.info(f"Execute {side} {order_type} @ {price:.2f}")
+        wallet = self.rest_api.get_wallet_balance("USDT")
+        if wallet <= 0: return
 
-            if signal_side == "Buy":
-                sl_price = close - sl_dist
-                tp_price = close + (atr * CONF.strategy.take_profit_atr)
-            else:
-                sl_price = close + sl_dist
-                tp_price = close - (atr * CONF.strategy.take_profit_atr)
-                
-            success = self.vpm.add_trade(signal_side, close, size_qty, sl_price, tp_price)
+        risk_amt = wallet * self.risk_per_trade
+        sl_dist = atr * CONF.strategy.stop_loss_atr
+        if sl_dist == 0: sl_dist = price * 0.01
+        
+        raw_qty = risk_amt / sl_dist
+        size_qty = self.normalize_qty(raw_qty)
+        
+        if size_qty <= 0: return
+        
+        # Check Min Notional
+        if (size_qty * price) < self.instrument_info['min_notional']:
+            logger.warning(f"Trade value {size_qty*price:.2f} < Min Notional {self.instrument_info['min_notional']}. Skipping.")
+            return
+
+        price = self.normalize_price(price)
+
+        sl_price = 0
+        tp_price = 0
+        if side == "Buy":
+            sl_price = price - sl_dist
+            tp_price = price + (atr * CONF.strategy.take_profit_atr)
+        else:
+            sl_price = price + sl_dist
+            tp_price = price - (atr * CONF.strategy.take_profit_atr)
+            
+        sl_price = self.normalize_price(sl_price)
+        tp_price = self.normalize_price(tp_price)
+
+        if order_type == "Market":
+            success = self.vpm.add_trade(side, price, size_qty, sl_price, tp_price)
             if success:
                 self.reconcile_positions()
+        else:
+            # Limit Order
+            # Place on Exchange + Track
+            oid = f"LIMIT-{uuid.uuid4().hex[:8]}"
+            logger.info(f"Placing Limit {side} {size_qty} @ {price}")
+            
+            # For Limit, we map Position Index same as Market
+            p_idx = 1 if side == "Buy" else 2
+            
+            res = self.rest_api.place_order(
+                self.symbol, side, "Limit", size_qty, price=price, 
+                position_idx=p_idx, order_link_id=oid,
+                sl=sl_price, tp=tp_price
+            )
+            
+            logger.info(f"DEBUG: Limit Res: {res}")
+            
+            if 'order_id' in res:
+                self.pending_limits[res['order_id']] = {
+                    'entry_time': time.time(),
+                    'link_id': oid
+                }
+                logger.info(f"DEBUG: Added to pending_limits. Count: {len(self.pending_limits)}")
+            else:
+                logger.info("DEBUG: Order ID missing in response")
+
+    def check_order_expiry(self):
+        limit_sec = CONF.strategy.time_limit_bars * self.tf_seconds
+        now = time.time()
+        
+        to_remove = []
+        for oid, data in self.pending_limits.items():
+            if (now - data['entry_time']) > limit_sec:
+                logger.info(f"Limit Order {oid} expired. Cancelling.")
+                self.rest_api.cancel_order(self.symbol, oid)
+                to_remove.append(oid)
+        
+        for oid in to_remove:
+            del self.pending_limits[oid]
+            
+    def manage_exits(self):
+        # Time Exits (VPM)
+        max_duration = CONF.strategy.max_holding_bars * self.tf_seconds
+        closed = self.vpm.check_time_exits(int(time.time()), max_duration)
+        if closed:
+            logger.info(f"Time Exits triggered: {closed}. Reconciling.")
+            self.reconcile_positions()
 
     def reconcile_positions(self):
-        logger.info("Reconciling Positions...")
-        target_net = self.vpm.get_net_position()
+        logger.info("Reconciling Positions (Hedge Mode)...")
         
+        # 1. Calculate Targets from Virtual Trades
+        target_long = 0.0
+        target_short = 0.0
+        
+        for t in self.vpm.trades:
+            if t.side == "Buy": target_long += t.size
+            elif t.side == "Sell": target_short += t.size
+            
+        # 2. Get Actual Positions from Exchange
         positions = self.rest_api.get_positions(self.symbol)
-        actual_net = 0.0
+        actual_long = 0.0
+        actual_short = 0.0
+        
+        # Map Bybit Positions to Long/Short buckets
         if positions:
             for p in positions:
-                s = p['size']
-                if p['side'] == 'Sell': s = -s
-                actual_net += s
+                idx = p.get('position_idx', 0)
+                sz = p['size']
+                side = p['side'] # Buy or Sell
+                
+                # Hedge Mode: Idx 1=Buy(Long), Idx 2=Sell(Short)
+                if idx == 1:
+                    actual_long = sz
+                elif idx == 2:
+                    actual_short = sz
+                elif idx == 0:
+                    # Fallback for One-Way mode (treating as hedge buckets)
+                    if side == 'Buy': actual_long = sz
+                    elif side == 'Sell': actual_short = sz
+                    
+        # 3. Execute Deltas
+        # Long Side (Idx 1)
+        diff_long = target_long - actual_long
+        norm_diff_long = self.normalize_qty(abs(diff_long))
         
-        diff = target_net - actual_net
+        if norm_diff_long > 0:
+            qty = norm_diff_long
+            oid = f"AUTO-{uuid.uuid4().hex[:8]}"
+            if diff_long > 0:
+                logger.info(f"Opening Long: {qty}")
+                # Attach SL/TP from latest trade for initial protection
+                last_buy = next((t for t in reversed(self.vpm.trades) if t.side == "Buy"), None)
+                sl = last_buy.stop_loss if last_buy else None
+                tp = last_buy.take_profit if last_buy else None
+                
+                self.rest_api.place_order(self.symbol, "Buy", "Market", qty, position_idx=1, order_link_id=oid, sl=sl, tp=tp)
+            else:
+                logger.info(f"Reducing Long: {qty}")
+                self.rest_api.place_order(self.symbol, "Sell", "Market", qty, reduce_only=True, position_idx=1, order_link_id=oid)
+
+        # Short Side (Idx 2)
+        diff_short = target_short - actual_short
+        norm_diff_short = self.normalize_qty(abs(diff_short))
         
-        if abs(diff) > 0.001: 
-            side = "Buy" if diff > 0 else "Sell"
-            qty = abs(diff)
-            logger.info(f"Drift detected. Target: {target_net}, Actual: {actual_net}. Executing {side} {qty}")
-            self.rest_api.place_order(self.symbol, side, "Market", qty)
-            
+        if norm_diff_short > 0:
+            qty = norm_diff_short
+            oid = f"AUTO-{uuid.uuid4().hex[:8]}"
+            if diff_short > 0:
+                logger.info(f"Opening Short: {qty}")
+                # Attach SL/TP
+                last_sell = next((t for t in reversed(self.vpm.trades) if t.side == "Sell"), None)
+                sl = last_sell.stop_loss if last_sell else None
+                tp = last_sell.take_profit if last_sell else None
+                
+                self.rest_api.place_order(self.symbol, "Sell", "Market", qty, position_idx=2, order_link_id=oid, sl=sl, tp=tp)
+            else:
+                logger.info(f"Reducing Short: {qty}")
+                self.rest_api.place_order(self.symbol, "Buy", "Market", qty, reduce_only=True, position_idx=2, order_link_id=oid)
+
         # Sync Stops
-        self.rest_api.cancel_all_orders(self.symbol)
+        # Cancel existing stops/untracked orders, but PRESERVE active Limit Orders
+        # AND preserve attached stops if position is still forming (size 0)
+        open_orders = self.rest_api.get_open_orders(self.symbol)
+        for o in open_orders:
+            oid = o['orderId']
+            if oid in self.pending_limits:
+                continue
+            
+            # Skip Market Orders (they fill instantly, usually race condition if we see them here)
+            if o.get('orderType') == 'Market':
+                continue
+
+            # Check if it is a Stop Order
+            trig = float(o.get('triggerPrice') or 0)
+            if trig > 0:
+                # It's a Stop. Preserve if corresponding position is 0 (likely attached to pending)
+                # Stop Sell protects Long
+                if o['side'] == 'Sell' and actual_long == 0: continue
+                # Stop Buy protects Short
+                if o['side'] == 'Buy' and actual_short == 0: continue
+            
+            self.rest_api.cancel_order(self.symbol, oid)
+        
+        # Fetch price for trigger direction calculation
+        current_price = self.rest_api.get_current_price(self.symbol)
         
         stops = self.vpm.get_active_stops()
         for s in stops:
+             # Skip if position doesn't exist yet to avoid ReduceOnly rejection
+             if s['side'] == 'Sell' and actual_long == 0: continue
+             if s['side'] == 'Buy' and actual_short == 0: continue
+             
+             p_idx = 0
+             if s['side'] == 'Sell': p_idx = 1
+             elif s['side'] == 'Buy': p_idx = 2
+             
+             # Calculate Trigger Direction
+             t_dir = None
+             if current_price > 0:
+                 if s['trigger_price'] > current_price:
+                     t_dir = 1 # Rise
+                 else:
+                     t_dir = 2 # Fall
+             
              self.rest_api.place_order(
                 symbol=self.symbol,
                 side=s['side'],
                 order_type="Market",
                 qty=s['qty'],
                 reduce_only=True,
-                trigger_price=s['trigger_price']
+                trigger_price=s['trigger_price'],
+                position_idx=p_idx,
+                trigger_direction=t_dir
             )
 
         # Prune Dead Trades
-        curr_price = self.rest_api.get_current_price(self.symbol)
-        if curr_price > 0:
-            closed_ids = self.vpm.prune_dead_trades(curr_price)
+        if current_price > 0:
+            closed_ids = self.vpm.prune_dead_trades(current_price)
             if closed_ids:
                 logger.info(f"Software SL/TP triggered for {closed_ids}. Re-running reconcile.")
                 self.reconcile_positions()

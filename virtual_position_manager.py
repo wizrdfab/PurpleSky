@@ -61,17 +61,18 @@ class VirtualPositionManager:
         except Exception as e:
             self.logger.error(f"Failed to save virtual positions: {e}")
 
-    def add_trade(self, side: str, price: float, size: float, sl: float, tp: float) -> bool:
+    def add_trade(self, side: str, price: float, size: float, sl: float, tp: float, check_debounce: bool = True) -> bool:
         if len(self.trades) >= self.max_positions:
             self.logger.warning(f"Max positions ({self.max_positions}) reached. Cannot add trade.")
             return False
         
         # Check against existing trades to prevent duplicate signals (simple time deboucing)
         # If we added a trade in the last 60 seconds, ignore
-        now = int(time.time())
-        if any(abs(t.entry_time - now) < 60 for t in self.trades):
-             self.logger.info("Signal debounced (trade added recently).")
-             return False
+        if check_debounce:
+            now = int(time.time())
+            if any(abs(t.entry_time - now) < 60 for t in self.trades):
+                self.logger.info("Signal debounced (trade added recently).")
+                return False
 
         trade = VirtualTrade(
             symbol=self.symbol,
@@ -137,4 +138,17 @@ class VirtualPositionManager:
                 if current_price >= t.stop_loss or current_price <= t.take_profit:
                     self.close_trade(t.trade_id)
                     closed.append(t.trade_id)
+        return closed
+
+    def check_time_exits(self, current_time: int, max_duration_sec: int) -> List[str]:
+        """
+        Close trades that have been open longer than max_duration_sec.
+        Returns list of closed trade IDs.
+        """
+        closed = []
+        for t in list(self.trades):
+            if (current_time - t.entry_time) >= max_duration_sec:
+                self.logger.info(f"Time Exit triggered for Trade {t.trade_id} (Duration: {current_time - t.entry_time}s)")
+                self.close_trade(t.trade_id)
+                closed.append(t.trade_id)
         return closed
