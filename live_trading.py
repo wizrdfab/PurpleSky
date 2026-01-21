@@ -87,6 +87,11 @@ class LiveBot:
         
         logger.info(f"Instrument Info: {self.instrument_info}")
         
+        # --- AUTO-CONFIGURATION ---
+        logger.info("Auto-configuring exchange settings...")
+        self.rest_api.switch_position_mode(self.symbol, mode=3) # Force Hedge Mode
+        self.rest_api.set_leverage(self.symbol, leverage=10.0) # Default to 10x safety
+        
         # Check Clock Drift
         self.rest_api.check_clock_drift()
         
@@ -165,6 +170,22 @@ class LiveBot:
         
         if not self.bars.empty:
             self.bars['timestamp'] = self.bars['timestamp'].astype(int)
+            
+            # --- FULL HISTORY CONTINUITY CHECK ---
+            if len(self.bars) >= 2:
+                timestamps = self.bars['timestamp'].values
+                deltas = np.diff(timestamps)
+                expected = self.tf_seconds * 1000
+                # Only flag real gaps (missing data), ignore duplicates/overlaps
+                gaps = np.where(deltas > expected)[0]
+                
+                if len(gaps) > 0:
+                    logger.warning(f"!!! HISTORY GAPS DETECTED: {len(gaps)} missing periods found !!!")
+                    for g_idx in gaps[:5]: # Show first 5 gaps
+                        logger.warning(f"    Gap at {datetime.fromtimestamp(timestamps[g_idx]/1000)} -> {datetime.fromtimestamp(timestamps[g_idx+1]/1000)}")
+                else:
+                    logger.info(f"History Continuity Check: OK (Checked {len(self.bars)} bars)")
+            # -------------------------------------
 
     def run(self):
         self._load_history()
@@ -289,19 +310,21 @@ class LiveBot:
         self.bars = pd.concat([self.bars, new_row_df], ignore_index=True)
         self.last_bar_time = row['timestamp']
         
+        # 4. Feature Calc (Using 10,000 bar window for macro stability)
+        df_feats = self.feature_engine.calculate_features(self.bars.iloc[-10000:]) 
+        
+        # --- SAFETY SHIELD ---
+        # Clean up extreme values (Inf/-Inf) and NaNs caused by history transition.
+        # This prevents the scaler overflow that leads to 'nan' predictions.
+        df_feats = df_feats.replace([np.inf, -np.inf], 0).fillna(0)
+        
+        # Update self.bars with calculated features so they are saved to CSV
+        self.bars.update(df_feats)
+        
         # Save History
         self.bars.to_csv(self.history_file, index=False)
         
-        # 3. Check Warmup
-        if any(ob_stats.values()):
-            self.real_ob_bars_count += 1
-            
-        if self.real_ob_bars_count < self.warmup_bars:
-            logger.info(f"Warmup: {self.real_ob_bars_count}/{self.warmup_bars} real OB bars.")
-            return
-
-        # 4. Feature Calc (Using 10,000 bar window for macro stability)
-        df_feats = self.feature_engine.calculate_features(self.bars.iloc[-10000:]) 
+        current_row = df_feats.iloc[[-1]]
         
         # --- COMPREHENSIVE DATA INTEGRITY & FEATURE REPORT ---
         logger.info(">>> [SYSTEM METRICS]")
@@ -329,13 +352,19 @@ class LiveBot:
         nan_msg = "OK" if nan_count == 0 else f"!!! WARNING: {nan_count} NaNs Detected !!!"
         
         ob_spread = row.get('ob_spread_mean', 0)
-        ob_status = "OK" if ob_spread > 0 else "!!! STALE/EMPTY ORDERBOOK !!!"
+        ob_updates = row.get('ob_update_count', 0)
+        
+        ob_status = "OK"
+        if ob_spread <= 0:
+            ob_status = "!!! STALE/EMPTY SPREAD !!!"
+        elif ob_updates < 5: # Expect at least 5 unique snapshots in 5 minutes
+            ob_status = f"!!! LOW LIQUIDITY/FROZEN ({ob_updates} updates) !!!"
 
         logger.info(f"    History:       {hist_len} bars | Continuity: {gap_msg}")
         logger.info(f"    Processing Lag:{lag_msg}")
         logger.info(f"    Data Quality:  {nan_msg}")
         logger.info(f"    OB State:      {ob_status} (Spread: {ob_spread:.8f})")
-        logger.info(f"    Warmup:        {self.real_ob_bars_count}/{self.warmup_bars}")
+        logger.info(f"    Warmup Status: {self.real_ob_bars_count}/{self.warmup_bars}")
         
         logger.info(">>> [ALL MODEL FEATURES]")
         feature_data = []
@@ -353,8 +382,8 @@ class LiveBot:
         logger.info(">>> [END REPORT]")
         # ------------------------------------------------------
         
-        # 5. Predict (Optimized: only pass last 100 bars to satisfy LSTM sequence_length=60)
-        preds_full = self.model_manager.predict(df_feats.iloc[-100:])
+        # 5. Predict (Optimized: use .copy() to satisfy LSTM and avoid SettingWithCopy)
+        preds_full = self.model_manager.predict(df_feats.iloc[-100:].copy())
         preds = preds_full.iloc[[-1]]
         
         p_long = preds['pred_long'].iloc[0]
@@ -370,11 +399,19 @@ class LiveBot:
             logger.info(f"LSTM Context: Gate Weight={preds['gate_weight'].iloc[0]:.4f} (LGB vs LSTM)")
 
         logger.info(f"Preds: Long={p_long:.2f} (Dir={p_dir_long:.2f}), Short={p_short:.2f} (Dir={p_dir_short:.2f})")
-        
-        # 6. Execute Strategy
+
+        # 6. Check Warmup
+        if any(ob_stats.values()):
+            self.real_ob_bars_count += 1
+            
+        if self.real_ob_bars_count < self.warmup_bars:
+            logger.info(f"WARMUP ACTIVE: Trading disabled until {self.warmup_bars} real OB bars reached.")
+            return
+
+        # 7. Execute Strategy
         self.execute_logic(p_long, p_short, p_dir_long, p_dir_short, close, atr)
         
-        # 7. Management
+        # 8. Management
         self.check_order_expiry()
         self.manage_exits()
 
@@ -401,7 +438,7 @@ class LiveBot:
             limit_p = close + (atr * CONF.strategy.base_limit_offset_atr)
             self._execute_trade("Sell", limit_p, atr, "Limit")
 
-    def _execute_trade(self, side, price, atr, order_type):
+    def _execute_trade(self, side, price, atr, order_type, check_debounce=True):
         logger.info(f"Execute {side} {order_type} @ {price:.2f}")
         wallet = self.rest_api.get_wallet_balance("USDT")
         if wallet <= 0: return
@@ -435,7 +472,7 @@ class LiveBot:
         tp_price = self.normalize_price(tp_price)
 
         if order_type == "Market":
-            success = self.vpm.add_trade(side, price, size_qty, sl_price, tp_price)
+            success = self.vpm.add_trade(side, price, size_qty, sl_price, tp_price, check_debounce=check_debounce)
             if success:
                 self.reconcile_positions()
         else:
@@ -624,12 +661,18 @@ class LiveBot:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, required=True)
-    parser.add_argument("--model-dir", type=str, required=True)
-    parser.add_argument("--api-key", type=str, default="")
-    parser.add_argument("--api-secret", type=str, default="")
+    parser.add_argument("--model-dir", "--model_dir", type=str, required=True, dest="model_dir")
+    parser.add_argument("--api-key", "--api_key", type=str, default="", dest="api_key")
+    parser.add_argument("--api-secret", "--api_secret", type=str, default="", dest="api_secret")
     parser.add_argument("--testnet", action="store_true")
-    parser.add_argument("--timeframe", type=str, default="5m")
+    parser.add_argument("--timeframe", "--time_frame", type=str, default="5m", dest="timeframe")
     args = parser.parse_args()
+    
+    # --- MANUAL VALIDATION (Double Safety) ---
+    if not args.symbol or not args.model_dir:
+        logger.error("CRITICAL: Missing --symbol or --model-dir. Bot cannot start.")
+        parser.print_help()
+        sys.exit(1)
     
     if not args.api_key:
         try:

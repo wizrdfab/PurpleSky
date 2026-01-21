@@ -97,8 +97,8 @@ class TestProductionFinal(unittest.TestCase):
         print("\n[Step 3] Executing a real Market Trade on Testnet...")
         # Manually call _execute_trade to force action regardless of current signal
         # Use min size for Fartcoin (usually 1.0)
-        bot._execute_trade("Buy", last_bar['close'], last_bar['close']*0.05, "Market")
-        time.sleep(3)
+        bot._execute_trade("Buy", last_bar['close'], last_bar['close']*0.05, "Market", check_debounce=False)
+        time.sleep(5) # Increased from 3s to 5s for Testnet stability
         
         # Verify Exchange Position
         pos = bot.rest_api.get_positions(SYMBOL)
@@ -114,18 +114,24 @@ class TestProductionFinal(unittest.TestCase):
 
         # 4. Verify Persistence (Restart)
         print("\n[Step 4] Verifying Persistence (Bot Restart)...")
-        trade_id = bot.vpm.trades[0].trade_id
+        num_trades = len(bot.vpm.trades)
+        trade_ids = [t.trade_id for t in bot.vpm.trades]
         del bot
         
         bot_new = LiveBot(self.args)
-        self.assertEqual(len(bot_new.vpm.trades), 1, "New bot instance should load the existing trade")
-        self.assertEqual(bot_new.vpm.trades[0].trade_id, trade_id)
-        print(f"    [OK] New bot instance recovered trade: {trade_id}")
+        self.assertEqual(len(bot_new.vpm.trades), num_trades, f"New bot instance should load {num_trades} existing trades")
+        for tid in trade_ids:
+            self.assertTrue(any(t.trade_id == tid for t in bot_new.vpm.trades))
+        print(f"    [OK] New bot instance recovered {num_trades} trades.")
 
         # Cleanup
         print("\n[Cleanup] Closing test positions...")
         bot_new.rest_api.cancel_all_orders(SYMBOL)
-        bot_new.rest_api.place_order(SYMBOL, "Sell", "Market", long_pos['size'], reduce_only=True, position_idx=1)
+        pos = bot_new.rest_api.get_positions(SYMBOL)
+        for p in pos:
+            if float(p['size']) > 0:
+                side = "Sell" if p['side'] == "Buy" else "Buy"
+                bot_new.rest_api.place_order(SYMBOL, side, "Market", p['size'], reduce_only=True, position_idx=p['position_idx'])
         print("=== FINAL TEST PASSED: SYSTEM IS 100% PRODUCTION READY ===")
 
 if __name__ == '__main__':

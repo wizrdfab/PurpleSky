@@ -185,3 +185,8 @@ bot_state_MONUSDT_v2.json
 data_collector.log
 
 key_profiles_local.json
+
+# --- User requested exclusions ---
+keys.json
+history_FARTCOINUSDT_5m.csv
+Bybit_API_specification_docs/

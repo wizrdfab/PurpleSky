@@ -6,13 +6,18 @@ class OrderbookAggregator:
     def __init__(self, ob_levels: int = 50):
         self.ob_levels = ob_levels
         self.snapshots = []
+        self.unique_timestamps = set()
         self.last_ts = 0
 
     def process_snapshot(self, bids: List[List[float]], asks: List[List[float]], timestamp: int):
         """
         Process a raw snapshot (bids/asks: [[price, size], ...])
         """
+        if timestamp in self.unique_timestamps and timestamp != 0:
+            return # Skip duplicate work if data hasn't changed
+            
         self.last_ts = timestamp
+        self.unique_timestamps.add(timestamp)
         
         # Sort and Slice
         # Bids: Descending Price
@@ -93,6 +98,7 @@ class OrderbookAggregator:
 
         # Construct result matching FeatureEngine keys
         result = {
+            'ob_update_count': len(self.unique_timestamps),
             'ob_spread_mean': means['spread'],
             'ob_micro_dev_mean': means['micro_dev'],
             'ob_micro_dev_std': micro_std,
@@ -109,4 +115,5 @@ class OrderbookAggregator:
         
         # Reset
         self.snapshots = []
+        self.unique_timestamps = set()
         return result
