@@ -1,0 +1,91 @@
+2026-01-21 19:15:31,089 [INFO] WebSocket Unified V5 attempting connection...
+2026-01-21 19:15:33,165 [INFO] Websocket connected
+2026-01-21 19:15:33,165 [INFO] WebSocket Unified V5 connected
+2026-01-21 19:15:33,166 [INFO] WebSocket Unified V5 (Auth) attempting connection...
+2026-01-21 19:15:35,844 [INFO] Websocket connected
+2026-01-21 19:15:35,844 [INFO] WebSocket Unified V5 (Auth) connected
+2026-01-21 19:15:35,848 [INFO] Loading model from models/FARTCOINUSDT/rank_1...
+2026-01-21 19:15:38,141 [INFO] Instrument Info: {'tick_size': 0.0001, 'qty_step': 1.0, 'min_qty': 1.0, 'min_notional': 5.0}
+2026-01-21 19:15:38,141 [INFO] Auto-configuring exchange settings...
+2026-01-21 19:15:39,986 [INFO] Clock Sync OK (Drift: -0.014s)
+2026-01-21 19:15:39,987 [INFO] Loading history from disk...
+2026-01-21 19:15:40,101 [WARNING] !!! HISTORY GAPS DETECTED: 1 gaps found in initial load !!!
+2026-01-21 19:15:40,101 [WARNING]     Gap at 2026-01-21 14:55:00 -> 2026-01-21 14:55:00
+2026-01-21 19:15:40,101 [INFO] Connecting WS...
+2026-01-21 19:15:40,102 [INFO] Subscribed to Orderbook for FARTCOINUSDT
+2026-01-21 19:15:40,102 [INFO] Subscribed to Kline 5m for FARTCOINUSDT
+2026-01-21 19:15:40,103 [INFO] Subscribed to Trade Stream for FARTCOINUSDT
+2026-01-21 19:15:40,103 [INFO] Subscribed to Private Channels
+2026-01-21 19:15:40,104 [INFO] Starting Main Loop...
+2026-01-21 19:20:00,801 [INFO] Bar Closing: 2026-01-21 19:15:00
+2026-01-21 19:20:00,806 [INFO] Taker Flow: Buy Vol=109483.00, Total Vol=349746.00, Ratio=0.3130
+2026-01-21 19:20:01,392 [INFO] >>> [SYSTEM METRICS]
+2026-01-21 19:20:01,394 [INFO]     History:       10053 bars | Continuity: OK (Continuous)
+2026-01-21 19:20:01,394 [INFO]     Processing Lag:1393ms
+2026-01-21 19:20:01,394 [INFO]     Data Quality:  OK
+2026-01-21 19:20:01,394 [INFO]     OB State:      OK (Spread: 0.00010199)
+2026-01-21 19:20:01,395 [INFO]     Warmup Status: 0/50
+2026-01-21 19:20:01,395 [INFO] >>> [ALL MODEL FEATURES]
+2026-01-21 19:20:01,397 [INFO]     close: 0.314600 | taker_buy_ratio: 0.313036 | ob_bid_integrity_mean: 0.002703 | ob_ask_integrity_mean: 0.005125
+2026-01-21 19:20:01,397 [INFO]     natr: 0.006080 | dist_ema_9: -0.183005 | dist_ema_21: 0.246218 | dist_ema_50: 2.664674
+2026-01-21 19:20:01,397 [INFO]     rsi: 55.234164 | bb_percent_b: 0.333695 | ema_9_slope: -0.268879 | ema_21_slope: 0.179083
+2026-01-21 19:20:01,397 [INFO]     ema_50_slope: 0.599844 | taker_buy_z: -1.450710 | vol_z: -1.022313 | ob_imb_trend: 0.133511
+2026-01-21 19:20:01,398 [INFO]     micro_pressure: -0.003557 | bid_depth_chg: 0.542622 | ask_depth_chg: -0.025773 | spread_z: 0.895978
+2026-01-21 19:20:01,398 [INFO]     ob_spread_bps: 3.242011 | ob_depth_log_ratio: 0.477149 | ob_imbalance_z: 1.840442 | price_liq_div: -1.000000
+2026-01-21 19:20:01,398 [INFO]     liq_dominance: 21.021482 | micro_dev_vol: 0.018366 | ob_bid_elasticity: 0.000031 | ob_ask_elasticity: 0.000046
+2026-01-21 19:20:01,398 [INFO]     ob_slope_ratio: 0.676278 | bid_slope_z: 0.034394 | ob_integrity_skew: -0.002423 | bid_integrity_chg: -0.001911
+2026-01-21 19:20:01,398 [INFO]     ask_integrity_chg: 0.000099 | vwap_4h_dist: 3.269356 | vwap_24h_dist: 7.328561 | vol_intraday: 0.468710
+2026-01-21 19:20:01,399 [INFO]     vol_macro: 1.186983 | atr_z: -1.961924 | macro_dist_3d: 0.029368 | macro_dist_1d: 5.576033
+2026-01-21 19:20:01,399 [INFO]     atr_regime: 1.121662 | atr_macro: 1.134404
+2026-01-21 19:20:01,399 [INFO] >>> [END REPORT]
+2026-01-21 19:20:01,451 [INFO] LSTM Context: Gate Weight=0.0720 (LGB vs LSTM)
+2026-01-21 19:20:01,452 [INFO] Preds: Long=0.65 (Dir=0.21), Short=0.63 (Dir=0.58)
+2026-01-21 19:20:01,452 [INFO] WARMUP ACTIVE: Trading disabled until 50 real OB bars reached.
+2026-01-21 19:25:00,867 [INFO] Bar Closing: 2026-01-21 19:20:00
+2026-01-21 19:25:00,873 [INFO] Taker Flow: Buy Vol=441688.00, Total Vol=1926348.00, Ratio=0.2293
+2026-01-21 19:25:01,457 [INFO] >>> [SYSTEM METRICS]
+2026-01-21 19:25:01,458 [INFO]     History:       10054 bars | Continuity: OK (Continuous)
+2026-01-21 19:25:01,458 [INFO]     Processing Lag:1457ms
+2026-01-21 19:25:01,458 [INFO]     Data Quality:  OK
+2026-01-21 19:25:01,459 [INFO]     OB State:      OK (Spread: 0.00010185)
+2026-01-21 19:25:01,459 [INFO]     Warmup Status: 1/50
+2026-01-21 19:25:01,459 [INFO] >>> [ALL MODEL FEATURES]
+2026-01-21 19:25:01,461 [INFO]     close: 0.311900 | taker_buy_ratio: 0.229288 | ob_bid_integrity_mean: 0.002794 | ob_ask_integrity_mean: 0.006170
+2026-01-21 19:25:01,461 [INFO]     natr: 0.006469 | dist_ema_9: -1.209305 | dist_ema_21: -1.004307 | dist_ema_50: 1.141319
+2026-01-21 19:25:01,461 [INFO]     rsi: 46.201791 | bb_percent_b: -0.075154 | ema_9_slope: -0.451718 | ema_21_slope: 0.041695
+2026-01-21 19:25:01,461 [INFO]     ema_50_slope: 0.497750 | taker_buy_z: -1.958978 | vol_z: 0.176710 | ob_imb_trend: 0.147625
+2026-01-21 19:25:01,462 [INFO]     micro_pressure: -0.001315 | bid_depth_chg: 0.219690 | ask_depth_chg: -0.013374 | spread_z: 0.965306
+2026-01-21 19:25:01,462 [INFO]     ob_spread_bps: 3.265463 | ob_depth_log_ratio: 0.689210 | ob_imbalance_z: 2.335564 | price_liq_div: -1.000000
+2026-01-21 19:25:01,462 [INFO]     liq_dominance: 5.211543 | micro_dev_vol: 0.016355 | ob_bid_elasticity: 0.000024 | ob_ask_elasticity: 0.000047
+2026-01-21 19:25:01,462 [INFO]     ob_slope_ratio: 0.500920 | bid_slope_z: -1.068675 | ob_integrity_skew: -0.003376 | bid_integrity_chg: 0.000091
+2026-01-21 19:25:01,463 [INFO]     ask_integrity_chg: 0.001044 | vwap_4h_dist: 1.503284 | vwap_24h_dist: 5.592250 | vol_intraday: 0.454028
+2026-01-21 19:25:01,463 [INFO]     vol_macro: 1.188471 | atr_z: -1.535795 | macro_dist_3d: -1.307277 | macro_dist_1d: 3.920486
+2026-01-21 19:25:01,463 [INFO]     atr_regime: 1.079108 | atr_macro: 1.135407
+2026-01-21 19:25:01,463 [INFO] >>> [END REPORT]
+2026-01-21 19:25:01,487 [INFO] LSTM Context: Gate Weight=0.0460 (LGB vs LSTM)
+2026-01-21 19:25:01,487 [INFO] Preds: Long=0.64 (Dir=0.40), Short=0.61 (Dir=0.39)
+2026-01-21 19:25:01,487 [INFO] WARMUP ACTIVE: Trading disabled until 50 real OB bars reached.
+2026-01-21 19:30:00,827 [INFO] Bar Closing: 2026-01-21 19:25:00
+2026-01-21 19:30:00,831 [INFO] Taker Flow: Buy Vol=634913.00, Total Vol=1561526.00, Ratio=0.4066
+2026-01-21 19:30:01,408 [INFO] >>> [SYSTEM METRICS]
+2026-01-21 19:30:01,409 [INFO]     History:       10055 bars | Continuity: OK (Continuous)
+2026-01-21 19:30:01,409 [INFO]     Processing Lag:1409ms
+2026-01-21 19:30:01,409 [INFO]     Data Quality:  OK
+2026-01-21 19:30:01,410 [INFO]     OB State:      OK (Spread: 0.00010054)
+2026-01-21 19:30:01,410 [INFO]     Warmup Status: 2/50
+2026-01-21 19:30:01,410 [INFO] >>> [ALL MODEL FEATURES]
+2026-01-21 19:30:01,411 [INFO]     close: 0.312300 | taker_buy_ratio: 0.406598 | ob_bid_integrity_mean: 0.003714 | ob_ask_integrity_mean: 0.004916
+2026-01-21 19:30:01,412 [INFO]     natr: 0.006453 | dist_ema_9: -0.809797 | dist_ema_21: -0.733644 | dist_ema_50: 1.288540
+2026-01-21 19:30:01,412 [INFO]     rsi: 47.569700 | bb_percent_b: 0.057576 | ema_9_slope: -0.590046 | ema_21_slope: -0.065800
+2026-01-21 19:30:01,412 [INFO]     ema_50_slope: 0.434036 | taker_buy_z: -0.678977 | vol_z: -0.088859 | ob_imb_trend: 0.226588
+2026-01-21 19:30:01,412 [INFO]     micro_pressure: 0.005882 | bid_depth_chg: 0.050129 | ask_depth_chg: -0.003786 | spread_z: -0.949955
+2026-01-21 19:30:01,413 [INFO]     ob_spread_bps: 3.219378 | ob_depth_log_ratio: 0.741916 | ob_imbalance_z: 2.001881 | price_liq_div: 1.000000
+2026-01-21 19:30:01,413 [INFO]     liq_dominance: 6.529653 | micro_dev_vol: 0.014486 | ob_bid_elasticity: 0.000023 | ob_ask_elasticity: 0.000047
+2026-01-21 19:30:01,413 [INFO]     ob_slope_ratio: 0.475487 | bid_slope_z: -1.303401 | ob_integrity_skew: -0.001202 | bid_integrity_chg: 0.000920
+2026-01-21 19:30:01,413 [INFO]     ask_integrity_chg: -0.001254 | vwap_4h_dist: 1.384737 | vwap_24h_dist: 5.619999 | vol_intraday: 0.452262
+2026-01-21 19:30:01,414 [INFO]     vol_macro: 1.149710 | atr_z: -1.410324 | macro_dist_3d: -1.107766 | macro_dist_1d: 4.095021
+2026-01-21 19:30:01,414 [INFO]     atr_regime: 1.040181 | atr_macro: 1.134109
+2026-01-21 19:30:01,414 [INFO] >>> [END REPORT]
+2026-01-21 19:30:01,435 [INFO] LSTM Context: Gate Weight=0.0439 (LGB vs LSTM)
+2026-01-21 19:30:01,435 [INFO] Preds: Long=0.63 (Dir=0.44), Short=0.61 (Dir=0.39)
+2026-01-21 19:30:01,435 [INFO] WARMUP ACTIVE: Trading disabled until 50 real OB bars reached.
