@@ -78,7 +78,7 @@ class BybitAdapter(ExchangeInterface):
                 raise e
         return func(*args, **kwargs) # Final attempt
 
-    def get_public_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
+    def get_public_klines(self, symbol: str, interval: str, limit: int = 200, start_time: Optional[int] = None) -> List[Dict]:
         try:
             bybit_interval = self._map_interval(interval)
             all_batches = []
@@ -96,6 +96,8 @@ class BybitAdapter(ExchangeInterface):
                 }
                 if end_ts:
                     params["end"] = end_ts
+                if start_time:
+                    params["start"] = start_time
                 
                 response = self._retry_api_call(self.session.get_kline, **params)
                 

@@ -707,7 +707,7 @@ class LiveBot:
         # Check Long
         if p_dir_long > agg_thresh:
             logger.info("Signal: Aggressive Buy")
-            self._execute_trade("Buy", close, atr, "Market")
+            self._execute_trade("Buy", close, atr, "Market", aggressive=True)
         elif p_long > thresh and p_dir_long > dir_thresh:
             logger.info("Signal: Standard Buy (Limit)")
             limit_p = close - (atr * CONF.strategy.base_limit_offset_atr)
@@ -716,14 +716,14 @@ class LiveBot:
         # Check Short
         if p_dir_short > agg_thresh:
             logger.info("Signal: Aggressive Sell")
-            self._execute_trade("Sell", close, atr, "Market")
+            self._execute_trade("Sell", close, atr, "Market", aggressive=True)
         elif p_short > thresh and p_dir_short > dir_thresh:
             logger.info("Signal: Standard Sell (Limit)")
             limit_p = close + (atr * CONF.strategy.base_limit_offset_atr)
             self._execute_trade("Sell", limit_p, atr, "Limit")
 
-    def _execute_trade(self, side, price, atr, order_type, check_debounce=True):
-        logger.info(f"Execute {side} {order_type} @ {price:.2f}")
+    def _execute_trade(self, side, price, atr, order_type, check_debounce=True, aggressive=False):
+        logger.info(f"Execute {side} {order_type} @ {price:.2f} (Aggressive={aggressive})")
         wallet = self.rest_api.get_wallet_balance("USDT")
         if wallet <= 0: return
 
@@ -745,12 +745,16 @@ class LiveBot:
 
         sl_price = 0
         tp_price = 0
+        
+        # Apply 10x multiplier for aggressive signals to match backtest logic
+        tp_mult = 10.0 if aggressive else 1.0
+        
         if side == "Buy":
             sl_price = price - sl_dist
-            tp_price = price + (atr * CONF.strategy.take_profit_atr)
+            tp_price = price + (atr * CONF.strategy.take_profit_atr * tp_mult)
         else:
             sl_price = price + sl_dist
-            tp_price = price - (atr * CONF.strategy.take_profit_atr)
+            tp_price = price - (atr * CONF.strategy.take_profit_atr * tp_mult)
             
         sl_price = self.normalize_price(sl_price)
         tp_price = self.normalize_price(tp_price)

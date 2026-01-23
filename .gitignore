@@ -193,3 +193,5 @@ Bybit_API_specification_docs/
 backup_history_FARTCOINUSDT_5m.csv
 data_keeper.txt
 data_keeper.log
+
+live_trading.log
