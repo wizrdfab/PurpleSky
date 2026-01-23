@@ -12,15 +12,14 @@ import json
 import requests
 
 # --- Configuration ---
-LOG_FILE = "live_trading.log"
-CHECK_INTERVAL = 5  
-MAX_SILENCE_SECONDS = 600 
-MIN_DISK_MB = 500         
-NET_CHECK_HOST = "8.8.8.8" 
+CHECK_INTERVAL = 5
+MAX_SILENCE_SECONDS = 600
+MIN_DISK_MB = 500
+NET_CHECK_HOST = "8.8.8.8"
+MAX_RESTARTS = 100
+RESTART_BACKOFF = 30
 
-MAX_RESTARTS = 5          # Safety limit
-RESTART_BACKOFF = 30      # Seconds to wait before restart
-
+# Common Patterns
 CRITICAL_PATTERNS = [
     "!!! GAP DETECTED !!!",
     "!!! STALE/EMPTY SPREAD !!!",
@@ -29,35 +28,235 @@ CRITICAL_PATTERNS = [
     "Traceback (most recent call last):",
     "ConnectionError",
     "Rate limit hit",
-    "Insufficient margin",
-    "Account blocked",
     "[ERROR]"
 ]
 
-TRADE_PATTERNS = [
-    "Opening Long:",
-    "Opening Short:",
-    "EXECUTION:",
-    "Virtual Trade"
+IGNORE_PATTERNS = [
+    "WinError 10054",
+    "Connection reset",
+    "Connection aborted",
+    "RemoteDisconnected",
+    "Authorization for Unified V5 (Auth) failed"
 ]
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [WATCHDOG] %(message)s'
+    format='%(asctime)s [SUPERVISOR] %(message)s'
 )
-logger = logging.getLogger("Watchdog")
+logger = logging.getLogger("Supervisor")
 
-class BotManager:
-    def __init__(self, cmd_args):
-        self.cmd = [sys.executable, "live_trading.py"] + cmd_args
-        self.process = None
+class ServiceManager:
+    """Manages a single child process (Trader or Keeper)."""
+    
+    def __init__(self, name, script_name, log_file, cmd_args, webhook_url, clean_start=False):
+        self.name = name
+        self.script_name = script_name
+        self.log_path = Path(log_file)
+        self.cmd = [sys.executable, script_name] + cmd_args
+        self.webhook_url = webhook_url
+        self.clean_start = clean_start
+        
+        self.process_pid = None
         self.last_health_report = time.time()
-        self.log_path = Path(LOG_FILE)
         self.restart_count = 0
-        self.webhook_url = self.load_webhook_url()
+        self.file_handle = None # For reading logs
         
         self.ensure_log_exists()
+        
+    def ensure_log_exists(self):
+        if not self.log_path.exists():
+            with open(self.log_path, 'w') as f: f.write("")
 
+    def notify(self, message, is_error=False):
+        if not self.webhook_url: return
+        prefix = f"**[{self.name}]**"
+        if is_error: prefix += " 🚨"
+        try:
+            requests.post(self.webhook_url, json={"content": f"{prefix} {message}"}, timeout=5)
+        except: pass
+
+    def find_existing_process(self):
+        """Finds a process running the specific script with same args."""
+        if sys.platform != "win32": return None
+
+        try:
+            signature_script = self.script_name
+            # We look for the script name in the command line
+            cmd = 'wmic process where "name=\'python.exe\'" get ProcessId,CommandLine /format:csv'
+            result = subprocess.check_output(cmd, shell=True).decode('utf-8', errors='ignore')
+            
+            lines = result.strip().splitlines()
+            for line in lines:
+                parts = line.split(',')
+                if len(parts) < 2: continue
+                pid_str = parts[-1].strip()
+                if not pid_str.isdigit(): continue
+                
+                command_line = line
+                # Match script name AND args (simple check)
+                if signature_script in command_line:
+                    # Avoid self
+                    if int(pid_str) != os.getpid():
+                         return int(pid_str)
+        except Exception as e:
+            logger.error(f"[{self.name}] Discovery Error: {e}")
+        return None
+
+    def is_running(self):
+        if not self.process_pid: return False
+        if sys.platform == "win32":
+            try:
+                cmd = f'tasklist /FI "PID eq {self.process_pid}" /NH'
+                output = subprocess.check_output(cmd, shell=True).decode()
+                return str(self.process_pid) in output
+            except: return False
+        else:
+            try:
+                os.kill(self.process_pid, 0)
+                return True
+            except: return False
+
+    def start(self):
+        # 0. Clean Start (One-off)
+        if self.clean_start:
+            existing = self.find_existing_process()
+            while existing:
+                logger.warning(f"[{self.name}] CLEAN START: Killing existing PID {existing}...")
+                if sys.platform == "win32":
+                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(existing)])
+                else:
+                    try: os.kill(existing, signal.SIGKILL)
+                    except: pass
+                time.sleep(1)
+                existing = self.find_existing_process()
+            self.clean_start = False # Done
+
+        # 1. Try to adopt
+        existing = self.find_existing_process()
+        if existing:
+            self.process_pid = existing
+            logger.info(f"[{self.name}] Adopted PID {existing}")
+            self.notify(f"Adopted active PID {existing}")
+            self.open_log_reader()
+            return
+
+        # 2. Start new detached
+        logger.info(f"[{self.name}] Starting new process...")
+        self.notify("Starting new session")
+        
+        creationflags = 0x00000008 | 0x00000200 # DETACHED + NEW_GROUP
+        
+        try:
+            # We rely on the script's internal FileHandler for logging.
+            # We also redirect stdout/stderr to the file to capture crashes/unhandled exceptions.
+            self.output_file = open(self.log_path, 'a')
+            
+            proc = subprocess.Popen(
+                self.cmd,
+                creationflags=creationflags,
+                close_fds=True,
+                stdout=self.output_file,
+                stderr=subprocess.STDOUT
+            )
+            self.process_pid = proc.pid
+            self.last_health_report = time.time()
+            self.open_log_reader()
+        except Exception as e:
+            logger.error(f"[{self.name}] Start Failed: {e}")
+            if hasattr(self, 'output_file') and self.output_file:
+                self.output_file.close()
+
+    def stop(self, reason):
+        logger.warning(f"[{self.name}] Stopping PID {self.process_pid}: {reason}")
+        self.notify(f"Stopping ({reason})", is_error=True)
+        
+        if self.process_pid:
+            if sys.platform == "win32":
+                subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.process_pid)])
+            else:
+                try: os.kill(self.process_pid, signal.SIGKILL)
+                except: pass
+        
+        self.process_pid = None
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
+            
+        if hasattr(self, 'output_file') and self.output_file:
+            try: self.output_file.close()
+            except: pass
+            self.output_file = None
+
+    def open_log_reader(self):
+        if self.file_handle: self.file_handle.close()
+        try:
+            self.file_handle = open(self.log_path, 'r')
+            self.file_handle.seek(0, os.SEEK_END)
+        except Exception as e:
+            logger.error(f"[{self.name}] Log Open Error: {e}")
+
+    def tick(self, network_ok, disk_ok):
+        """Called every loop iteration."""
+        # 1. Ensure Running
+        if not self.process_pid or not self.is_running():
+            if self.process_pid:
+                self.stop("Process Vanished")
+            self.start()
+            return
+
+        # 2. Environment Checks (Global)
+        if not network_ok:
+            # We might treat net loss differently for Trader vs Keeper?
+            # For now, strict: kill and restart when net back
+            self.stop("Network Lost")
+            return
+
+        if not disk_ok:
+            self.stop("Disk Full")
+            return
+
+        # 3. Read Logs
+        if not self.file_handle: return
+
+        try:
+            lines = self.file_handle.readlines() # Read all new lines
+            if not lines:
+                # Silence Check
+                if (time.time() - self.last_health_report) > MAX_SILENCE_SECONDS:
+                    self.stop(f"Frozen ({MAX_SILENCE_SECONDS}s silence)")
+                return
+
+            for line in lines:
+                # ECHO TO CONSOLE (Capture Output)
+                print(f"[{self.name}] {line.strip()}")
+                
+                if ">>> [SYSTEM METRICS]" in line:
+                    self.last_health_report = time.time()
+                
+                if any(p in line for p in IGNORE_PATTERNS): continue
+                
+                for pattern in CRITICAL_PATTERNS:
+                    if pattern in line:
+                        self.stop(f"Log Error: {line.strip()}")
+                        return
+        except Exception as e:
+            logger.error(f"[{self.name}] Log Read Error: {e}")
+
+
+class Supervisor:
+    def __init__(self, cmd_args, clean_start=False):
+        webhook_url = self.load_webhook_url()
+        
+        # Initialize Services
+        self.trader = ServiceManager(
+            "TRADER", "live_trading.py", "live_trading.log", 
+            cmd_args, webhook_url, clean_start
+        )
+        self.keeper = ServiceManager(
+            "KEEPER", "data_keeper.py", "data_keeper.log", 
+            cmd_args, webhook_url, clean_start
+        )
+        
     def load_webhook_url(self):
         url = os.getenv("DISCORD_WEBHOOK_URL")
         if not url:
@@ -68,175 +267,43 @@ class BotManager:
             except: pass
         return url
 
-    def notify_discord(self, message, is_error=False):
-        if not self.webhook_url:
-            return
-        
-        prefix = "🚨 **[CRITICAL]**" if is_error else "📈 **[INFO]**"
-        payload = {
-            "content": f"{prefix} {message}"
-        }
-        try:
-            requests.post(self.webhook_url, json=payload, timeout=5)
-        except Exception as e:
-            logger.error(f"Failed to send Discord notification: {e}")
-
-    def ensure_log_exists(self):
-        if not self.log_path.exists():
-            with open(self.log_path, 'w') as f: f.write("")
-        else:
-            with open(self.log_path, 'w') as f: f.write("")
-
     def check_network(self):
-        # 1. General Internet Check
         try:
             socket.setdefaulttimeout(3)
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect((NET_CHECK_HOST, 53))
-        except:
-            return False
-            
-        # 2. Exchange Reachability Check
-        try:
-            # Check if Bybit API is reachable
-            socket.gethostbyname("api.bybit.com")
             return True
-        except:
-            logger.warning("Internet is UP, but api.bybit.com is UNREACHABLE.")
-            return False
+        except: return False
 
     def check_disk(self):
         total, used, free = shutil.disk_usage(".")
         return (free // (2**20)) > MIN_DISK_MB
 
-    def start_bot(self):
-        self.repair_environment() # --- ACTIVE REPAIR ---
-        self.ensure_log_exists()
-        logger.info(f"Starting Bot (Attempt {self.restart_count + 1}/{MAX_RESTARTS}): {' '.join(self.cmd)}")
-        self.notify_discord(f"Starting Bot (Attempt {self.restart_count + 1}/{MAX_RESTARTS})")
-        self.process = subprocess.Popen(self.cmd)
-        self.last_health_report = time.time()
-
-    def repair_environment(self):
-        """Actively fix common issues before starting the bot."""
-        logger.info("Running Active Repair Engine...")
+    def run(self):
+        logger.info("Supervisor Started. Monitoring Trader & Keeper...")
         
-        # 1. Zombie Cleanup (Force kill any leaked bot processes)
-        if sys.platform == "win32":
-            # Find and kill processes running live_trading.py
-            subprocess.run(["taskkill", "/F", "/IM", "python.exe", "/FI", "WINDOWTITLE eq live_trading.py*"], 
-                           capture_output=True, shell=True)
-        
-        # 2. Disk Salvage (If low, truncate the log file)
-        if not self.check_disk():
-            logger.warning("Disk space low. Truncating log file to salvage space...")
-            if self.log_path.exists():
-                with open(self.log_path, 'w') as f: f.write("--- DISK SALVAGE PERFORMED ---\n")
-
-        # 3. State Integrity (Check for corrupted JSON)
-        vpm_file = Path("virtual_positions.json")
-        if vpm_file.exists():
-            try:
-                import json
-                with open(vpm_file, 'r') as f:
-                    json.load(f)
-            except Exception as e:
-                logger.error(f"CORRUPTION DETECTED in {vpm_file}: {e}. Repairing...")
-                bak_file = vpm_file.with_suffix(".json.corrupt_bak")
-                vpm_file.replace(bak_file)
-                logger.info(f"Corrupted state moved to {bak_file}. Bot will reconcile from exchange.")
-
-    def stop_bot(self, reason):
-        if self.process:
-            logger.error(f"EMERGENCY STOP: {reason}")
-            self.notify_discord(f"EMERGENCY STOP: {reason}", is_error=True)
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-            logger.info("Bot process terminated.")
-
-    def wait_for_recovery(self):
-        """Wait until environment is healthy again."""
-        logger.info("Entering Recovery Mode. Checking environment...")
-        self.notify_discord("⚠️ Bot entered Recovery Mode. Waiting for healthy environment...")
         while True:
+            # 1. Global Checks
             net_ok = self.check_network()
             disk_ok = self.check_disk()
             
-            if net_ok and disk_ok:
-                logger.info("Environment is HEALTHY. Preparing to restart...")
-                self.notify_discord("✅ Environment recovered. Restarting bot soon.")
-                time.sleep(RESTART_BACKOFF)
-                return True
+            # 2. Tick Services
+            self.trader.tick(net_ok, disk_ok)
+            self.keeper.tick(net_ok, disk_ok)
             
-            logger.warning(f"Recovery pending: Network={'OK' if net_ok else 'DOWN'}, Disk={'OK' if disk_ok else 'LOW'}")
-            time.sleep(30)
-
-    def monitor(self):
-        while self.restart_count < MAX_RESTARTS:
-            self.start_bot()
-            
-            # Inner monitor loop
-            stop_reason = None
-            try:
-                with open(self.log_path, 'r') as f:
-                    f.seek(0, os.SEEK_END)
-                    
-                    while True:
-                        if self.process.poll() is not None:
-                            stop_reason = "Bot process died unexpectedly."
-                            break
-
-                        if not self.check_network():
-                            stop_reason = "Network Connectivity Lost"
-                            break
-
-                        if not self.check_disk():
-                            stop_reason = "Disk Space Critical"
-                            break
-
-                        line = f.readline()
-                        if line:
-                            if ">>> [SYSTEM METRICS]" in line:
-                                self.last_health_report = time.time()
-                            
-                            for pattern in CRITICAL_PATTERNS:
-                                if pattern in line:
-                                    stop_reason = f"Anomaly in logs: {line.strip()}"
-                                    break
-                            
-                            # 2. Trade Notifications
-                            for pattern in TRADE_PATTERNS:
-                                if pattern in line:
-                                    self.notify_discord(f"Trade Event: {line.strip()}")
-                            
-                            if stop_reason: break
-                        else:
-                            silence = time.time() - self.last_health_report
-                            if silence > MAX_SILENCE_SECONDS:
-                                stop_reason = f"Bot frozen (No heartbeat for {silence:.0f}s)"
-                                break
-                            time.sleep(CHECK_INTERVAL)
-                            
-            except Exception as e:
-                stop_reason = f"Watchdog Error: {e}"
-
-            # If we reached here, we need to stop and potentially restart
-            self.stop_bot(stop_reason)
-            self.restart_count += 1
-            
-            if self.restart_count < MAX_RESTARTS:
-                self.wait_for_recovery()
-            else:
-                logger.critical("MAX RESTARTS REACHED. Watchdog exiting. Manual intervention required.")
-                self.notify_discord("💀 **MAX RESTARTS REACHED.** Watchdog exiting. Manual intervention required!", is_error=True)
-                break
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python watchdog.py [live_trading_args...]")
+        print("Usage: python watchdog.py [shared_args...] [--start-clean]")
         sys.exit(1)
-    manager = BotManager(sys.argv[1:])
-    manager.monitor()
+    
+    args = sys.argv[1:]
+    clean_start = False
+    
+    if "--start-clean" in args:
+        clean_start = True
+        args.remove("--start-clean")
+    
+    sup = Supervisor(args, clean_start=clean_start)
+    sup.run()

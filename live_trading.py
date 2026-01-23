@@ -1,3 +1,20 @@
+"""
+Copyright (C) 2026 wizrdfab
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+"""
+
 import time
 import logging
 import argparse
@@ -8,6 +25,7 @@ import traceback
 import signal
 import sys
 import uuid
+import os
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -71,7 +89,8 @@ class LiveBot:
         
         # Runtime Flags
         self.running = True
-        self.warmup_bars = 50 
+        self.warmup_bars = max(50, CONF.model.sequence_length)
+        logger.info(f"Warmup configured: {self.warmup_bars} bars required (SeqLen={CONF.model.sequence_length})")
         self.real_ob_bars_count = 0
         self.pending_limits = {} # {oid: {'entry_time': ts, 'side': ..., 'size': ...}}
         
@@ -118,6 +137,31 @@ class LiveBot:
 
     def _load_model_manager(self, model_dir):
         path = Path(model_dir)
+        
+        # --- DYNAMIC PARAMETER LOADING ---
+        params_file = path / "params.json"
+        if params_file.exists():
+            try:
+                with open(params_file, 'r') as f:
+                    params = json.load(f)
+                logger.info(f"Applying optimized parameters from {params_file}")
+                
+                # Model Thresholds
+                CONF.model.model_threshold = params.get('model_threshold', CONF.model.model_threshold)
+                CONF.model.direction_threshold = params.get('direction_threshold', CONF.model.direction_threshold)
+                CONF.model.aggressive_threshold = params.get('aggressive_threshold', CONF.model.aggressive_threshold)
+                
+                # Strategy Offsets
+                CONF.strategy.take_profit_atr = params.get('take_profit_atr', CONF.strategy.take_profit_atr)
+                CONF.strategy.stop_loss_atr = params.get('stop_loss_atr', CONF.strategy.stop_loss_atr)
+                CONF.strategy.base_limit_offset_atr = params.get('limit_offset_atr', CONF.strategy.base_limit_offset_atr)
+                
+                logger.info(f"  > Aggressive Threshold: {CONF.model.aggressive_threshold:.4f}")
+                logger.info(f"  > Take Profit ATR:      {CONF.strategy.take_profit_atr:.4f}")
+                logger.info(f"  > Stop Loss ATR:        {CONF.strategy.stop_loss_atr:.4f}")
+            except Exception as e:
+                logger.error(f"Failed to load params.json: {e}. Using defaults.")
+
         mm = ModelManager(CONF.model)
         mm.feature_cols = joblib.load(path / "features.pkl")
         
@@ -149,14 +193,100 @@ class LiveBot:
         self.running = False
         self.ws_api.disconnect()
 
+    def _calculate_warmup_status(self):
+        """
+        Calculates the number of valid, continuous, and recent bars at the end of history.
+        Used to determine if the bot is 'warm' upon restart.
+        """
+        if self.bars.empty:
+            return 0
+        
+        # 1. Check recency of last bar
+        last_ts = int(self.bars.iloc[-1]['timestamp'])
+        now_ts = int(time.time() * 1000)
+        # We allow a gap of up to 2 timeframes. If the last bar is older, history is stale.
+        # e.g., if TF=5m, and last bar is 15m ago, we need to restart warmup.
+        max_lag = self.tf_seconds * 1000 * 2
+        if (now_ts - last_ts) > max_lag:
+            logger.info(f"History Stale: Last bar {datetime.fromtimestamp(last_ts/1000)} is > {max_lag/1000}s old. Resetting warmup.")
+            return 0
+
+        # 2. Iterate backwards to find continuous valid sequence
+        count = 0
+        expected_diff = self.tf_seconds * 1000
+        
+        # Check columns existence
+        if 'ob_spread_mean' not in self.bars.columns:
+            return 0
+            
+        timestamps = self.bars['timestamp'].values
+        # We consider 'ob_spread_mean' > 0 as a proxy for valid OB data
+        ob_spreads = self.bars['ob_spread_mean'].values
+        
+        # Iterate backwards
+        for i in range(len(self.bars) - 1, -1, -1):
+            # Check Validity (OB Data presence)
+            if ob_spreads[i] <= 0:
+                logger.debug(f"Warmup Break: Bar {i} has invalid OB data.")
+                break 
+            
+            # Check Continuity (with next bar, which is i+1)
+            # The loop goes i, i-1... so i+1 is the *later* bar we just checked (or the end)
+            if i < len(self.bars) - 1:
+                diff = timestamps[i+1] - timestamps[i]
+                if diff != expected_diff:
+                    logger.debug(f"Warmup Break: Gap detected between {i} and {i+1} (Diff={diff}).")
+                    break
+            
+            count += 1
+            if count >= self.warmup_bars:
+                break
+                
+        return count
+
     def _load_history(self):
         if self.history_file.exists():
             logger.info("Loading history from disk...")
             self.bars = pd.read_csv(self.history_file)
             if not self.bars.empty:
                 self.last_bar_time = int(self.bars.iloc[-1]['timestamp'])
+                self.real_ob_bars_count = self._calculate_warmup_status()
+                logger.info(f"Warmup Status: {self.real_ob_bars_count}/{self.warmup_bars} valid continuous bars restored.")
         else:
-            logger.info("No history file found. Fetching 10,000 bars from exchange...")
+            logger.info("No main history file found.")
+            self.bars = pd.DataFrame()
+            self.real_ob_bars_count = 0
+
+        # --- BACKUP RESCUE LOGIC ---
+        # If we are cold (not enough warmup data), try to rescue from the Keeper's backup file
+        if self.real_ob_bars_count < self.warmup_bars:
+            backup_file = Path(f"backup_history_{self.symbol}_{self.timeframe}.csv")
+            if backup_file.exists():
+                logger.info(f"Warmup insufficient ({self.real_ob_bars_count}). Attempting to merge backup file: {backup_file}")
+                try:
+                    backup_bars = pd.read_csv(backup_file)
+                    if not backup_bars.empty:
+                        # Merge Strategy: Concatenate -> Drop Duplicates -> Sort
+                        combined = pd.concat([self.bars, backup_bars], ignore_index=True)
+                        combined = combined.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
+                        
+                        self.bars = combined
+                        logger.info(f"Merged backup data. Total bars: {len(self.bars)}")
+                        
+                        # Recalculate status
+                        if not self.bars.empty:
+                            self.last_bar_time = int(self.bars.iloc[-1]['timestamp'])
+                            self.real_ob_bars_count = self._calculate_warmup_status()
+                            logger.info(f"New Warmup Status after merge: {self.real_ob_bars_count}/{self.warmup_bars}")
+                            
+                            # Persist the merge immediately to main file
+                            self.bars.to_csv(self.history_file, index=False)
+                except Exception as e:
+                    logger.error(f"Failed to merge backup file: {e}")
+
+        # Fallback: Download from Exchange if still empty
+        if self.bars.empty:
+            logger.info("History buffer empty. Fetching 10,000 bars from exchange...")
             klines = self.rest_api.get_public_klines(self.symbol, self.timeframe, limit=10000)
             if klines:
                 self.bars = pd.DataFrame(klines)
@@ -168,6 +298,62 @@ class LiveBot:
                 logger.warning("Exchange returned no history. Starting with empty buffer.")
                 self.bars = pd.DataFrame()
         
+        # --- AUTO-BACKFILL LOGIC ---
+        # Close the gap between the last saved bar and NOW
+        if not self.bars.empty:
+            last_ts = int(self.bars.iloc[-1]['timestamp'])
+            now_ms = int(time.time() * 1000)
+            # Gap threshold: 2 * timeframe (allow 1 missing bar before triggering, to be safe)
+            gap_threshold = self.tf_seconds * 1000 * 2
+            
+            if (now_ms - last_ts) > gap_threshold:
+                logger.info(f"Gap Detected: Last bar {datetime.fromtimestamp(last_ts/1000)} is old. Attempting Auto-Backfill...")
+                
+                # Fetch missing data
+                # Bybit API usually takes startTime (ms). We want data AFTER the last bar.
+                start_fetch = last_ts + (self.tf_seconds * 1000)
+                
+                # We limit to 1000 bars per request (Bybit limit). If gap is huge, we might need loop,
+                # but for now, let's grab the most recent 1000 to close the immediate gap or reset if too old.
+                # If gap > 1000 bars, we probably shouldn't be blindly appending anyway (market structure changed).
+                
+                new_klines = self.rest_api.get_public_klines(self.symbol, self.timeframe, limit=1000, start_time=start_fetch)
+                
+                if new_klines:
+                    logger.info(f"Backfill: Downloaded {len(new_klines)} missing bars.")
+                    df_new = pd.DataFrame(new_klines)
+                    
+                    # Initialize missing columns with 0
+                    for col in self.model_manager.feature_cols:
+                        if col not in df_new.columns and col not in ['open','high','low','close','volume','timestamp']:
+                            df_new[col] = 0.0
+                            
+                    # Append
+                    self.bars = pd.concat([self.bars, df_new], ignore_index=True)
+                    self.bars = self.bars.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
+                    
+                    # RE-CALCULATE FEATURES FOR THE NEW TAIL
+                    # We need to recalculate features for at least the new bars + lookback
+                    # Simplest way: Recalculate the last chunk
+                    recalc_size = len(new_klines) + 500 # 500 is buffer for EMAs
+                    if recalc_size > len(self.bars): recalc_size = len(self.bars)
+                    
+                    subset = self.bars.iloc[-recalc_size:].copy()
+                    subset_feats = self.feature_engine.calculate_features(subset)
+                    
+                    # Update the main dataframe
+                    self.bars.update(subset_feats)
+                    
+                    # Save immediately (Atomic)
+                    self._save_history_atomic()
+                    logger.info("Backfill Complete: History updated and saved.")
+                    
+                    # Recalculate status
+                    self.last_bar_time = int(self.bars.iloc[-1]['timestamp'])
+                    self.real_ob_bars_count = self._calculate_warmup_status()
+                else:
+                    logger.warning("Backfill: Exchange returned no data for the gap.")
+
         if not self.bars.empty:
             self.bars['timestamp'] = self.bars['timestamp'].astype(int)
             
@@ -187,7 +373,58 @@ class LiveBot:
                     logger.info(f"History Continuity Check: OK (Checked {len(self.bars)} bars)")
             # -------------------------------------
 
+    def check_consistency(self):
+        try:
+            vpm_net = self.vpm.get_net_position()
+            
+            positions = self.rest_api.get_positions(self.symbol)
+            actual_long = 0.0
+            actual_short = 0.0
+            
+            if positions:
+                for p in positions:
+                    idx = int(p.get('position_idx', 0))
+                    sz = float(p.get('size', 0))
+                    side = p.get('side', '')
+                    
+                    if idx == 1: actual_long = sz
+                    elif idx == 2: actual_short = sz
+                    elif idx == 0:
+                        if side == 'Buy': actual_long = sz
+                        elif side == 'Sell': actual_short = sz
+            
+            exch_net = actual_long - actual_short
+            
+            if abs(vpm_net - exch_net) > 0.0001:
+                 logger.warning(f"!!! STARTUP INCONSISTENCY DETECTED !!!")
+                 logger.warning(f"    VPM Net: {vpm_net:.4f} | Exchange Net: {exch_net:.4f}")
+                 logger.warning(f"    The bot will attempt to reconcile (trade) to match VPM state.")
+            else:
+                 logger.info(f"Startup Consistency Check: OK (Net: {vpm_net:.4f})")
+        except Exception as e:
+            logger.error(f"Failed consistency check: {e}")
+
+    def _save_history_atomic(self):
+        """
+        Saves history to a temp file first, then atomically renames it.
+        Prevents file corruption if power loss occurs during write.
+        """
+        try:
+            temp_file = self.history_file.with_suffix('.tmp')
+            self.bars.to_csv(temp_file, index=False)
+            
+            # Force OS to flush to disk
+            with open(temp_file, 'a') as f:
+                f.flush()
+                os.fsync(f.fileno())
+                
+            # Atomic replacement
+            temp_file.replace(self.history_file)
+        except Exception as e:
+            logger.error(f"Failed to save history atomically: {e}")
+
     def run(self):
+        self.check_consistency()
         self._load_history()
         
         # Connect WS
@@ -198,6 +435,8 @@ class LiveBot:
         self.ws_api.subscribe_private(self.on_position_update, self.on_execution_update)
         
         logger.info("Starting Main Loop...")
+        
+        last_maintenance = time.time()
         
         while self.running:
             try:
@@ -215,10 +454,19 @@ class LiveBot:
                 ws_kline = self.ws_api.latest_kline # {'start': ..., 'confirm': bool}
                 if ws_kline and ws_kline.get('confirm'):
                     bar_start = int(ws_kline['start'])
+                    now_ms = int(time.time() * 1000)
                     
-                    if bar_start > self.last_processed_bar:
+                    # Sanity Check: Future > 1 hour
+                    if bar_start > (now_ms + 3600000):
+                        logger.warning(f"Ignored future bar timestamp: {bar_start}")
+                    elif bar_start > self.last_processed_bar:
                         self.on_bar_close(ws_kline)
                         self.last_processed_bar = bar_start
+                
+                # 3. Fast Loop Maintenance (SL/TP Check)
+                if time.time() - last_maintenance > 1.0:
+                    self.manage_exits()
+                    last_maintenance = time.time()
                 
                 time.sleep(0.1) # Fast loop
                 
@@ -256,20 +504,50 @@ class LiveBot:
                 side = item['side']
                 price = float(item['execPrice'])
                 qty = float(item['execQty'])
+                oid = item.get('orderId')
                 
-                # Fallback SL/TP since we don't have ATR access here easily
-                # Assuming 1% SL, 2% TP
-                sl_dist = price * 0.01
-                if side == "Buy":
-                    sl = price - sl_dist
-                    tp = price + (sl_dist * 2)
-                else:
-                    sl = price + sl_dist
-                    tp = price - (sl_dist * 2)
+                # Retrieve intended SL/TP from pending info
+                sl, tp = 0.0, 0.0
+                if oid in self.pending_limits:
+                    sl = self.pending_limits[oid].get('sl', 0.0)
+                    tp = self.pending_limits[oid].get('tp', 0.0)
+                
+                # Fallback SL/TP if missing (e.g. restart)
+                if sl == 0 or tp == 0:
+                    logger.warning(f"Limit Fill {oid} missing stored SL/TP. Using 1% fallback.")
+                    sl_dist = price * 0.01
+                    if side == "Buy":
+                        sl = price - sl_dist
+                        tp = price + (sl_dist * 2)
+                    else:
+                        sl = price + sl_dist
+                        tp = price - (sl_dist * 2)
                     
-                self.vpm.add_trade(side, price, qty, sl, tp, check_debounce=False)
+                success = self.vpm.add_trade(side, price, qty, sl, tp, check_debounce=False)
+                if not success:
+                    # Attempt Merge (Partial Fill Handling)
+                    if self.vpm.trades:
+                        last_t = self.vpm.trades[-1]
+                        if last_t.side == side:
+                             logger.info(f"Merging partial fill {qty} into Trade {last_t.trade_id}")
+                             # Weighted Average Price
+                             old_val = last_t.size * last_t.entry_price
+                             new_val = qty * price
+                             last_t.size += qty
+                             last_t.entry_price = (old_val + new_val) / last_t.size
+                             self.vpm.save()
+                             self.reconcile_positions()
+                        else:
+                             logger.warning("Partial fill rejected and could not merge (Side Mismatch).")
+                    else:
+                         logger.warning("Partial fill rejected and VPM empty (Unknown State).")
 
     def on_bar_close(self, ws_kline):
+        required_keys = ['start', 'open', 'high', 'low', 'close', 'volume']
+        if not ws_kline or not all(k in ws_kline for k in required_keys):
+            logger.error(f"Malformed kline data received: {ws_kline}")
+            return
+
         logger.info(f"Bar Closing: {datetime.fromtimestamp(int(ws_kline['start'])/1000)}")
         
         # 1. Finalize OB Stats
@@ -318,11 +596,17 @@ class LiveBot:
         # This prevents the scaler overflow that leads to 'nan' predictions.
         df_feats = df_feats.replace([np.inf, -np.inf], 0).fillna(0)
         
+        # Ensure all feature columns exist in self.bars before update
+        # (Fixes bug where first-ever bar drops features because update() doesn't add columns)
+        for col in df_feats.columns:
+            if col not in self.bars.columns:
+                self.bars[col] = 0.0
+
         # Update self.bars with calculated features so they are saved to CSV
         self.bars.update(df_feats)
         
-        # Save History
-        self.bars.to_csv(self.history_file, index=False)
+        # Save History Atomically
+        self._save_history_atomic()
         
         current_row = df_feats.iloc[[-1]]
         
@@ -495,7 +779,9 @@ class LiveBot:
             if 'order_id' in res:
                 self.pending_limits[res['order_id']] = {
                     'entry_time': time.time(),
-                    'link_id': oid
+                    'link_id': oid,
+                    'sl': sl_price,
+                    'tp': tp_price
                 }
                 logger.info(f"DEBUG: Added to pending_limits. Count: {len(self.pending_limits)}")
             else:
@@ -516,16 +802,41 @@ class LiveBot:
             del self.pending_limits[oid]
             
     def manage_exits(self):
-        # Time Exits (VPM)
+        # 1. Time Exits (VPM)
         max_duration = CONF.strategy.max_holding_bars * self.tf_seconds
-        closed = self.vpm.check_time_exits(int(time.time()), max_duration)
-        if closed:
-            logger.info(f"Time Exits triggered: {closed}. Reconciling.")
+        closed_time = self.vpm.check_time_exits(int(time.time()), max_duration)
+        
+        # 2. Price Exits (Software SL/TP Sync)
+        closed_price = []
+        current_price = self.rest_api.get_current_price(self.symbol)
+        if current_price > 0:
+            closed_price = self.vpm.prune_dead_trades(current_price)
+            
+        if closed_time or closed_price:
+            logger.info(f"Exits triggered (Time={len(closed_time)}, Price={len(closed_price)}). Reconciling.")
             self.reconcile_positions()
 
     def reconcile_positions(self):
         logger.info("Reconciling Positions (Hedge Mode)...")
         
+        # Safety: Check Spread
+        try:
+            snap = self.local_book.get_snapshot(limit=1)
+            if not snap or not snap.get('bids') or not snap.get('asks'):
+                logger.warning("CRITICAL: Orderbook Empty/Unavailable! PAUSING EXECUTION.")
+                return
+
+            best_bid = float(snap['bids'][0][0])
+            best_ask = float(snap['asks'][0][0])
+            if best_bid > 0:
+                spread = (best_ask - best_bid) / best_bid
+                if spread > CONF.live.max_spread_pct:
+                    logger.warning(f"CRITICAL: High Spread {spread:.2%} > {CONF.live.max_spread_pct:.2%}. PAUSING EXECUTION.")
+                    return
+        except Exception as e:
+            logger.error(f"Spread check failed: {e}")
+            return # Safety first
+
         # 1. Calculate Targets from Virtual Trades
         target_long = 0.0
         target_short = 0.0
@@ -650,13 +961,6 @@ class LiveBot:
                 position_idx=p_idx,
                 trigger_direction=t_dir
             )
-
-        # Prune Dead Trades
-        if current_price > 0:
-            closed_ids = self.vpm.prune_dead_trades(current_price)
-            if closed_ids:
-                logger.info(f"Software SL/TP triggered for {closed_ids}. Re-running reconcile.")
-                self.reconcile_positions()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

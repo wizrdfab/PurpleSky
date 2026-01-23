@@ -1,6 +1,10 @@
 # 🌌 PurpleSky
 
-PurpleSky is a state-of-the-art automated trading system designed for high-frequency crypto futures trading on Bybit. It leverages a hybrid machine learning architecture that combines Gradient Boosting (LightGBM) with Deep Learning (LSTM) and an intelligent Gating Network to navigate complex market microstructures.
+PurpleSky is a state-of-the-art automated trading system made 100% by AI and me, designed for high-frequency crypto futures trading (currently there is a well developed connector for Bybit, but it has the needed abstraction to make a connector for any other exchange). It leverages a hybrid machine learning architecture that combines Gradient Boosting (LightGBM) with Deep Learning (LSTM) and an intelligent Gating Network to navigate complex market microstructures.
+
+There is a strategy already the model FARTCOINUSDT deploys correctly in Bybit (may also work in Binance though if you train on Bybit data and deploy on Binance), however you can make any strategy you want; it has quite a bit of flexibility, specially with the direction models and the LTSM model :)
+
+If you want a different one out of the box, you may try changing the TP ATR search space when doing optuna optimization, and you may also remove the drawdown penalty on the score function for the trials ;)
 
 ## 🚀 Key Features
 
@@ -95,7 +99,7 @@ python tests/test_live_accumulation.py
 **Business Inquiries**: [contact@purple-sky.online](mailto:contact@purple-sky.online)
 
 ### Community
-Feel free to contact me in case you need help or you just want to have a chat! I'm always willing to help if you need, and I would be happy to teach you how to train your own models! Feel free to contact me anytime.
+Feel free to contact me in case you need help or you just want to have a chat! I'm always willing to help if you need, and I would be happy to help train your own models! Feel free to contact me anytime.
 
 - **Twitter/X**: [@Fabb_998](https://twitter.com/Fabb_998)
 - **Telegram**: [Join the Channel](https://t.me/PurpleSkymm)
@@ -105,13 +109,15 @@ Feel free to contact me in case you need help or you just want to have a chat! I
 
 ## ❤️ Support the Project
 
-If you find this project useful, consider making a donation or signing up with my referral code in Bybit:
+If you find this project useful, consider making a donation or signing up with my referral code in Binance:
 
 - **Bitcoin (BTC)**: `1PucNiXsUCzfrMqUGCPfwgdyE3BL8Xnrrp`
 - **Ethereum (ETH)**: `0x58ef00f47d6e94dfc486a2ed9b3dd3cfaf3c9714`
-- **Bybit Referral**: [Create an account using my link](https://www.bybit.com/invite?ref=14VP14Z) (Referral Code: `14VP14Z`)
+- **Binance Referral** [Create an account using my link](https://accounts.binance.com/register?ref=1204138773) (Referral Code: '1204138773')
 
 Thanks! <3
+
+Special aknowledgements to the guys from this paper I got some ideas from: https://arxiv.org/html/2505.23084v1
 
 ---
 *Disclaimer: Trading cryptocurrencies involves significant risk. PurpleSky is provided for educational purposes only. Use it at your own risk.*

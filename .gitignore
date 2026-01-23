@@ -190,3 +190,6 @@ key_profiles_local.json
 keys.json
 history_FARTCOINUSDT_5m.csv
 Bybit_API_specification_docs/
+backup_history_FARTCOINUSDT_5m.csv
+data_keeper.txt
+data_keeper.log
