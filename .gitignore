@@ -195,3 +195,5 @@ data_keeper.txt
 data_keeper.log
 
 live_trading.log
+
+docs/refactoring_plan.md

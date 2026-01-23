@@ -59,7 +59,7 @@ class DataKeeperBot(LiveBot):
         Override: Do not execute trades.
         This method is called after every bar close and feature save.
         """
-        logger.info(f"✓ Data synced & features updated. (History file: {self.history_file})")
+        logger.info(f"[OK] Data synced & features updated. (History file: {self.history_file})")
 
     def reconcile_positions(self):
         """Override: Do not sync positions with exchange."""
