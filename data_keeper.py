@@ -52,6 +52,12 @@ class DataKeeperBot(LiveBot):
         pass
 
     def manage_exits(self):
+        # TODO: Replace manual sleep with a more robust precision timer or 
+        # asynchronous scheduler to ensure perfectly consistent sampling 
+        # regardless of OS process prioritization.
+        # A robust fixed cross platform compatible sampling may be needed to 
+        # gather enough snapshots and in a similar way to live_trading.py.
+        
         # We sleep briefly to simulate the Trader's network lag.
         # This averages the loop speed to ~9Hz (2700 snapshots/bar).
         time.sleep(0.11)
