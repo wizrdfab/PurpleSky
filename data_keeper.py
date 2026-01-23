@@ -39,6 +39,20 @@ class DataKeeperBot(LiveBot):
         # Override history file to prevent write conflicts with the main bot
         self.history_file = Path(f"backup_history_{self.symbol}_{self.timeframe}.csv")
         logger.info(f"Keeper initialized. Saving to backup file: {self.history_file}")
+        
+        # Disable warmup restriction so execute_logic (and its log) runs every bar
+        self.warmup_bars = 0
+        
+        # Permanently silence LiveBot logger to prevent verbose logs and crashes
+        logging.getLogger("LiveTrading").setLevel(logging.CRITICAL)
+
+    def configure_exchange(self):
+        """Override: Do not configure exchange (leverage, position mode)."""
+        pass
+
+    def subscribe_private_channels(self):
+        """Override: Do not subscribe to private channels."""
+        pass
 
     def execute_logic(self, p_long, p_short, p_dir_long, p_dir_short, close, atr):
         """
@@ -61,6 +75,13 @@ class DataKeeperBot(LiveBot):
         # We sleep briefly to simulate the Trader's network lag.
         # This averages the loop speed to ~9Hz (2700 snapshots/bar).
         time.sleep(0.11)
+
+        # Heartbeat to prevent supervisor freeze (every 5 minutes)
+        now = time.time()
+        if not hasattr(self, 'last_heartbeat'): self.last_heartbeat = now
+        if now - self.last_heartbeat > 300:
+            logger.info(f"Heartbeat: Monitoring {self.symbol} | History: {len(self.bars)} bars.")
+            self.last_heartbeat = now
     
     def check_order_expiry(self):
         """Override: Do not cancel orders."""
@@ -75,16 +96,8 @@ class DataKeeperBot(LiveBot):
         pass
 
     def on_bar_close(self, ws_kline):
-        """Override: Suppress verbose info logs from the parent class."""
-        # The parent methods use the 'LiveTrading' logger. We silence it temporarily.
-        lt_logger = logging.getLogger("LiveTrading")
-        previous_level = lt_logger.level
-        lt_logger.setLevel(logging.WARNING)
-        
-        try:
-            super().on_bar_close(ws_kline)
-        finally:
-            lt_logger.setLevel(previous_level)
+        """Override: Just call super logic (warmup disabled in init, logging silenced in init)."""
+        super().on_bar_close(ws_kline)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Data Keeper - Maintains history file using LiveBot logic.")

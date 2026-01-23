@@ -107,16 +107,22 @@ class LiveBot:
         logger.info(f"Instrument Info: {self.instrument_info}")
         
         # --- AUTO-CONFIGURATION ---
-        logger.info("Auto-configuring exchange settings...")
-        self.rest_api.switch_position_mode(self.symbol, mode=3) # Force Hedge Mode
-        self.rest_api.set_leverage(self.symbol, leverage=10.0) # Default to 10x safety
-        
-        # Check Clock Drift
+        self.configure_exchange()
         self.rest_api.check_clock_drift()
         
         # Graceful Shutdown
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
+
+    def configure_exchange(self):
+        """Configure account-level settings like leverage and position mode."""
+        logger.info("Auto-configuring exchange settings...")
+        self.rest_api.switch_position_mode(self.symbol, mode=3) # Force Hedge Mode
+        self.rest_api.set_leverage(self.symbol, leverage=10.0) # Default to 10x safety
+
+    def subscribe_private_channels(self):
+        """Subscribe to account-specific streams (positions, executions)."""
+        self.ws_api.subscribe_private(self.on_position_update, self.on_execution_update)
 
     def normalize_price(self, price):
         tick = self.instrument_info['tick_size']
@@ -193,22 +199,26 @@ class LiveBot:
         self.running = False
         self.ws_api.disconnect()
 
-    def _calculate_warmup_status(self):
+    def _calculate_warmup_status(self, df=None):
         """
         Calculates the number of valid, continuous, and recent bars at the end of history.
         Used to determine if the bot is 'warm' upon restart.
         """
-        if self.bars.empty:
+        if df is None:
+            df = self.bars
+
+        if df.empty:
             return 0
         
         # 1. Check recency of last bar
-        last_ts = int(self.bars.iloc[-1]['timestamp'])
+        last_ts = int(df.iloc[-1]['timestamp'])
         now_ts = int(time.time() * 1000)
         # We allow a gap of up to 2 timeframes. If the last bar is older, history is stale.
         # e.g., if TF=5m, and last bar is 15m ago, we need to restart warmup.
         max_lag = self.tf_seconds * 1000 * 2
         if (now_ts - last_ts) > max_lag:
-            logger.info(f"History Stale: Last bar {datetime.fromtimestamp(last_ts/1000)} is > {max_lag/1000}s old. Resetting warmup.")
+            if df is self.bars:
+                logger.info(f"History Stale: Last bar {datetime.fromtimestamp(last_ts/1000)} is > {max_lag/1000}s old. Resetting warmup.")
             return 0
 
         # 2. Iterate backwards to find continuous valid sequence
@@ -216,15 +226,15 @@ class LiveBot:
         expected_diff = self.tf_seconds * 1000
         
         # Check columns existence
-        if 'ob_spread_mean' not in self.bars.columns:
+        if 'ob_spread_mean' not in df.columns:
             return 0
             
-        timestamps = self.bars['timestamp'].values
+        timestamps = df['timestamp'].values
         # We consider 'ob_spread_mean' > 0 as a proxy for valid OB data
-        ob_spreads = self.bars['ob_spread_mean'].values
+        ob_spreads = df['ob_spread_mean'].values
         
         # Iterate backwards
-        for i in range(len(self.bars) - 1, -1, -1):
+        for i in range(len(df) - 1, -1, -1):
             # Check Validity (OB Data presence)
             if ob_spreads[i] <= 0:
                 logger.debug(f"Warmup Break: Bar {i} has invalid OB data.")
@@ -232,7 +242,7 @@ class LiveBot:
             
             # Check Continuity (with next bar, which is i+1)
             # The loop goes i, i-1... so i+1 is the *later* bar we just checked (or the end)
-            if i < len(self.bars) - 1:
+            if i < len(df) - 1:
                 diff = timestamps[i+1] - timestamps[i]
                 if diff != expected_diff:
                     logger.debug(f"Warmup Break: Gap detected between {i} and {i+1} (Diff={diff}).")
@@ -262,27 +272,37 @@ class LiveBot:
         if self.real_ob_bars_count < self.warmup_bars:
             backup_file = Path(f"backup_history_{self.symbol}_{self.timeframe}.csv")
             if backup_file.exists():
-                logger.info(f"Warmup insufficient ({self.real_ob_bars_count}). Attempting to merge backup file: {backup_file}")
+                logger.info(f"Warmup insufficient ({self.real_ob_bars_count}). Checking backup file: {backup_file}")
                 try:
                     backup_bars = pd.read_csv(backup_file)
                     if not backup_bars.empty:
-                        # Merge Strategy: Concatenate -> Drop Duplicates -> Sort
-                        combined = pd.concat([self.bars, backup_bars], ignore_index=True)
-                        combined = combined.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
+                        # VALIDATE BACKUP QUALITY BEFORE MERGING
+                        backup_status = self._calculate_warmup_status(backup_bars)
                         
-                        self.bars = combined
-                        logger.info(f"Merged backup data. Total bars: {len(self.bars)}")
-                        
-                        # Recalculate status
-                        if not self.bars.empty:
-                            self.last_bar_time = int(self.bars.iloc[-1]['timestamp'])
-                            self.real_ob_bars_count = self._calculate_warmup_status()
-                            logger.info(f"New Warmup Status after merge: {self.real_ob_bars_count}/{self.warmup_bars}")
+                        if backup_status >= self.warmup_bars:
+                            logger.info(f"Backup file is valid and warm ({backup_status} bars). Merging...")
                             
-                            # Persist the merge immediately to main file
-                            self.bars.to_csv(self.history_file, index=False)
+                            # Merge Strategy: Concatenate -> Drop Duplicates -> Sort
+                            combined = pd.concat([self.bars, backup_bars], ignore_index=True)
+                            combined = combined.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
+                            
+                            self.bars = combined
+                            logger.info(f"Merged backup data. Total bars: {len(self.bars)}")
+                            
+                            # Recalculate status
+                            if not self.bars.empty:
+                                self.last_bar_time = int(self.bars.iloc[-1]['timestamp'])
+                                self.real_ob_bars_count = self._calculate_warmup_status()
+                                logger.info(f"New Warmup Status after merge: {self.real_ob_bars_count}/{self.warmup_bars}")
+                                
+                                # Persist the merge immediately to main file
+                                self.bars.to_csv(self.history_file, index=False)
+                        else:
+                            logger.info(f"Backup file also insufficient ({backup_status}/{self.warmup_bars}). Skipping merge.")
+                    else:
+                        logger.info("Backup file is empty.")
                 except Exception as e:
-                    logger.error(f"Failed to merge backup file: {e}")
+                    logger.error(f"Failed to check/merge backup file: {e}")
 
         # Fallback: Download from Exchange if still empty
         if self.bars.empty:
@@ -432,7 +452,7 @@ class LiveBot:
         self.ws_api.subscribe_orderbook(self.symbol, self.local_book)
         self.ws_api.subscribe_kline(self.symbol, self.timeframe)
         self.ws_api.subscribe_trades(self.symbol, self.on_public_trade)
-        self.ws_api.subscribe_private(self.on_position_update, self.on_execution_update)
+        self.subscribe_private_channels()
         
         logger.info("Starting Main Loop...")
         
