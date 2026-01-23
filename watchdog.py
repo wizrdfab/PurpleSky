@@ -48,13 +48,14 @@ logger = logging.getLogger("Supervisor")
 class ServiceManager:
     """Manages a single child process (Trader or Keeper)."""
     
-    def __init__(self, name, script_name, log_file, cmd_args, webhook_url, clean_start=False):
+    def __init__(self, name, script_name, log_file, cmd_args, webhook_url, clean_start=False, heartbeat_pattern=None):
         self.name = name
         self.script_name = script_name
         self.log_path = Path(log_file)
         self.cmd = [sys.executable, script_name] + cmd_args
         self.webhook_url = webhook_url
         self.clean_start = clean_start
+        self.heartbeat_pattern = heartbeat_pattern or ">>> [SYSTEM METRICS]"
         
         self.process_pid = None
         self.last_health_report = time.time()
@@ -137,6 +138,7 @@ class ServiceManager:
             self.process_pid = existing
             logger.info(f"[{self.name}] Adopted PID {existing}")
             self.notify(f"Adopted active PID {existing}")
+            self.last_health_report = time.time() # Reset silence timer on adoption
             self.open_log_reader()
             return
 
@@ -230,7 +232,7 @@ class ServiceManager:
                 # ECHO TO CONSOLE (Capture Output)
                 print(f"[{self.name}] {line.strip()}")
                 
-                if ">>> [SYSTEM METRICS]" in line:
+                if self.heartbeat_pattern in line:
                     self.last_health_report = time.time()
                 
                 if any(p in line for p in IGNORE_PATTERNS): continue
@@ -250,11 +252,13 @@ class Supervisor:
         # Initialize Services
         self.trader = ServiceManager(
             "TRADER", "live_trading.py", "live_trading.log", 
-            cmd_args, webhook_url, clean_start
+            cmd_args, webhook_url, clean_start,
+            heartbeat_pattern=">>> [SYSTEM METRICS]"
         )
         self.keeper = ServiceManager(
             "KEEPER", "data_keeper.py", "data_keeper.log", 
-            cmd_args, webhook_url, clean_start
+            cmd_args, webhook_url, clean_start,
+            heartbeat_pattern="Data synced & features updated"
         )
         
     def load_webhook_url(self):
@@ -279,8 +283,18 @@ class Supervisor:
         total, used, free = shutil.disk_usage(".")
         return (free // (2**20)) > MIN_DISK_MB
 
+    def shutdown(self, signum=None, frame=None):
+        logger.warning("Supervisor shutting down... Stopping services.")
+        self.trader.stop("Supervisor Shutdown")
+        self.keeper.stop("Supervisor Shutdown")
+        sys.exit(0)
+
     def run(self):
         logger.info("Supervisor Started. Monitoring Trader & Keeper...")
+        
+        # Register Signal Handlers
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
         
         while True:
             # 1. Global Checks
