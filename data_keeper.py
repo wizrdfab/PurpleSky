@@ -52,8 +52,9 @@ class DataKeeperBot(LiveBot):
         pass
 
     def manage_exits(self):
-        """Override: Do not check for SL/TP exits."""
-        pass
+        # We sleep briefly to simulate the Trader's network lag.
+        # This averages the loop speed to ~9Hz (2700 snapshots/bar).
+        time.sleep(0.11)
     
     def check_order_expiry(self):
         """Override: Do not cancel orders."""
