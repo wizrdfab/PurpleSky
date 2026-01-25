@@ -107,19 +107,31 @@ class VirtualPositionManager:
         return net
     
     def get_active_stops(self) -> List[Dict]:
-        """Returns list of needed Stop orders: [{'qty': float, 'trigger_price': float, 'side': str}]"""
+        """Returns list of needed Stop/TP orders: [{'qty': float, 'trigger_price': float, 'side': str, 'type': str}]"""
         stops = []
         for t in self.trades:
-            # If Long, Stop is Sell
+            # If Long, Stop/TP is Sell
             side = "Sell" if t.side == "Buy" else "Buy"
-            stops.append({
-                'id': t.trade_id, # Link back to virtual trade
-                'qty': t.size,
-                'trigger_price': t.stop_loss,
-                'side': side,
-                'type': 'sl'
-            })
-            # We could add TP here too
+            
+            # Stop Loss
+            if t.stop_loss > 0:
+                stops.append({
+                    'id': t.trade_id, 
+                    'qty': t.size,
+                    'trigger_price': t.stop_loss,
+                    'side': side,
+                    'type': 'sl'
+                })
+            
+            # Take Profit
+            if t.take_profit > 0:
+                stops.append({
+                    'id': t.trade_id,
+                    'qty': t.size,
+                    'trigger_price': t.take_profit,
+                    'side': side,
+                    'type': 'tp'
+                })
         return stops
 
     def prune_dead_trades(self, current_price: float):
@@ -152,3 +164,36 @@ class VirtualPositionManager:
                 self.close_trade(t.trade_id)
                 closed.append(t.trade_id)
         return closed
+
+    def reduce_position(self, exec_side: str, qty: float, price: float) -> bool:
+        """
+        Reduces virtual positions based on an execution (FIFO).
+        exec_side: The side of the execution (e.g. "Sell" to close Longs).
+        qty: The amount executed.
+        """
+        target_side = "Buy" if exec_side == "Sell" else "Sell"
+        remaining_qty = qty
+        reduced = False
+        
+        # Sort by entry time (FIFO)
+        matching_trades = [t for t in self.trades if t.side == target_side]
+        matching_trades.sort(key=lambda x: x.entry_time)
+        
+        for trade in matching_trades:
+            if remaining_qty <= 0: break
+            
+            if trade.size <= remaining_qty:
+                # Full close of this trade
+                remaining_qty -= trade.size
+                self.logger.info(f"Execution {exec_side} {qty} fully closed Trade {trade.trade_id}")
+                self.close_trade(trade.trade_id)
+                reduced = True
+            else:
+                # Partial close
+                trade.size -= remaining_qty
+                self.logger.info(f"Execution {exec_side} {qty} partially reduced Trade {trade.trade_id} to {trade.size}")
+                remaining_qty = 0
+                self.save()
+                reduced = True
+                
+        return reduced

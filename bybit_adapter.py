@@ -324,6 +324,25 @@ class BybitAdapter(ExchangeInterface):
             self.logger.error(f"Set Leverage Error: {e}")
             return False
 
+    def set_trading_stop(self, symbol: str, position_idx: int, sl: Optional[float] = None, tp: Optional[float] = None) -> bool:
+        try:
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "positionIdx": position_idx
+            }
+            if sl is not None: params["stopLoss"] = str(sl)
+            if tp is not None: params["takeProfit"] = str(tp)
+            
+            response = self._retry_api_call(self.session.set_trading_stop, **params)
+            return response['retCode'] == 0
+        except Exception as e:
+            # Code 34040: SL/TP too close or same as current (often happens when clearing 0 -> 0)
+            if "34040" in str(e): 
+                return True
+            self.logger.error(f"Set Trading Stop Error: {e}")
+            return False
+
     def switch_position_mode(self, symbol: str, mode: int = 3) -> bool:
         # mode 0: One-Way, 3: Hedge
         try:

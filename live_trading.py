@@ -515,16 +515,16 @@ class LiveBot:
     def on_execution_update(self, msg):
         # Log fills
         for item in msg.get('data', []):
-            logger.info(f"EXECUTION: {item.get('side')} {item.get('execQty')} @ {item.get('execPrice')}")
-            
+            side = item['side']
+            price = float(item['execPrice'])
+            qty = float(item['execQty'])
+            oid = item.get('orderId')
             link_id = item.get('orderLinkId', '')
+            
+            logger.info(f"EXECUTION: {side} {qty} @ {price} (Link: {link_id})")
+            
             if link_id and link_id.startswith('LIMIT-'):
                 logger.info(f"Detected Limit Fill {link_id}. Adding to VPM.")
-                
-                side = item['side']
-                price = float(item['execPrice'])
-                qty = float(item['execQty'])
-                oid = item.get('orderId')
                 
                 # Retrieve intended SL/TP from pending info
                 sl, tp = 0.0, 0.0
@@ -561,6 +561,13 @@ class LiveBot:
                              logger.warning("Partial fill rejected and could not merge (Side Mismatch).")
                     else:
                          logger.warning("Partial fill rejected and VPM empty (Unknown State).")
+            elif qty > 0 and not link_id.startswith('AUTO-'):
+                # Handle External/SL/TP Closes
+                # If it's not our tracked Limit Entry (LIMIT-) and not our active Market Order (AUTO-),
+                # assume it's a closing trade (SL/TP/Manual/Liquidation)
+                logger.info(f"Detected Closing Execution (SL/TP/Manual). Reducing VPM.")
+                if self.vpm.reduce_position(side, qty, price):
+                    self.reconcile_positions()
 
     def on_bar_close(self, ws_kline):
         required_keys = ['start', 'open', 'high', 'low', 'close', 'volume']
@@ -930,52 +937,87 @@ class LiveBot:
                 logger.info(f"Reducing Short: {qty}")
                 self.rest_api.place_order(self.symbol, "Buy", "Market", qty, reduce_only=True, position_idx=2, order_link_id=oid)
 
-        # Sync Stops
-        # Cancel existing stops/untracked orders, but PRESERVE active Limit Orders
-        # AND preserve attached stops if position is still forming (size 0)
+        # Sync Stops (Smart Sync)
+        # 1. Clear Position-level SL/TP to ensure we rely on granular orders
+        if actual_long > 0:
+            self.rest_api.set_trading_stop(self.symbol, position_idx=1, sl=0, tp=0)
+        if actual_short > 0:
+            self.rest_api.set_trading_stop(self.symbol, position_idx=2, sl=0, tp=0)
+
+        # 2. Fetch State
         open_orders = self.rest_api.get_open_orders(self.symbol)
+        vpm_stops = self.vpm.get_active_stops()
+        
+        # 3. Match Existing vs Required
+        # We need to map which VPM stop is covered by which Open Order
+        matched_orders = set()
+        matched_vpm_ids = set()
+        
+        # Pre-process Open Orders to separate "Our Stops" from "Limit Entries"
+        current_stops = []
         for o in open_orders:
             oid = o['orderId']
             if oid in self.pending_limits:
-                continue
+                continue # Skip Limit Entries
             
-            # Skip Market Orders (they fill instantly, usually race condition if we see them here)
-            if o.get('orderType') == 'Market':
+            trig = float(o.get('triggerPrice') or 0)
+            
+            # Skip Active Market Orders (Instant Fills) but KEEP Conditional Market Orders
+            if o.get('orderType') == 'Market' and trig == 0:
+                continue 
+            
+            if trig > 0:
+                current_stops.append(o)
+        
+        # Matching Algorithm (Greedy)
+        for i, s in enumerate(vpm_stops):
+            # Skip if position size is 0 (can't place reduceOnly)
+            if s['side'] == 'Sell' and actual_long == 0: 
+                matched_vpm_ids.add(i) # Pretend matched so we don't try to place
+                continue
+            if s['side'] == 'Buy' and actual_short == 0: 
+                matched_vpm_ids.add(i)
                 continue
 
-            # Check if it is a Stop Order
-            trig = float(o.get('triggerPrice') or 0)
-            if trig > 0:
-                # It's a Stop. Preserve if corresponding position is 0 (likely attached to pending)
-                # Stop Sell protects Long
-                if o['side'] == 'Sell' and actual_long == 0: continue
-                # Stop Buy protects Short
-                if o['side'] == 'Buy' and actual_short == 0: continue
+            target_price = float(s['trigger_price'])
+            target_qty = float(s['qty'])
+            target_side = s['side']
             
-            self.rest_api.cancel_order(self.symbol, oid)
+            for o in current_stops:
+                oid = o['orderId']
+                if oid in matched_orders: continue
+                
+                # Check Tolerance (Price match within small delta, Qty match)
+                o_price = float(o.get('triggerPrice'))
+                o_qty = float(o.get('qty'))
+                o_side = o['side']
+                
+                if o_side == target_side and abs(o_qty - target_qty) < 0.001 and abs(o_price - target_price) < (target_price * 0.0005):
+                    matched_orders.add(oid)
+                    matched_vpm_ids.add(i)
+                    break
         
-        # Fetch price for trigger direction calculation
+        # 4. Cancel Unmatched Orders (Stale)
+        for o in current_stops:
+            if o['orderId'] not in matched_orders:
+                self.rest_api.cancel_order(self.symbol, o['orderId'])
+        
+        # 5. Place Missing Orders
         current_price = self.rest_api.get_current_price(self.symbol)
-        
-        stops = self.vpm.get_active_stops()
-        for s in stops:
-             # Skip if position doesn't exist yet to avoid ReduceOnly rejection
-             if s['side'] == 'Sell' and actual_long == 0: continue
-             if s['side'] == 'Buy' and actual_short == 0: continue
-             
-             p_idx = 0
-             if s['side'] == 'Sell': p_idx = 1
-             elif s['side'] == 'Buy': p_idx = 2
-             
-             # Calculate Trigger Direction
-             t_dir = None
-             if current_price > 0:
-                 if s['trigger_price'] > current_price:
-                     t_dir = 1 # Rise
-                 else:
-                     t_dir = 2 # Fall
-             
-             self.rest_api.place_order(
+        for i, s in enumerate(vpm_stops):
+            if i in matched_vpm_ids: continue
+            
+            # Recalculate Trigger Direction (Dynamic for SL vs TP)
+            t_dir = None
+            if current_price > 0:
+                if s['trigger_price'] > current_price:
+                    t_dir = 1 # Rise (TP for Long, SL for Short)
+                else:
+                    t_dir = 2 # Fall (SL for Long, TP for Short)
+            
+            p_idx = 1 if s['side'] == 'Sell' else 2 # Sell closes Long(1), Buy closes Short(2)
+            
+            self.rest_api.place_order(
                 symbol=self.symbol,
                 side=s['side'],
                 order_type="Market",
