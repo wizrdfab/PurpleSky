@@ -227,6 +227,7 @@ class LiveBot:
         
         # Check columns existence
         if 'ob_spread_mean' not in df.columns:
+            logger.warning("Warmup Check Failed: 'ob_spread_mean' column missing.")
             return 0
             
         timestamps = df['timestamp'].values
@@ -237,7 +238,7 @@ class LiveBot:
         for i in range(len(df) - 1, -1, -1):
             # Check Validity (OB Data presence)
             if ob_spreads[i] <= 0:
-                logger.debug(f"Warmup Break: Bar {i} has invalid OB data.")
+                logger.debug(f"Warmup Break: Bar {i} (Time={datetime.fromtimestamp(timestamps[i]/1000)}) has invalid OB data (Backfilled?). Stopping count.")
                 break 
             
             # Check Continuity (with next bar, which is i+1)
@@ -761,6 +762,8 @@ class LiveBot:
         raw_qty = risk_amt / sl_dist
         size_qty = self.normalize_qty(raw_qty)
         
+        logger.info(f"Sizing Calc: Wallet={wallet:.2f} | Risk={self.risk_per_trade:.1%} (${risk_amt:.2f}) | SL_Dist={sl_dist:.4f} | RawQty={raw_qty:.2f} -> {size_qty}")
+        
         if size_qty <= 0: return
         
         # Check Min Notional
@@ -939,10 +942,11 @@ class LiveBot:
 
         # Sync Stops (Smart Sync)
         # 1. Clear Position-level SL/TP to ensure we rely on granular orders
-        if actual_long > 0:
-            self.rest_api.set_trading_stop(self.symbol, position_idx=1, sl=0, tp=0)
-        if actual_short > 0:
-            self.rest_api.set_trading_stop(self.symbol, position_idx=2, sl=0, tp=0)
+        # SAFETY: Do NOT blindly clear position stops. Redundancy is better than naked positions.
+        # if actual_long > 0:
+        #     self.rest_api.set_trading_stop(self.symbol, position_idx=1, sl=0, tp=0)
+        # if actual_short > 0:
+        #     self.rest_api.set_trading_stop(self.symbol, position_idx=2, sl=0, tp=0)
 
         # 2. Fetch State
         open_orders = self.rest_api.get_open_orders(self.symbol)
@@ -1000,22 +1004,28 @@ class LiveBot:
         # 4. Cancel Unmatched Orders (Stale)
         for o in current_stops:
             if o['orderId'] not in matched_orders:
-                self.rest_api.cancel_order(self.symbol, o['orderId'])
+                try:
+                    self.rest_api.cancel_order(self.symbol, o['orderId'])
+                except Exception as e:
+                    logger.warning(f"Failed to cancel stale order {o['orderId']}: {e}")
         
         # 5. Place Missing Orders
         current_price = self.rest_api.get_current_price(self.symbol)
+        if current_price <= 0:
+            logger.warning("Price unavailable. Skipping Sync Stops.")
+            return
+
         for i, s in enumerate(vpm_stops):
             if i in matched_vpm_ids: continue
             
             # Recalculate Trigger Direction (Dynamic for SL vs TP)
-            t_dir = None
-            if current_price > 0:
-                if s['trigger_price'] > current_price:
-                    t_dir = 1 # Rise (TP for Long, SL for Short)
-                else:
-                    t_dir = 2 # Fall (SL for Long, TP for Short)
+            # 1 = Rise (Trigger > Price), 2 = Fall (Trigger < Price)
+            t_dir = 1 if s['trigger_price'] > current_price else 2
             
             p_idx = 1 if s['side'] == 'Sell' else 2 # Sell closes Long(1), Buy closes Short(2)
+            type_str = "TP" if s['type'] == 'tp' else "SL"
+
+            logger.info(f"Syncing Missing {type_str}: {s['side']} {s['qty']} @ {s['trigger_price']} (Dir={t_dir})")
             
             self.rest_api.place_order(
                 symbol=self.symbol,

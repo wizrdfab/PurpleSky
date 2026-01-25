@@ -219,12 +219,18 @@ class BybitAdapter(ExchangeInterface):
 
     def get_open_orders(self, symbol: str) -> List[Dict]:
         try:
-            # Fetch active orders (Limit, Market if pending)
-            response = self._retry_api_call(self.session.get_open_orders, category="linear", symbol=symbol)
             orders = []
-            if response['retCode'] == 0:
-                orders.extend(response['result']['list'])
             
+            # 1. Fetch Active Orders (Limit, etc.)
+            res_active = self._retry_api_call(self.session.get_open_orders, category="linear", symbol=symbol, orderFilter="Order")
+            if res_active['retCode'] == 0:
+                orders.extend(res_active['result']['list'])
+            
+            # 2. Fetch Conditional Orders (Stop Loss, Take Profit, Conditional Market)
+            res_stop = self._retry_api_call(self.session.get_open_orders, category="linear", symbol=symbol, orderFilter="StopOrder")
+            if res_stop['retCode'] == 0:
+                orders.extend(res_stop['result']['list'])
+                
             return orders
         except Exception as e:
             self.logger.error(f"Exception fetching open orders: {e}")
@@ -296,7 +302,11 @@ class BybitAdapter(ExchangeInterface):
             return response['retCode'] == 0
         except Exception as e:
             err_msg = str(e).encode('ascii', 'ignore').decode('ascii')
-            self.logger.error(f"Exception cancelling order: {err_msg}")
+            # 110001: Order not exists, 110003: Order already cancelled
+            if "110001" in err_msg or "110003" in err_msg:
+                self.logger.warning(f"Benign Cancel Error (Ignored): {err_msg}")
+            else:
+                self.logger.error(f"Exception cancelling order: {err_msg}")
             return False
 
     def cancel_all_orders(self, symbol: str) -> bool:
