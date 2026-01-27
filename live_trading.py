@@ -797,7 +797,7 @@ class LiveBot:
             # Limit Order
             # Place on Exchange + Track
             oid = f"LIMIT-{uuid.uuid4().hex[:8]}"
-            logger.info(f"Placing Limit {side} {size_qty} @ {price}")
+            logger.info(f"DEBUG: Placing Limit {side}. Qty={size_qty}, Price={price}, SL={sl_price}, TP={tp_price}, OID={oid}")
             
             # For Limit, we map Position Index same as Market
             p_idx = 1 if side == "Buy" else 2
@@ -916,10 +916,13 @@ class LiveBot:
                 sl = last_buy.stop_loss if last_buy else None
                 tp = last_buy.take_profit if last_buy else None
                 
-                self.rest_api.place_order(self.symbol, "Buy", "Market", qty, position_idx=1, order_link_id=oid, sl=sl, tp=tp)
+                logger.info(f"DEBUG: Placing Long Market. Qty={qty}, SL={sl}, TP={tp}, OID={oid}")
+                res = self.rest_api.place_order(self.symbol, "Buy", "Market", qty, position_idx=1, order_link_id=oid, sl=sl, tp=tp)
+                logger.info(f"DEBUG: Long Market Res: {res}")
             else:
                 logger.info(f"Reducing Long: {qty}")
-                self.rest_api.place_order(self.symbol, "Sell", "Market", qty, reduce_only=True, position_idx=1, order_link_id=oid)
+                res = self.rest_api.place_order(self.symbol, "Sell", "Market", qty, reduce_only=True, position_idx=1, order_link_id=oid)
+                logger.info(f"DEBUG: Reduce Long Res: {res}")
 
         # Short Side (Idx 2)
         diff_short = target_short - actual_short
@@ -930,27 +933,48 @@ class LiveBot:
             oid = f"AUTO-{uuid.uuid4().hex[:8]}"
             if diff_short > 0:
                 logger.info(f"Opening Short: {qty}")
-                # Attach SL/TP
+                # Try to attach SL/TP (Best Effort)
                 last_sell = next((t for t in reversed(self.vpm.trades) if t.side == "Sell"), None)
                 sl = last_sell.stop_loss if last_sell else None
                 tp = last_sell.take_profit if last_sell else None
                 
-                self.rest_api.place_order(self.symbol, "Sell", "Market", qty, position_idx=2, order_link_id=oid, sl=sl, tp=tp)
+                logger.info(f"DEBUG: Placing Short Market. Qty={qty}, SL={sl}, TP={tp}, OID={oid}")
+                res = self.rest_api.place_order(self.symbol, "Sell", "Market", qty, position_idx=2, order_link_id=oid, sl=sl, tp=tp)
+                logger.info(f"DEBUG: Short Market Res: {res}")
             else:
                 logger.info(f"Reducing Short: {qty}")
-                self.rest_api.place_order(self.symbol, "Buy", "Market", qty, reduce_only=True, position_idx=2, order_link_id=oid)
+                res = self.rest_api.place_order(self.symbol, "Buy", "Market", qty, reduce_only=True, position_idx=2, order_link_id=oid)
+                logger.info(f"DEBUG: Reduce Short Res: {res}")
 
-        # Sync Stops (Smart Sync)
-        # 1. Clear Position-level SL/TP to ensure we rely on granular orders
-        # SAFETY: Do NOT blindly clear position stops. Redundancy is better than naked positions.
-        # if actual_long > 0:
-        #     self.rest_api.set_trading_stop(self.symbol, position_idx=1, sl=0, tp=0)
-        # if actual_short > 0:
-        #     self.rest_api.set_trading_stop(self.symbol, position_idx=2, sl=0, tp=0)
-
-        # 2. Fetch State
-        open_orders = self.rest_api.get_open_orders(self.symbol)
+        # --- STATE REFRESH ---
+        # If we placed orders above, the state (Open Orders & Positions) has changed. 
+        # We must refresh to see if SL/TPs were accepted and if Position size updated.
+        if norm_diff_long > 0 or norm_diff_short > 0:
+            logger.info("State Refresh: Updating Open Orders & Positions after execution...")
+            time.sleep(0.5) # Give Bybit a moment to index the new orders
+            open_orders = self.rest_api.get_open_orders(self.symbol)
+            current_price = self.rest_api.get_current_price(self.symbol)
+            
+            # Refresh Positions to ensure ReduceOnly checks pass
+            positions = self.rest_api.get_positions(self.symbol)
+            if positions:
+                for p in positions:
+                    idx = p.get('position_idx', 0)
+                    sz = p['size']
+                    side = p['side']
+                    if idx == 1: actual_long = sz
+                    elif idx == 2: actual_short = sz
+                    elif idx == 0:
+                        if side == 'Buy': actual_long = sz
+                        elif side == 'Sell': actual_short = sz
+        
+        # 2. Fetch State (Used for Sync)
+        # If we didn't refresh above, we use the initial fetch.
+        # But wait, we fetched at the START of function? No, we fetched at Step 2.
+        
+        # Ensure we have the latest VPM stops
         vpm_stops = self.vpm.get_active_stops()
+        logger.debug(f"DEBUG: VPM expects {len(vpm_stops)} active stops.")
         
         # 3. Match Existing vs Required
         # We need to map which VPM stop is covered by which Open Order
@@ -973,6 +997,8 @@ class LiveBot:
             if trig > 0:
                 current_stops.append(o)
         
+        logger.debug(f"DEBUG: {len(current_stops)} orders identified as Conditional Stops.")
+
         # Matching Algorithm (Greedy)
         for i, s in enumerate(vpm_stops):
             # Skip if position size is 0 (can't place reduceOnly)
@@ -999,18 +1025,23 @@ class LiveBot:
                 if o_side == target_side and abs(o_qty - target_qty) < 0.001 and abs(o_price - target_price) < (target_price * 0.0005):
                     matched_orders.add(oid)
                     matched_vpm_ids.add(i)
+                    logger.debug(f"DEBUG: Matched VPM Stop {i} to Order {oid}")
                     break
         
         # 4. Cancel Unmatched Orders (Stale)
         for o in current_stops:
             if o['orderId'] not in matched_orders:
                 try:
+                    logger.debug(f"DEBUG: Cancelling stale order {o['orderId']}")
                     self.rest_api.cancel_order(self.symbol, o['orderId'])
                 except Exception as e:
                     logger.warning(f"Failed to cancel stale order {o['orderId']}: {e}")
         
         # 5. Place Missing Orders
+        logger.debug("DEBUG: Checking for missing orders...")
         current_price = self.rest_api.get_current_price(self.symbol)
+        logger.debug(f"DEBUG: Current Price = {current_price}")
+        
         if current_price <= 0:
             logger.warning("Price unavailable. Skipping Sync Stops.")
             return

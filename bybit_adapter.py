@@ -283,8 +283,12 @@ class BybitAdapter(ExchangeInterface):
             response = self._retry_api_call(self.session.place_order, **params)
             
             if response['retCode'] != 0:
-                self.logger.error(f"Bybit Place Order Error: {response['retMsg']}")
+                self.logger.error(f"Bybit Place Order Error: {response['retMsg']} (Code: {response['retCode']})")
                 return {'error': response['retMsg']}
+            
+            # Check for warnings even on success (e.g. SL/TP adjusted/dropped)
+            if response['retMsg'] and response['retMsg'].lower() != "ok":
+                 self.logger.warning(f"Bybit Order Warning: {response['retMsg']}")
                 
             return {
                 'order_id': response['result']['orderId'],

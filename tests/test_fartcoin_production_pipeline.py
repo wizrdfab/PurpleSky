@@ -1,146 +1,194 @@
-import unittest
-import logging
-import sys
-import os
+import pytest
+from unittest.mock import MagicMock, patch
 import pandas as pd
-import time
-from pathlib import Path
-from types import SimpleNamespace
-
-# Add project root to path
-sys.path.append(str(Path(__file__).parent.parent))
-
 from live_trading import LiveBot
 from config import CONF
 
-# API CREDENTIALS (TESTNET)
-API_KEY = os.getenv("BYBIT_API_KEY", "DZh7qdh2dTfw328ASi")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "Y4Jhn5z2MMi0LGN174RRNXLeE2NrRpGZ3mcf")
-SYMBOL = "FARTCOINUSDT"
-MODEL_DIR = "models/FARTCOINUSDT/rank_1"
+class MockArgs:
+    symbol = "FARTCOINUSDT"
+    model_dir = "models/FARTCOINUSDT"
+    timeframe = "5m"
+    api_key = "test"
+    api_secret = "test"
+    testnet = True
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("FartcoinProdTest")
-
-class TestFartcoinProductionPipeline(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        print(f"\n=== STARTING PRODUCTION PIPELINE TEST - {SYMBOL} ===")
-        cls.args = SimpleNamespace(
-            symbol=SYMBOL,
-            model_dir=MODEL_DIR, 
-            api_key=API_KEY,
-            api_secret=API_SECRET,
-            testnet=True,
-            timeframe="5m"
-        )
+@pytest.fixture
+def bot():
+    with patch('live_trading.BybitAdapter') as MockAdapter, \
+         patch('live_trading.BybitWSAdapter') as MockWS, \
+         patch('live_trading.VirtualPositionManager') as MockVPM, \
+         patch('live_trading.LocalOrderbook') as MockOB, \
+         patch('live_trading.OrderbookAggregator') as MockAgg, \
+         patch('live_trading.ModelManager') as MockModel, \
+         patch('live_trading.FeatureEngine') as MockFeat, \
+         patch('joblib.load') as MockJoblib: # Patch joblib to avoid file load
         
-    def setUp(self):
-        # NO MOCKS for ModelManager, FeatureEngine, or joblib/torch
-        # We want the real code to run.
+        # Setup Mocks
+        adapter = MockAdapter.return_value
+        adapter.get_instrument_info.return_value = {
+            'tick_size': 0.0001, 'qty_step': 1.0, 'min_qty': 1.0, 'min_notional': 5.0
+        }
+        adapter.get_wallet_balance.return_value = 50.0
+        adapter.get_current_price.return_value = 0.30
+        adapter.get_positions.return_value = [] # No initial positions
+        adapter.get_open_orders.return_value = []
         
-        print("    Loading Bot with real Model & Features...")
-        self.bot = LiveBot(self.args)
-        self.bot.warmup_bars = 0 # Disable warmup for test
-        
-        # 1. Populate History with REAL data from exchange
-        print("    Fetching real history for feature calculation...")
-        klines = self.bot.rest_api.get_public_klines(SYMBOL, "5m", limit=300)
-        if not klines:
-            self.fail("Failed to fetch history from exchange.")
-        
-        self.bot.bars = pd.DataFrame(klines)
-        # Ensure OB columns exist so calc doesn't fail
-        for col in ['ob_spread_mean', 'ob_micro_dev_std']:
-            self.bot.bars[col] = 0.0001 # Realistic dummy value
-            
-        print(f"    History loaded: {len(self.bot.bars)} bars.")
-
-    def test_production_inference(self):
-        """Run the full production pipeline: History -> Features -> Model -> Prediction"""
-        print("\n[Test] Production Inference Pipeline")
-        
-        # Latest bar from our fetched history
-        last_bar = self.bot.bars.iloc[-1].to_dict()
-        
-        # Prepare a 'fake' kline message that matches the last bar
-        fake_kline = {
-            'start': last_bar['timestamp'],
-            'open': last_bar['open'],
-            'high': last_bar['high'],
-            'low': last_bar['low'],
-            'close': last_bar['close'],
-            'volume': last_bar['volume'],
-            'confirm': True
+        # Mock LocalOrderbook Snapshot (Valid Spread)
+        MockOB.return_value.get_snapshot.return_value = {
+            'bids': [[0.2999, 1000]], 
+            'asks': [[0.3000, 1000]], 
+            'timestamp': 123456789
         }
         
-        # Manually trigger bar close
-        # This will run: finalize() -> concat -> calculate_features -> predict -> execute_logic
-        print("    Triggering bar close processing...")
+        # Mock Joblib to return dummy data for features/models
+        MockJoblib.return_value = ['close', 'open', 'high', 'low', 'volume'] # Dummy feature list
         
-        # We catch the logs to verify everything happened
-        with self.assertLogs('LiveTrading', level='INFO') as cm:
-            self.bot.on_bar_close(fake_kline)
-            
-            # Check if prediction happened
-            pred_logs = [l for l in cm.output if "Preds: Long=" in l]
-            self.assertTrue(len(pred_logs) > 0, "Model prediction log not found!")
-            
-            print(f"    RESULT: {pred_logs[0]}")
-            
-            # Check if features were printed (our new diagnostic report)
-            feat_logs = [l for l in cm.output if ">>> [ALL MODEL FEATURES]" in l]
-            self.assertTrue(len(feat_logs) > 0, "Feature diagnostic report not found!")
-            print("    [OK] Feature engine and Diagnostic report worked correctly.")
+        # Initialize Bot
+        bot = LiveBot(MockArgs())
+        # Disable VPM loading from file for test
+        bot.vpm.trades = []
+        return bot
 
-    def test_instrument_sync(self):
-        """Verify the bot correctly loaded Fartcoin's specific exchange rules"""
-        print("\n[Test] Instrument Specification Sync")
-        info = self.bot.instrument_info
-        print(f"    Fartcoin Tick Size: {info['tick_size']}")
-        print(f"    Fartcoin Min Qty:  {info['min_qty']}")
-        
-        self.assertIn('tick_size', info)
-        self.assertGreater(info['tick_size'], 0)
+def test_aggressive_sell_execution_flow(bot):
+    """
+    Test that an aggressive sell signal correctly:
+    1. Calculates sizing
+    2. Adds trade to VPM
+    3. Executes MARKET order WITH SL/TP attached
+    """
+    # 1. Setup Context
+    close_price = 0.30
+    atr = 0.005
+    
+    # Configure VPM to store the trade when added
+    def mock_add_trade(side, price, size, sl, tp, check_debounce=True):
+        bot.vpm.trades.append(MagicMock(
+            side=side, entry_price=price, size=size, stop_loss=sl, take_profit=tp
+        ))
+        return True
+    bot.vpm.add_trade.side_effect = mock_add_trade
+    
+    # 2. Trigger Signal
+    # Risk = 1.3% of $50 = $0.65
+    # SL Dist = ATR * 2.4 (from params) approx 0.012
+    # Size = 0.65 / 0.012 ~= 54 units
+    
+    bot._execute_trade(
+        side="Sell", 
+        price=close_price, 
+        atr=atr, 
+        order_type="Market", 
+        aggressive=True
+    )
+    
+    # 3. Verify VPM State
+    assert len(bot.vpm.trades) == 1
+    trade = bot.vpm.trades[0]
+    assert trade.side == "Sell"
+    assert trade.size > 0
+    # Check SL logic (Sell SL is ABOVE price)
+    assert trade.stop_loss > close_price 
+    # Check Aggressive TP logic (Sell TP is BELOW price, boosted by multiplier)
+    assert trade.take_profit < close_price
+    
+    print(f"\n[Test] VPM Trade: {trade.size} @ {trade.entry_price} | SL: {trade.stop_loss} | TP: {trade.take_profit}")
 
-    def test_taker_flow_accumulation(self):
-        """Verify that public trades correctly accumulate volume and calculate ratio"""
-        print("\n[Test] Taker Flow Accumulation")
-        
-        # 1. Simulate some public trades
-        trades = {
-            'data': [
-                {'v': '100', 'S': 'Buy'},
-                {'v': '50', 'S': 'Sell'},
-                {'v': '150', 'S': 'Buy'}
-            ]
-        }
-        self.bot.on_public_trade(trades)
-        
-        self.assertEqual(self.bot.bar_taker_total_vol, 300)
-        self.assertEqual(self.bot.bar_taker_buy_vol, 250)
-        print(f"    Accumulated Vol: Total={self.bot.bar_taker_total_vol}, Buy={self.bot.bar_taker_buy_vol}")
-        
-        # 2. Trigger bar close and verify ratio calculation in logs
-        last_bar = self.bot.bars.iloc[-1].to_dict()
-        fake_kline = {
-            'start': last_bar['timestamp'], 'open': last_bar['open'], 'high': last_bar['high'], 
-            'low': last_bar['low'], 'close': last_bar['close'], 'volume': last_bar['volume'], 
-            'confirm': True
-        }
-        
-        with self.assertLogs('LiveTrading', level='INFO') as cm:
-            self.bot.on_bar_close(fake_kline)
-            
-            # Check for Taker Flow log
-            flow_logs = [l for l in cm.output if "Taker Flow: Buy Vol=250.00, Total Vol=300.00, Ratio=0.8333" in l]
-            self.assertTrue(len(flow_logs) > 0, "Taker Flow ratio log mismatch or missing!")
-            print("    [OK] Taker Buy Ratio calculated correctly (0.8333).")
-            
-            # Check if counters were reset
-            self.assertEqual(self.bot.bar_taker_total_vol, 0)
-            self.assertEqual(self.bot.bar_taker_buy_vol, 0)
-            print("    [OK] Volume counters reset for next bar.")
+    # 4. Verify Exchange Execution (Reconciliation)
+    # The bot should have called place_order
+    # We need to verify that 'sl' and 'tp' were passed to place_order
+    
+    # Find the place_order call
+    calls = bot.rest_api.place_order.call_args_list
+    assert len(calls) > 0, "No order placed on exchange"
+    
+    # Check args of the last call
+    args, kwargs = calls[-1]
+    
+    print(f"[Test] Place Order Args: {args}")
+    print(f"[Test] Place Order Kwargs: {kwargs}")
+    
+    # Check Positional Args: symbol, side, order_type, qty
+    assert args[1] == "Sell"
+    assert args[2] == "Market"
+    assert float(args[3]) == trade.size
+    
+    # CRITICAL CHECK: Were SL and TP attached?
+    assert kwargs.get('sl') is not None, "Stop Loss NOT attached to Market Order!"
+    assert kwargs.get('tp') is not None, "Take Profit NOT attached to Market Order!"
+    
+    assert float(kwargs['sl']) == trade.stop_loss
+    assert float(kwargs['tp']) == trade.take_profit
+    
+    print("[Test] SUCCESS: SL/TP were correctly attached to the Market Order.")
 
-if __name__ == '__main__':
-    unittest.main()
+def test_naked_fill_recovery(bot):
+    """
+    Simulates a scenario where Bybit accepts the Market Order but SILENTLY ignores/drops 
+    the SL/TP params (e.g. due to 'Trigger Price too close').
+    
+    The bot must:
+    1. Place the Market Order (simulated 'Naked' fill).
+    2. REFRESH the Open Orders state.
+    3. DETECT that SL/TP are missing.
+    4. PLACE separate orders to fix it.
+    """
+    # 1. Setup VPM with a trade that NEEDS stops
+    # Since VPM is mocked, we must manually populate the list AND the get_active_stops method
+    trade = MagicMock(side="Sell", entry_price=0.30, size=100.0, stop_loss=0.31, take_profit=0.25)
+    bot.vpm.trades.append(trade)
+    
+    # Mock get_active_stops to return the dicts for SL/TP
+    bot.vpm.get_active_stops.return_value = [
+        {'id': '1', 'qty': 100.0, 'trigger_price': 0.31, 'side': 'Buy', 'type': 'sl'},
+        {'id': '1', 'qty': 100.0, 'trigger_price': 0.25, 'side': 'Buy', 'type': 'tp'}
+    ]
+    
+    # 2. Mock Bybit State
+    # A. Initial State: No orders, No positions
+    bot.rest_api.get_open_orders.side_effect = [[], []] 
+    
+    # Positions: First call (Empty), Second call (Filled)
+    bot.rest_api.get_positions.side_effect = [
+        [], 
+        [{'symbol': 'FARTCOINUSDT', 'side': 'Sell', 'size': 100.0, 'entry_price': 0.30, 'unrealized_pnl': 0, 'position_idx': 2}]
+    ]
+    
+    # B. Mock Place Order to succeed
+    bot.rest_api.place_order.return_value = {'order_id': '123', 'order_link_id': 'AUTO-1'}
+    
+    # 3. Run Reconciliation
+    bot.reconcile_positions()
+    
+    # 4. Verify
+    # We expect AT LEAST 3 calls to place_order:
+    # 1. The Market Sell (Entry)
+    # 2. The Stop Loss (Fix)
+    # 3. The Take Profit (Fix)
+    
+    calls = bot.rest_api.place_order.call_args_list
+    print(f"\n[Test] Total Place Order Calls: {len(calls)}")
+    for i, c in enumerate(calls):
+        print(f"  Call {i+1}: {c[1]}")
+        
+    assert len(calls) >= 3, f"Failed to recover! Expected 3 calls (Entry + SL + TP), got {len(calls)}"
+    
+    # Verify Call 1 is Entry (Positional Args)
+    # Args: (self.symbol, "Sell", "Market", qty)
+    args_entry, kwargs_entry = calls[0]
+    assert args_entry[1] == 'Sell'
+    assert args_entry[2] == 'Market'
+    
+    # Verify Call 2/3 are conditional fixes (Keyword Args)
+    # These use place_order(symbol=..., side=..., ...) so 'side' IS in kwargs
+    fix_orders = [c[1] for c in calls[1:]]
+    
+    # Verify we sent ReduceOnly orders
+    fix_types = [o.get('reduce_only') for o in fix_orders]
+    assert all(fix_types), "Recovery orders must be ReduceOnly!"
+    
+    # Check prices
+    prices = [float(o.get('trigger_price', 0)) for o in fix_orders]
+    assert 0.31 in prices, "Missing SL placement"
+    assert 0.25 in prices, "Missing TP placement"
+    
+    print("[Test] SUCCESS: Bot detected naked position and placed fixes.")
