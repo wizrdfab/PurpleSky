@@ -1,5 +1,7 @@
 # 🌌 PurpleSky
 
+(The current model for FARTCOIN is somewhat old, it may be a good idea to train a new one before live trading)
+
 PurpleSky is a state-of-the-art automated trading system made 100% by AI and me, designed for high-frequency crypto futures trading (currently there is a well developed connector for Bybit, but it has the needed abstraction to make a connector for any other exchange). It leverages a hybrid machine learning architecture that combines Gradient Boosting (LightGBM) with Deep Learning (LSTM) and an intelligent Gating Network to navigate complex market microstructures.
 
 There is a strategy already the model FARTCOINUSDT deploys correctly in Bybit (may also work in Binance though if you train on Bybit data and deploy on Binance), however you can make any strategy you want; it has quite a bit of flexibility, specially with the direction models and the LTSM model :)
